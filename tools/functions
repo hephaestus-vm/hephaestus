@@ -1,0 +1,193 @@
+# -*- shell-script[bash] -*-
+
+# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+###################
+# Logging helpers #
+###################
+
+# Naming things is hard
+ARG0=${BASH_SOURCE[-1]}
+MY_NAME="Firecracker $(basename "$ARG0")"
+
+# Send a decorated message to stderr, followed by a new line
+#
+say() {
+    [ -t 1 ] && [ -n "$TERM" ] \
+        && echo "$(tput setaf 2)[$MY_NAME $(date -Iseconds)]$(tput sgr0) $*" 1>&2 \
+        || echo "[$MY_NAME] $*" 1>&2
+}
+
+# Send a text message to stderr
+#
+say_err() {
+    [ -t 2 ] && [ -n "$TERM" ] \
+        && echo -e "$(tput setaf 1)[$MY_NAME] $*$(tput sgr0)" 1>&2 \
+        || echo -e "[$MY_NAME] $*" 1>&2
+}
+
+# Send a warning-highlighted text to stderr
+say_warn() {
+    [ -t 1 ] && [ -n "$TERM" ] \
+        && echo "$(tput setaf 3)[$MY_NAME] $*$(tput sgr0)" 1>&2 \
+        || echo "[$MY_NAME] $*" 1>&2
+}
+
+# Exit with an error message and (optional) code
+# Usage: die [-c <error code>] <error message>
+#
+die() {
+    code=1
+    [[ "$1" = "-c" ]] && {
+        code="$2"
+        shift 2
+    }
+    say_err "$@"
+    exit $code
+}
+
+# Exit with an error message if the last exit code is not 0
+#
+ok_or_die() {
+    code=$?
+    [[ $code -eq 0 ]] || die -c $code "$@"
+}
+
+# ANSI output helper
+# https://en.wikipedia.org/wiki/ANSI_escape_code
+function SGR {
+    local codes=$*
+    printf "\e[%sm" "${codes// /;}"
+}
+
+# Prompt the user for confirmation before proceeding.
+# Args:
+#   $1  prompt text.
+#       Default: Continue? (y/n)
+#   $2  confirmation input.
+#       Default: y
+# Return:
+#   exit code 0 for successful confirmation
+#   exit code != 0 if the user declined
+#
+get_user_confirmation() {
+    # Fail if STDIN is not a terminal (there's no user to confirm anything)
+    [[ -t 0 ]] || return 1
+
+    # Otherwise, ask the user
+    #
+    msg=$([ -n "${1:-}" ] && echo -n "$1" || echo -n "Continue? (y/n) ")
+    yes=$([ -n "${2:-}" ] && echo -n "$2" || echo -n "y")
+    read -p "$msg" c && [ "$c" = "$yes" ] && return 0
+    return 1
+}
+
+#######################################
+# Release automation common functions #
+#######################################
+
+# Get version from the swagger file
+function get_swagger_version {
+    local file=${1:-"$FC_ROOT_DIR/src/firecracker/swagger/firecracker.yaml"}
+    grep -oP 'version: \K.*' "$file"
+}
+
+function check_local_branch_is_release_branch {
+    local LOCAL_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    local RELEASE_BRANCH=firecracker-v$(echo "$version" |cut -d. -f-2)
+
+    if [ "$LOCAL_BRANCH" != "$RELEASE_BRANCH" ]; then
+        cat <<EOF
+ERROR: The current branch '$LOCAL_BRANCH' should be '$RELEASE_BRANCH'
+Bailing out.
+You can fix this by checking out the expected release branch and rerunning:
+
+    git checkout -B $RELEASE_BRANCH
+EOF
+        exit 1
+    fi
+}
+
+# Validate the user supplied version number.
+# It must start with 3 groups of integers separated by dot and
+# must not contain `wip` or `dirty`.
+function validate_version {
+    declare version_regex="^([0-9]+\.){2}[0-9]+"
+    local version="$1"
+
+    if [ -z "$version" ]; then
+        die "Version cannot be empty."
+    elif [[ ! "$version" =~ $version_regex ]]; then
+        die "Invalid version number: $version. Version should start with \$Major.\$Minor.\$Build, see
+        https://github.com/firecracker-microvm/firecracker/blob/main/docs/RELEASE_POLICY.md for more information."
+    elif [[ "$version" == *"wip"* ]] || [[ "$version" == *"dirty"* ]]; then
+        die "Invalid version number: $version. Version should not contain \`wip\` or \`dirty\`."
+    fi
+}
+
+########################
+# Rootfs build helpers #
+########################
+
+# Wait for dockerd to come up in devctr
+prepare_docker() {
+    nohup /usr/bin/dockerd --host=unix:///var/run/docker.sock --host=tcp://127.0.0.1:2375 --storage-driver=vfs &
+
+    # Wait for Docker socket to be created
+    timeout 15 sh -c "until docker info; do echo .; sleep 1; done"
+    rm -f nohup.out
+}
+
+# Build a squashfs rootfs from a Docker image.
+# Runs <setup_script> inside the container to install packages and configure.
+# The setup script receives $rootfs as the overlay directory (pre-populated
+# with overlay files).
+# Usage: build_rootfs <image> <output_dir> <overlay_dir> <setup_script>
+build_rootfs() {
+    local IMAGE_NAME=$1
+    local OUTPUT_DIR=$2
+    local OVERLAY_DIR=$3
+    local SETUP_SCRIPT=$4
+    local ROOTFS_NAME="${IMAGE_NAME//:/-}"
+    local FROM_CTR="public.ecr.aws/docker/library/$IMAGE_NAME"
+    local rootfs="rootfs_${ROOTFS_NAME}_$$"
+
+    say "Building rootfs for $IMAGE_NAME"
+
+    mkdir -pv $rootfs
+
+    cp -rvf "$OVERLAY_DIR"/* "$rootfs"
+
+    # Run setup script inside the container image, then copy the
+    # resulting filesystem back to the bind-mounted rootfs directory.
+    docker run --env rootfs="$rootfs" --privileged --rm -i \
+        -v "$PWD:/work" -w "/work" "$FROM_CTR" sh -c '
+            # Make overlay files available inside the container
+            cp -ruv $rootfs/* /
+
+            # Run the setup script
+            if [ -e /bin/bash ]; then
+              bash /work/'"$SETUP_SCRIPT"'
+            else
+              sh /work/'"$SETUP_SCRIPT"'
+            fi
+
+            # Copy filesystem back to bind-mounted rootfs
+            dirs="bin etc home lib lib64 root sbin usr"
+            for d in $dirs; do [ -d "/$d" ] && tar c "/$d" | tar x -C $rootfs; done
+            mkdir -pv $rootfs/dev $rootfs/proc $rootfs/sys $rootfs/run $rootfs/tmp 
+            '
+
+    # TBD what about /etc/hosts?
+    echo > $rootfs/etc/resolv.conf
+
+    mkdir -pv "$OUTPUT_DIR"
+
+    # If manifest file is present in rootfs, move it to output dir
+    [ -f "$rootfs/root/manifest" ] && mv "$rootfs/root/manifest" "$OUTPUT_DIR/$ROOTFS_NAME.manifest"
+
+    mksquashfs "$rootfs" "$OUTPUT_DIR/$ROOTFS_NAME.squashfs" \
+        -all-root -noappend -comp zstd
+    rm -rf "$rootfs"
+}

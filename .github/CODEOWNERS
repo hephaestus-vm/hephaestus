@@ -1,0 +1,19 @@
+# All markdown files
+*.md @kalyazin @Manciukic @micz010
+
+# But not the ones in docs/
+docs/*.md
+
+# Except these specific ones
+docs/getting-started.md @kalyazin @Manciukic @micz010
+docs/prod-host-setup.md @kalyazin @Manciukic @micz010
+
+# Also cover all "*policy*.md" documents
+**/*policy*.md @kalyazin @Manciukic @micz010
+**/*POLICY*.md @kalyazin @Manciukic @micz010
+
+# Also these non-md files in the repository root
+THIRD-PARTY @kalyazin @Manciukic @micz010
+LICENSE @kalyazin @Manciukic @micz010
+NOTICE @kalyazin @Manciukic @micz010
+PGP-KEY.asc @kalyazin @Manciukic @micz010
