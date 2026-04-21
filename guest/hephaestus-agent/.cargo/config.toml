@@ -10,11 +10,11 @@ target = "aarch64-unknown-linux-musl"
 target-dir = "target"
 
 [target.aarch64-unknown-linux-musl]
-linker = "../../scripts/zig-aarch64-musl-cc.sh"
+# rustup's aarch64-musl target ships `rust-lld` + self-contained musl
+# crt1.o / libc.a; using those directly avoids needing any third-party
+# cross-toolchain (zig, musl-cross, Docker, etc.) on the host.
+linker = "rust-lld"
 rustflags = [
-    # Ensure panics don't pull in libunwind tables that musl can't link.
     "-C", "panic=abort",
-    # Zig bundles its own crt1 / musl; rustc's self-contained copies collide
-    # on `_start` / `_start_c` at link time. Let zig own the CRT.
-    "-C", "link-self-contained=no",
+    "-C", "link-self-contained=yes",
 ]

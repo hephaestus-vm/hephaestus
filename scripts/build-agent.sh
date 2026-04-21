@@ -8,10 +8,9 @@
 #
 # Requires:
 #   - rustup with the aarch64-unknown-linux-musl target
-#     (`rustup target add aarch64-unknown-linux-musl`)
-#   - zig ≥ 0.15 in PATH (used as the cross-linker via
-#     scripts/zig-aarch64-musl-cc.sh; bundles musl libc + lld so no separate
-#     cross-toolchain is needed)
+#     (`rustup target add aarch64-unknown-linux-musl`). rustup ships
+#     `rust-lld` + self-contained musl crt for this target, so no separate
+#     cross-toolchain (zig, musl-cross, Docker) is needed.
 #   - cpio + gzip (macOS base system)
 
 set -euo pipefail
@@ -25,12 +24,6 @@ mkdir -p "$out_dir"
 # $HOME/.cargo/bin to the front of PATH to pick up the rustup proxy.
 if [[ -x "$HOME/.cargo/bin/cargo" ]]; then
     export PATH="$HOME/.cargo/bin:$PATH"
-fi
-
-if ! command -v zig >/dev/null 2>&1; then
-    echo "error: zig not found in PATH (needed as the cross-linker)" >&2
-    echo "       install via: brew install zig   OR   zvm install 0.15.1" >&2
-    exit 1
 fi
 
 echo "[build-agent] cross-compiling guest/hephaestus-agent for aarch64-linux-musl…"

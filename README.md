@@ -111,7 +111,6 @@ swift/HephaestusBridge/      Swift package — @_cdecl impls, Containerization u
 guest/hephaestus-agent/      Cross-compiled Linux init for vz-exec
 scripts/link-and-sign.sh     Linker wrapper that codesigns the CLI
 scripts/run-vm.sh            Artifact discovery + CLI invocation helper
-scripts/zig-aarch64-musl-cc.sh  zig cross-linker wrapper for the guest agent
 scripts/build-agent.sh       Cross-compile + cpio-pack the guest agent
 hephaestus.entitlements      com.apple.security.virtualization
 justfile                     Dev recipes
@@ -138,9 +137,10 @@ upstream cherry-picks.
   orchestration path (`hephaestus run`).
 - **Command execution without vminitd** via `hephaestus vz-exec` + our
   own cross-compiled guest agent (`guest/hephaestus-agent`, aarch64-musl
-  via `zig cc`). Packaged as a 186 KB `cpio.gz` initramfs. Boot → run →
-  exit → halt wall-clock lands at 200–400 ms on alpine for trivial
-  commands.
+  via rustup's `rust-lld` + self-contained musl crt — no zig, no Docker,
+  no third-party cross-toolchain). Packaged as a ~200 KB `cpio.gz`
+  initramfs. Boot → run → exit → halt wall-clock lands at 200–400 ms
+  on alpine for trivial commands.
 - **Warm-start via snapshot** via `hephaestus vz-warm save` / `vz-warm run`.
   Pre-warm a VM with the agent listening on vsock and save its state.
   Subsequent restores deliver a fresh command over vsock and return the

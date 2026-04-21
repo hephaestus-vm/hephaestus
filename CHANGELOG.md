@@ -23,9 +23,9 @@ or vminitd.
   writes the guest's exit code as i32 LE back over the same vsock
   connection, and calls `reboot(RB_POWER_OFF)` so the host sees a clean
   `.stopped` state transition.
-- `scripts/build-agent.sh` + `scripts/zig-aarch64-musl-cc.sh` —
-  cross-compile the agent and pack it with `cpio -H newc | gzip` into
-  `build/agent.cpio.gz`.
+- `scripts/build-agent.sh` — cross-compile the agent (using rustup's
+  `rust-lld` + self-contained musl crt, no third-party cross-toolchain)
+  and pack it with `cpio -H newc | gzip` into `build/agent.cpio.gz`.
 - `hephaestus vz-exec --cmd CMD --kernel K --rootfs R` — boot the agent
   initramfs, ship the command over vsock (not kernel cmdline — that's
   the key shift from v0.1.0), collect stdout on host stdout and the
@@ -57,17 +57,16 @@ or vminitd.
 - Vsock wire protocol between host (Swift) and guest (Rust): u32 LE
   length + UTF-8 command → i32 LE exit code → close. Trivial enough that
   both sides fit in ~40 lines each.
-- `.cargo/config.toml` in `guest/hephaestus-agent` wires zig as the
-  cross-linker and forces `-C link-self-contained=no` to avoid `_start`
-  symbol collisions between rustc's bundled musl CRT and zig's.
+- `.cargo/config.toml` in `guest/hephaestus-agent` sets
+  `linker = "rust-lld"` and `-C link-self-contained=yes` so rustup's own
+  bundled linker + musl crt handle the cross-compile. No zig, no
+  Docker, no musl-cross-toolchain sysroot on the host.
 
 ### Requirements added
 
-- `zig ≥ 0.15` in `PATH` (cross-linker for the guest agent). Install via
-  `brew install zig` or `zvm`.
-- `rustup` with the `aarch64-unknown-linux-musl` target. The main host
-  workspace still builds fine with Homebrew `cargo` — only the guest
-  agent needs the rustup toolchain.
+- `rustup` with the `aarch64-unknown-linux-musl` target for the guest
+  agent build (`rustup target add aarch64-unknown-linux-musl`). The main
+  host workspace still builds fine with Homebrew `cargo`.
 
 ## [0.1.0] - 2026-04-21
 
