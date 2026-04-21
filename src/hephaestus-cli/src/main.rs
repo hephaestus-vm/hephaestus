@@ -4,8 +4,8 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 
 use hephaestus_vmm::{
-    Compression, Spec, StdioSink, build_rootfs_from_tar, vz_boot, vz_sh, vz_snapshot_restore,
-    vz_snapshot_save,
+    Compression, Spec, StdioSink, build_rootfs_from_tar, vz_boot, vz_exec, vz_sh,
+    vz_snapshot_restore, vz_snapshot_save,
 };
 
 fn main() -> ExitCode {
@@ -36,6 +36,14 @@ fn main() -> ExitCode {
             Err(msg) => {
                 eprintln!("hephaestus: {msg}");
                 eprintln!("{VZ_BOOT_USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        Some("vz-exec") => match parse_vz_exec_args(&mut args) {
+            Ok(opts) => vz_exec_cmd(opts),
+            Err(msg) => {
+                eprintln!("hephaestus: {msg}");
+                eprintln!("{VZ_EXEC_USAGE}");
                 ExitCode::from(2)
             }
         },
@@ -71,11 +79,11 @@ fn main() -> ExitCode {
         },
         Some(other) => {
             eprintln!("hephaestus: unknown subcommand `{other}`");
-            eprintln!("usage: hephaestus <ping|run|rootfs|vz-boot|vz-sh|vz-snapshot>");
+            eprintln!("usage: hephaestus <ping|run|rootfs|vz-boot|vz-exec|vz-sh|vz-snapshot>");
             ExitCode::from(2)
         }
         None => {
-            eprintln!("usage: hephaestus <ping|run|rootfs|vz-boot|vz-sh|vz-snapshot>");
+            eprintln!("usage: hephaestus <ping|run|rootfs|vz-boot|vz-exec|vz-sh|vz-snapshot>");
             ExitCode::from(2)
         }
     }
@@ -446,6 +454,129 @@ fn vz_boot_cmd(opts: VzBootOptions) -> ExitCode {
         }
         Err(e) => {
             eprintln!("hephaestus: vz-boot: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+// =============================================================================
+// vz-exec subcommand — run a single command in a fresh VM using our guest
+// agent (cross-compiled Rust init that mounts the rootfs and execs the
+// command from kernel cmdline). Bypasses apple/containerization entirely.
+// =============================================================================
+
+const VZ_EXEC_USAGE: &str = "\
+usage: hephaestus vz-exec \\
+    --kernel <path> --rootfs <path> --cmd <shell-command> \\
+    [--initramfs <path>] [--log <path>] \\
+    [--cpus N] [--memory-mib N] [--timeout-seconds N]
+
+--initramfs defaults to `./build/agent.cpio.gz`. Build it with
+    scripts/build-agent.sh  (requires rustup + the
+    aarch64-unknown-linux-musl target, and zig ≥ 0.15).";
+
+#[derive(Debug)]
+struct VzExecOptions {
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    initramfs: PathBuf,
+    log: Option<PathBuf>,
+    command: String,
+    cpus: u32,
+    memory_mib: u64,
+    timeout_seconds: u32,
+}
+
+fn parse_vz_exec_args(args: &mut impl Iterator<Item = String>) -> Result<VzExecOptions, String> {
+    let default_initramfs = PathBuf::from("build/agent.cpio.gz");
+    let mut opts = VzExecOptions {
+        kernel: PathBuf::new(),
+        rootfs: PathBuf::new(),
+        initramfs: default_initramfs,
+        log: None,
+        command: String::new(),
+        cpus: 0,
+        memory_mib: 0,
+        timeout_seconds: 0,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--kernel" => opts.kernel = require_value(args, "--kernel")?.into(),
+            "--rootfs" => opts.rootfs = require_value(args, "--rootfs")?.into(),
+            "--initramfs" => opts.initramfs = require_value(args, "--initramfs")?.into(),
+            "--log" => opts.log = Some(require_value(args, "--log")?.into()),
+            "--cmd" => opts.command = require_value(args, "--cmd")?,
+            "--cpus" => {
+                opts.cpus = require_value(args, "--cpus")?
+                    .parse()
+                    .map_err(|e| format!("invalid --cpus: {e}"))?;
+            }
+            "--memory-mib" => {
+                opts.memory_mib = require_value(args, "--memory-mib")?
+                    .parse()
+                    .map_err(|e| format!("invalid --memory-mib: {e}"))?;
+            }
+            "--timeout-seconds" => {
+                opts.timeout_seconds = require_value(args, "--timeout-seconds")?
+                    .parse()
+                    .map_err(|e| format!("invalid --timeout-seconds: {e}"))?;
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    if opts.kernel.as_os_str().is_empty() {
+        return Err("missing --kernel".into());
+    }
+    if opts.rootfs.as_os_str().is_empty() {
+        return Err("missing --rootfs".into());
+    }
+    if opts.command.is_empty() {
+        return Err("missing --cmd".into());
+    }
+    for (label, path) in [
+        ("--kernel", &opts.kernel),
+        ("--rootfs", &opts.rootfs),
+        ("--initramfs", &opts.initramfs),
+    ] {
+        if !path.exists() {
+            return Err(format!("{label} path does not exist: {}", path.display()));
+        }
+    }
+    Ok(opts)
+}
+
+fn vz_exec_cmd(opts: VzExecOptions) -> ExitCode {
+    eprintln!(
+        "hephaestus: vz-exec cmd={:?} (initramfs={}, cpus={}, mem={} MiB)",
+        opts.command,
+        opts.initramfs.display(),
+        if opts.cpus == 0 { "default".into() } else { opts.cpus.to_string() },
+        if opts.memory_mib == 0 { "default".into() } else { opts.memory_mib.to_string() },
+    );
+    let start = std::time::Instant::now();
+    match vz_exec(
+        &opts.kernel,
+        &opts.initramfs,
+        &opts.rootfs,
+        &opts.command,
+        opts.log.as_deref(),
+        opts.cpus,
+        opts.memory_mib,
+        opts.timeout_seconds,
+    ) {
+        Ok(code) => {
+            eprintln!(
+                "hephaestus: guest exited with code {code} (wall {:?})",
+                start.elapsed()
+            );
+            if let Ok(c) = u8::try_from(code) {
+                ExitCode::from(c)
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(e) => {
+            eprintln!("hephaestus: vz-exec: {e}");
             ExitCode::from(1)
         }
     }

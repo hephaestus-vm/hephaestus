@@ -1,0 +1,27 @@
+[package]
+name = "hephaestus-agent"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Minimal Linux init for the hephaestus direct-VZ path — mounts the rootfs, runs a command from kernel cmdline, halts."
+
+# Intentionally out of the main workspace: this crate is cross-compiled for
+# aarch64-unknown-linux-musl and shouldn't inherit the macOS workspace's
+# linker wrappers, codesigning, or target-dir conventions.
+[workspace]
+
+[[bin]]
+name = "hephaestus-agent"
+path = "src/main.rs"
+
+[dependencies]
+nix = { version = "0.30", features = ["mount", "process", "reboot", "fs"] }
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+# Size matters — every KB goes into the initramfs we ship.
+opt-level = "z"

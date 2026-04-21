@@ -564,3 +564,168 @@ private final class ObservationBox: @unchecked Sendable {
 private final class ExitFlagBox: @unchecked Sendable {
     var signalled = false
 }
+
+private final class ExitCodeBox: @unchecked Sendable {
+    /// The guest's exit code as parsed from the serial sentinel, or -1 if
+    /// the VM halted without emitting one (e.g., kernel panic before agent
+    /// ran, VZ crashed).
+    var code: Int32 = -1
+}
+
+// =============================================================================
+// FFI: hb_vz_exec — boot direct-VZ with our guest agent initramfs, run a
+// single command inside the provided rootfs, capture exit code. No vminitd,
+// no containerization.
+// =============================================================================
+
+@_cdecl("hb_vz_exec")
+public func hb_vz_exec(
+    kernelPath: UnsafePointer<CChar>?,
+    initramfsPath: UnsafePointer<CChar>?,
+    rootfsPath: UnsafePointer<CChar>?,
+    commandHex: UnsafePointer<CChar>?,
+    logPath: UnsafePointer<CChar>?,
+    cpuCount: UInt32,
+    memoryMib: UInt64,
+    timeoutSeconds: UInt32,
+    outExitCode: UnsafeMutablePointer<Int32>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let kernelPath, let initramfsPath, let rootfsPath, let commandHex else {
+        writeError(outErr, "null path or command argument")
+        return Status.invalidArgument
+    }
+    let kernel = URL(fileURLWithPath: String(cString: kernelPath))
+    let initramfs = URL(fileURLWithPath: String(cString: initramfsPath))
+    let rootfs = URL(fileURLWithPath: String(cString: rootfsPath))
+    let commandHexStr = String(cString: commandHex)
+    // `logPath` is optional — if nil we discard serial output entirely.
+    let log: URL? = logPath.map { URL(fileURLWithPath: String(cString: $0)) }
+
+    do {
+        let config = VZVirtualMachineConfiguration()
+        config.cpuCount = Int(cpuCount == 0 ? 2 : cpuCount)
+        config.memorySize = (memoryMib == 0 ? 512 : memoryMib) * (1 << 20)
+
+        let bootloader = VZLinuxBootLoader(kernelURL: kernel)
+        bootloader.initialRamdiskURL = initramfs
+        // `rdinit=/init` tells the kernel to exec our agent as PID 1 out of
+        // the initramfs. `hephaestus.cmd=<hex>` is the payload the agent
+        // reads from /proc/cmdline. `quiet loglevel=3` keeps kernel chatter
+        // out of the serial stream so the agent's exit sentinel is easy to
+        // spot.
+        bootloader.commandLine =
+            "console=hvc0 rdinit=/init quiet loglevel=3 hephaestus.cmd=\(commandHexStr)"
+        config.bootLoader = bootloader
+
+        let rootfsAttachment = try VZDiskImageStorageDeviceAttachment(
+            url: rootfs,
+            readOnly: false
+        )
+        config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)]
+
+        // Intercept guest serial output: forward to `log` if given, parse
+        // for the `__HEPHAESTUS_EXIT_<code>__` sentinel, and signal the VM
+        // to stop once we've captured it.
+        let outputPipe = Pipe()
+        let exitSem = DispatchSemaphore(value: 0)
+        let exitBox = ExitFlagBox()
+        let codeBox = ExitCodeBox()
+        let logHandle: FileHandle? = log.flatMap { url in
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+            return try? FileHandle(forWritingTo: url)
+        }
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty || exitBox.signalled { return }
+            // Always write to the log (captures everything verbatim).
+            try? logHandle?.write(contentsOf: data)
+            // Stream to host stdout too, but strip the exit sentinel so it
+            // doesn't leak into the user's visible output.
+            if let text = String(data: data, encoding: .utf8),
+               let sentinelStart = text.range(of: exitSentinelPrefix)
+            {
+                // Everything before the sentinel: the user's command output
+                // (and agent diagnostics, which we accept as noise for now).
+                let before = text[..<sentinelStart.lowerBound]
+                if !before.isEmpty {
+                    try? FileHandle.standardOutput.write(contentsOf: Data(before.utf8))
+                }
+                if let code = parseExitSentinel(in: text) {
+                    codeBox.code = code
+                    exitBox.signalled = true
+                    exitSem.signal()
+                }
+            } else {
+                try? FileHandle.standardOutput.write(contentsOf: data)
+            }
+        }
+        let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
+        serial.attachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: nil,
+            fileHandleForWriting: outputPipe.fileHandleForWriting
+        )
+        config.serialPorts = [serial]
+
+        config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+        try config.validate()
+
+        let queue = DispatchQueue(label: "com.hephaestus.vz-exec")
+        let holder = VMHolder()
+        queue.sync {
+            holder.vm = VZVirtualMachine(configuration: config, queue: queue)
+        }
+        guard holder.vm != nil else {
+            writeError(outErr, "failed to construct VZVirtualMachine")
+            return Status.swiftError
+        }
+
+        // Also observe VZ state so a crash or early stop doesn't hang the
+        // host forever.
+        let observerBox = ObservationBox()
+        queue.sync {
+            guard let vm = holder.vm else { return }
+            observerBox.observation = vm.observe(\.state, options: [.new]) { vm, _ in
+                if vm.state == .stopped || vm.state == .error {
+                    if !exitBox.signalled {
+                        exitBox.signalled = true
+                        exitSem.signal()
+                    }
+                }
+            }
+        }
+
+        try blockingStart(queue: queue, holder: holder)
+
+        let timeout = DispatchTime.now() + .seconds(Int(timeoutSeconds == 0 ? 300 : timeoutSeconds))
+        _ = exitSem.wait(timeout: timeout)
+
+        outputPipe.fileHandleForReading.readabilityHandler = nil
+        _ = blockingStop(queue: queue, holder: holder)
+        queue.sync {
+            observerBox.observation?.invalidate()
+            observerBox.observation = nil
+        }
+        try? logHandle?.close()
+
+        outExitCode?.pointee = codeBox.code
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}
+
+private let exitSentinelPrefix = "__HEPHAESTUS_EXIT_"
+private let exitSentinelSuffix = "__"
+
+/// Scan a chunk of guest serial output for `__HEPHAESTUS_EXIT_<code>__` and
+/// return the parsed exit code, or nil if not present.
+private func parseExitSentinel(in text: String) -> Int32? {
+    guard let start = text.range(of: exitSentinelPrefix) else { return nil }
+    let after = text[start.upperBound...]
+    guard let end = after.range(of: exitSentinelSuffix) else { return nil }
+    let numeric = after[..<end.lowerBound]
+    return Int32(numeric)
+}

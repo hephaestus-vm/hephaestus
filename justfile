@@ -102,6 +102,32 @@ parallel-net-check: build
 sh: build
     HEPHAESTUS_NETWORK=1 HEPHAESTUS_TTY=1 scripts/run-vm.sh /bin/sh
 
+# Cross-compile the guest agent (aarch64-linux-musl via zig) and pack it as a
+# cpio.gz initramfs at build/agent.cpio.gz. Needed once per agent source change.
+build-agent:
+    scripts/build-agent.sh
+
+# Run a single guest command via the direct-VZ path + our own init agent.
+# No vminitd, no containerization. Uses build/agent.cpio.gz (run `just build-agent` first).
+# Usage: just vz-exec 'uname -a; echo $HOSTNAME'
+vz-exec cmd: build build-agent
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cdir="$HOME/Library/Application Support/com.apple.container"
+    kernel="$(ls "$cdir"/kernels/vmlinux-* 2>/dev/null | head -1 || true)"
+    snaps=("$cdir"/snapshots/*/snapshot)
+    if [[ -z "$kernel" ]] || [[ ! -e "${snaps[0]:-}" ]]; then
+        echo "no artifacts; run: just artifacts" >&2; exit 1
+    fi
+    rootfs_src=$(stat -f '%z %N' "${snaps[@]}" | sort -nr | head -1 | cut -d' ' -f2-)
+    # vz-exec mounts rootfs rw; clone so we don't mutate the shared snapshot.
+    rootfs_dir="${TMPDIR:-/tmp}/hephaestus/vz-exec-rootfs"
+    mkdir -p "$rootfs_dir"
+    rootfs="$rootfs_dir/$(date +%s%N).ext4"
+    cp -c "$rootfs_src" "$rootfs"
+    trap 'rm -f "$rootfs"' EXIT
+    {{bin}} vz-exec --kernel "$kernel" --rootfs "$rootfs" --cmd {{quote(cmd)}}
+
 # Interactive shell via the direct-VZ path (bypasses containerization / vminitd).
 # No networking. `exit` or Ctrl-D to leave; the guest kernel halts on init exit.
 vz-sh: build

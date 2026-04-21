@@ -1,0 +1,20 @@
+# Use zig cc as the cross-linker for aarch64-linux-musl so we don't need a
+# separate musl toolchain. `zig cc -target aarch64-linux-musl` bundles
+# everything (headers, libc, lld). See scripts/zig-aarch64-musl-cc.sh for the
+# wrapper that sets the -target flag.
+
+[build]
+target = "aarch64-unknown-linux-musl"
+# Keep agent artifacts local so the root .cargo/config.toml's build/cargo_target
+# (intended for the host workspace) isn't mixed with cross-compiled objects.
+target-dir = "target"
+
+[target.aarch64-unknown-linux-musl]
+linker = "../../scripts/zig-aarch64-musl-cc.sh"
+rustflags = [
+    # Ensure panics don't pull in libunwind tables that musl can't link.
+    "-C", "panic=abort",
+    # Zig bundles its own crt1 / musl; rustc's self-contained copies collide
+    # on `_start` / `_start_c` at link time. Let zig own the CRT.
+    "-C", "link-self-contained=no",
+]

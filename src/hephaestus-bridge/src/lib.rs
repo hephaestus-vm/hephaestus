@@ -148,6 +148,18 @@ unsafe extern "C" {
         timeout_seconds: u32,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
+    fn hb_vz_exec(
+        kernel_path: *const c_char,
+        initramfs_path: *const c_char,
+        rootfs_path: *const c_char,
+        command_hex: *const c_char,
+        log_path: *const c_char,
+        cpu_count: u32,
+        memory_mib: u64,
+        timeout_seconds: u32,
+        out_exit_code: *mut i32,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
 }
 
 // =============================================================================
@@ -539,6 +551,70 @@ pub fn vz_boot(
     status.into_result(out_err)
 }
 
+/// Run a single command inside `rootfs` via our guest agent and return
+/// its exit code. Boots a minimal VM whose initramfs is the cross-compiled
+/// `hephaestus-agent` binary (see `guest/hephaestus-agent/`), which mounts
+/// `rootfs` at `/`, `chroot`s, `exec`s `/bin/sh -c CMD`, and halts. Serial
+/// output goes to `log` if provided.
+///
+/// No vminitd, no gRPC, no apple/containerization. The command is passed
+/// via kernel cmdline (hex-encoded so spaces and special chars survive).
+pub fn vz_exec(
+    kernel: &Path,
+    initramfs: &Path,
+    rootfs: &Path,
+    command: &str,
+    log: Option<&Path>,
+    cpu_count: u32,
+    memory_mib: u64,
+    timeout_seconds: u32,
+) -> Result<i32, VmError> {
+    // Kernel cmdline typically caps at ~4 KiB; hex doubles length, so
+    // refuse commands that would risk truncation. In practice, 1 KiB of
+    // command text is plenty.
+    if command.len() > 1024 {
+        return Err(VmError::InvalidArgument(format!(
+            "command length {} exceeds 1024 byte limit (kernel cmdline cap)",
+            command.len()
+        )));
+    }
+    let hex = hex_encode(command.as_bytes());
+    let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
+    let initramfs_c = CString::new(path_to_str(initramfs, "initramfs")?)?;
+    let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
+    let hex_c = CString::new(hex)?;
+    let log_c = log.map(|p| CString::new(path_to_str(p, "log").unwrap_or("")))
+        .transpose()?;
+    let log_ptr = log_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    let mut out_err: *mut c_char = std::ptr::null_mut();
+    let mut exit_code: i32 = -1;
+    let status = unsafe {
+        hb_vz_exec(
+            kernel_c.as_ptr(),
+            initramfs_c.as_ptr(),
+            rootfs_c.as_ptr(),
+            hex_c.as_ptr(),
+            log_ptr,
+            cpu_count,
+            memory_mib,
+            timeout_seconds,
+            &mut exit_code,
+            &mut out_err,
+        )
+    };
+    status.into_result(out_err)?;
+    Ok(exit_code)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
 /// Pause a booted VM and save its full state to disk. Builds a fresh
 /// `VZVirtualMachineConfiguration` from the provided artifacts, starts the
 /// VM, waits `settle_seconds` for the guest to reach a quiescent state,
@@ -802,6 +878,17 @@ mod tests {
             "expected wide distribution, got {} distinct buckets out of 253",
             seen.len()
         );
+    }
+
+    #[test]
+    fn hex_encode_roundtrip() {
+        // The agent's hex_decode mirrors this on the guest side; drift
+        // breaks vz-exec at runtime.
+        assert_eq!(hex_encode(&[]), "");
+        assert_eq!(hex_encode(&[0x00]), "00");
+        assert_eq!(hex_encode(&[0xff]), "ff");
+        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+        assert_eq!(hex_encode(b"hi"), "6869");
     }
 
     #[test]

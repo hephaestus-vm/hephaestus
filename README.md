@@ -108,8 +108,11 @@ src/hephaestus-cli/          Rust bin crate — argv parsing, stdio sink
 src/hephaestus-vmm/          Rust lib — re-exports from bridge
 src/hephaestus-bridge/       Rust FFI crate — cbindgen, extern declarations
 swift/HephaestusBridge/      Swift package — @_cdecl impls, Containerization use
+guest/hephaestus-agent/      Cross-compiled Linux init for vz-exec
 scripts/link-and-sign.sh     Linker wrapper that codesigns the CLI
 scripts/run-vm.sh            Artifact discovery + CLI invocation helper
+scripts/zig-aarch64-musl-cc.sh  zig cross-linker wrapper for the guest agent
+scripts/build-agent.sh       Cross-compile + cpio-pack the guest agent
 hephaestus.entitlements      com.apple.security.virtualization
 justfile                     Dev recipes
 ```
@@ -133,6 +136,11 @@ upstream cherry-picks.
   `hephaestus vz-snapshot save/restore`. Restore+resume ≈ 200 ms on a
   512 MiB VM. Does not yet integrate with the full container
   orchestration path (`hephaestus run`).
+- **Command execution without vminitd** via `hephaestus vz-exec` + our
+  own cross-compiled guest agent (`guest/hephaestus-agent`, aarch64-musl
+  via `zig cc`). Packaged as a 186 KB `cpio.gz` initramfs. Boot → run →
+  exit → halt wall-clock lands at 200–400 ms on alpine for trivial
+  commands.
 
 ### Still missing
 
