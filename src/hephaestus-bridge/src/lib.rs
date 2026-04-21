@@ -137,6 +137,14 @@ unsafe extern "C" {
         out_restore_nanos: *mut u64,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
+    fn hb_vz_sh(
+        kernel_path: *const c_char,
+        rootfs_path: *const c_char,
+        cpu_count: u32,
+        memory_mib: u64,
+        timeout_seconds: u32,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
 }
 
 // =============================================================================
@@ -586,6 +594,35 @@ pub fn vz_snapshot_restore(
     };
     status.into_result(out_err)?;
     Ok(restore_nanos)
+}
+
+/// Interactive shell on the direct-VZ path — no vminitd, no
+/// containerization orchestration. Guest serial port is wired to the
+/// host's stdin/stdout, host TTY is put in raw mode for the duration.
+///
+/// `timeout_seconds = 0` means 1 hour; session naturally ends when the
+/// guest shell exits and the kernel halts (we use `panic=0`).
+pub fn vz_sh(
+    kernel: &Path,
+    rootfs: &Path,
+    cpu_count: u32,
+    memory_mib: u64,
+    timeout_seconds: u32,
+) -> Result<(), VmError> {
+    let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
+    let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
+    let mut out_err: *mut c_char = std::ptr::null_mut();
+    let status = unsafe {
+        hb_vz_sh(
+            kernel_c.as_ptr(),
+            rootfs_c.as_ptr(),
+            cpu_count,
+            memory_mib,
+            timeout_seconds,
+            &mut out_err,
+        )
+    };
+    status.into_result(out_err)
 }
 
 /// Build an ext4 block device at `out` from the tar archive at `tar`.

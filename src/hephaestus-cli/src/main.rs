@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 
 use hephaestus_vmm::{
-    Compression, Spec, StdioSink, build_rootfs_from_tar, vz_boot, vz_snapshot_restore,
+    Compression, Spec, StdioSink, build_rootfs_from_tar, vz_boot, vz_sh, vz_snapshot_restore,
     vz_snapshot_save,
 };
 
@@ -39,6 +39,14 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("vz-sh") => match parse_vz_sh_args(&mut args) {
+            Ok(opts) => vz_sh_cmd(opts),
+            Err(msg) => {
+                eprintln!("hephaestus: {msg}");
+                eprintln!("{VZ_SH_USAGE}");
+                ExitCode::from(2)
+            }
+        },
         Some("vz-snapshot") => match args.next().as_deref() {
             Some("save") => match parse_vz_snap_args(&mut args, true) {
                 Ok(opts) => vz_snap_save_cmd(opts),
@@ -63,11 +71,11 @@ fn main() -> ExitCode {
         },
         Some(other) => {
             eprintln!("hephaestus: unknown subcommand `{other}`");
-            eprintln!("usage: hephaestus <ping|run|rootfs|vz-boot|vz-snapshot>");
+            eprintln!("usage: hephaestus <ping|run|rootfs|vz-boot|vz-sh|vz-snapshot>");
             ExitCode::from(2)
         }
         None => {
-            eprintln!("usage: hephaestus <ping|run|rootfs|vz-boot|vz-snapshot>");
+            eprintln!("usage: hephaestus <ping|run|rootfs|vz-boot|vz-sh|vz-snapshot>");
             ExitCode::from(2)
         }
     }
@@ -414,6 +422,85 @@ fn vz_boot_cmd(opts: VzBootOptions) -> ExitCode {
         }
         Err(e) => {
             eprintln!("hephaestus: vz-boot: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+// =============================================================================
+// vz-sh subcommand — interactive shell on the direct-VZ path (N2.1).
+// =============================================================================
+
+const VZ_SH_USAGE: &str = "\
+usage: hephaestus vz-sh \\
+    --kernel <path> --rootfs <path> \\
+    [--cpus N] [--memory-mib N] [--timeout-seconds N]";
+
+#[derive(Debug)]
+struct VzShOptions {
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    cpus: u32,
+    memory_mib: u64,
+    timeout_seconds: u32,
+}
+
+fn parse_vz_sh_args(args: &mut impl Iterator<Item = String>) -> Result<VzShOptions, String> {
+    let mut opts = VzShOptions {
+        kernel: PathBuf::new(),
+        rootfs: PathBuf::new(),
+        cpus: 0,
+        memory_mib: 0,
+        timeout_seconds: 0,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--kernel" => opts.kernel = require_value(args, "--kernel")?.into(),
+            "--rootfs" => opts.rootfs = require_value(args, "--rootfs")?.into(),
+            "--cpus" => {
+                opts.cpus = require_value(args, "--cpus")?
+                    .parse()
+                    .map_err(|e| format!("invalid --cpus: {e}"))?;
+            }
+            "--memory-mib" => {
+                opts.memory_mib = require_value(args, "--memory-mib")?
+                    .parse()
+                    .map_err(|e| format!("invalid --memory-mib: {e}"))?;
+            }
+            "--timeout-seconds" => {
+                opts.timeout_seconds = require_value(args, "--timeout-seconds")?
+                    .parse()
+                    .map_err(|e| format!("invalid --timeout-seconds: {e}"))?;
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    if opts.kernel.as_os_str().is_empty() {
+        return Err("missing --kernel".into());
+    }
+    if opts.rootfs.as_os_str().is_empty() {
+        return Err("missing --rootfs".into());
+    }
+    for (label, path) in [("--kernel", &opts.kernel), ("--rootfs", &opts.rootfs)] {
+        if !path.exists() {
+            return Err(format!("{label} path does not exist: {}", path.display()));
+        }
+    }
+    Ok(opts)
+}
+
+fn vz_sh_cmd(opts: VzShOptions) -> ExitCode {
+    eprintln!("hephaestus: vz-sh (exit shell with `exit` or Ctrl-D)");
+    match vz_sh(
+        &opts.kernel,
+        &opts.rootfs,
+        opts.cpus,
+        opts.memory_mib,
+        opts.timeout_seconds,
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("hephaestus: vz-sh: {e}");
             ExitCode::from(1)
         }
     }

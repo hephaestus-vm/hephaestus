@@ -4,7 +4,7 @@
 //! the FFI crate directly.
 
 pub use hephaestus_bridge::{
-    Compression, Spec, StdioSink, Vm, VmError, build_rootfs_from_tar, vz_boot,
+    Compression, Spec, StdioSink, Vm, VmError, build_rootfs_from_tar, vz_boot, vz_sh,
     vz_snapshot_restore, vz_snapshot_save,
 };
 

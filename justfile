@@ -86,6 +86,20 @@ network-check: build
 sh: build
     HEPHAESTUS_NETWORK=1 HEPHAESTUS_TTY=1 scripts/run-vm.sh /bin/sh
 
+# Interactive shell via the direct-VZ path (bypasses containerization / vminitd).
+# No networking. `exit` or Ctrl-D to leave; the guest kernel halts on init exit.
+vz-sh: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cdir="$HOME/Library/Application Support/com.apple.container"
+    kernel="$(ls "$cdir"/kernels/vmlinux-* 2>/dev/null | head -1 || true)"
+    snaps=("$cdir"/snapshots/*/snapshot)
+    if [[ -z "$kernel" ]] || [[ ! -e "${snaps[0]:-}" ]]; then
+        echo "no artifacts; run: just artifacts" >&2; exit 1
+    fi
+    rootfs=$(stat -f '%z %N' "${snaps[@]}" | sort -nr | head -1 | cut -d' ' -f2-)
+    exec {{bin}} vz-sh --kernel "$kernel" --rootfs "$rootfs"
+
 # Tail the kernel boot log from the last VM run (default id=dev).
 bootlog id='dev':
     #!/usr/bin/env bash

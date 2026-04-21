@@ -8,6 +8,7 @@
 // kernel start?" as a smoke test.
 
 import CHephaestusBridge
+import ContainerizationOS
 import Dispatch
 import Foundation
 import Virtualization
@@ -420,4 +421,146 @@ private func blockingStop(queue: DispatchQueue, holder: VMHolder) -> Bool {
         vm.stop { _ in sem.signal() }
     }
     return sem.wait(timeout: .now() + 5) == .success
+}
+
+// =============================================================================
+// FFI: hb_vz_sh — boot direct-VZ with the host's stdin/stdout wired straight
+// to the guest serial port. Gives an interactive shell without vminitd or
+// any containerization-layer orchestration. Incompatible with save/restore
+// (FileHandle-based serial attachments don't serialize).
+// =============================================================================
+
+@_cdecl("hb_vz_sh")
+public func hb_vz_sh(
+    kernelPath: UnsafePointer<CChar>?,
+    rootfsPath: UnsafePointer<CChar>?,
+    cpuCount: UInt32,
+    memoryMib: UInt64,
+    timeoutSeconds: UInt32,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let kernelPath, let rootfsPath else {
+        writeError(outErr, "null path argument")
+        return Status.invalidArgument
+    }
+    let kernel = URL(fileURLWithPath: String(cString: kernelPath))
+    let rootfs = URL(fileURLWithPath: String(cString: rootfsPath))
+
+    do {
+        let config = VZVirtualMachineConfiguration()
+        config.cpuCount = Int(cpuCount == 0 ? 2 : cpuCount)
+        config.memorySize = (memoryMib == 0 ? 512 : memoryMib) * (1 << 20)
+
+        let bootloader = VZLinuxBootLoader(kernelURL: kernel)
+        // `quiet loglevel=3` hides the virtio/IPVS/etc. boot firehose; only
+        // warnings and the eventual "Kernel panic" sentinel (which we use to
+        // detect shell exit below) remain. `panic=0` makes the kernel halt
+        // instead of reboot when PID 1 exits.
+        bootloader.commandLine =
+            "console=hvc0 root=/dev/vda rw init=/bin/sh panic=0 quiet loglevel=3"
+        config.bootLoader = bootloader
+
+        let rootfsAttachment = try VZDiskImageStorageDeviceAttachment(
+            url: rootfs,
+            readOnly: false
+        )
+        config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)]
+
+        // Intercept guest output through a Pipe so we can (a) forward it to
+        // the user's stdout and (b) watch for the "Kernel panic" message
+        // that follows PID 1 exiting (`exit` / Ctrl-D in the shell). Without
+        // this sniffer the VZ state property never transitions to .stopped
+        // on panic=0 and the CLI hangs forever.
+        let outputPipe = Pipe()
+        let exitSem = DispatchSemaphore(value: 0)
+        let exitBox = ExitFlagBox()
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty || exitBox.signalled { return }
+            let isPanic = (String(data: data, encoding: .utf8) ?? "").contains("Kernel panic")
+            if !isPanic {
+                try? FileHandle.standardOutput.write(contentsOf: data)
+            } else {
+                // The panic message follows PID 1 exiting; user has seen
+                // their shell end, and the kernel noise after isn't
+                // interesting output. Swallow it and signal shutdown.
+                exitBox.signalled = true
+                exitSem.signal()
+            }
+        }
+
+        let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
+        serial.attachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: FileHandle.standardInput,
+            fileHandleForWriting: outputPipe.fileHandleForWriting
+        )
+        config.serialPorts = [serial]
+
+        config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+        try config.validate()
+
+        // Put the host terminal in raw mode so keystrokes, including
+        // Ctrl-C and Ctrl-D, land in the guest rather than being
+        // interpreted by the host shell.
+        let terminal = try Terminal.current
+        try terminal.setraw()
+        // Ensure we always reset, even on Swift error paths below.
+        defer { terminal.tryReset() }
+
+        let queue = DispatchQueue(label: "com.hephaestus.vz-sh")
+        let holder = VMHolder()
+        queue.sync {
+            holder.vm = VZVirtualMachine(configuration: config, queue: queue)
+        }
+        guard holder.vm != nil else {
+            writeError(outErr, "failed to construct VZVirtualMachine")
+            return Status.swiftError
+        }
+
+        // KVO on state catches VM crashes and explicit stops. Panic on
+        // panic=0 doesn't trigger a VZ state transition (the kernel is
+        // halted but VZ considers the VM still running), so we also
+        // rely on the serial-output sniffer above.
+        let observerBox = ObservationBox()
+        queue.sync {
+            guard let vm = holder.vm else { return }
+            observerBox.observation = vm.observe(\.state, options: [.new]) { vm, _ in
+                if vm.state == .stopped || vm.state == .error {
+                    if !exitBox.signalled {
+                        exitBox.signalled = true
+                        exitSem.signal()
+                    }
+                }
+            }
+        }
+
+        try blockingStart(queue: queue, holder: holder)
+
+        // Wait for kernel-panic-detected or user-supplied timeout.
+        let timeout = DispatchTime.now() + .seconds(Int(timeoutSeconds == 0 ? 3600 : timeoutSeconds))
+        _ = exitSem.wait(timeout: timeout)
+
+        // Drop the stdio sniffer before stop so a late write can't race
+        // against teardown and double-signal.
+        outputPipe.fileHandleForReading.readabilityHandler = nil
+        _ = blockingStop(queue: queue, holder: holder)
+        queue.sync {
+            observerBox.observation?.invalidate()
+            observerBox.observation = nil
+        }
+
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}
+
+private final class ObservationBox: @unchecked Sendable {
+    var observation: NSKeyValueObservation?
+}
+
+private final class ExitFlagBox: @unchecked Sendable {
+    var signalled = false
 }
