@@ -141,6 +141,12 @@ upstream cherry-picks.
   no third-party cross-toolchain). Packaged as a ~200 KB `cpio.gz`
   initramfs. Boot → run → exit → halt wall-clock lands at 200–400 ms
   on alpine for trivial commands.
+- **Warm pool** via `hephaestus pool init / run / stats / destroy`. A
+  disk-backed directory of pre-warmed VZ snapshots with `flock(2)`-based
+  exclusive slot claiming. `pool run` is non-blocking: all-slots-busy
+  exits 75 (`EX_TEMPFAIL`) so the caller owns retry semantics,
+  matching Firecracker's "VMs are a primitive, queueing lives outside"
+  shape. Layered on `vz-warm` internally.
 - **Warm-start via snapshot** via `hephaestus vz-warm save` / `vz-warm run`.
   Pre-warm a VM with the agent listening on vsock and save its state.
   Subsequent restores deliver a fresh command over vsock and return the

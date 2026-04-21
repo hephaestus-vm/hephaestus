@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
 
@@ -7,6 +7,8 @@ use hephaestus_vmm::{
     Compression, Spec, StdioSink, build_rootfs_from_tar, vz_boot, vz_exec,
     vz_exec_snapshot_restore, vz_exec_snapshot_save, vz_sh, vz_snapshot_restore, vz_snapshot_save,
 };
+
+mod pool;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -44,6 +46,28 @@ fn main() -> ExitCode {
             Err(msg) => {
                 eprintln!("hephaestus: {msg}");
                 eprintln!("{VZ_EXEC_USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        Some("pool") => match args.next().as_deref() {
+            Some("init") => match parse_pool_init(&mut args) {
+                Ok(o) => pool_init_cmd(o),
+                Err(msg) => pool_usage_err(&msg),
+            },
+            Some("run") => match parse_pool_run(&mut args) {
+                Ok(o) => pool_run_cmd(o),
+                Err(msg) => pool_usage_err(&msg),
+            },
+            Some("stats") => match parse_pool_dir_only(&mut args) {
+                Ok(dir) => pool_stats_cmd(&dir),
+                Err(msg) => pool_usage_err(&msg),
+            },
+            Some("destroy") => match parse_pool_dir_only(&mut args) {
+                Ok(dir) => pool_destroy_cmd(&dir),
+                Err(msg) => pool_usage_err(&msg),
+            },
+            _ => {
+                eprintln!("{POOL_USAGE}");
                 ExitCode::from(2)
             }
         },
@@ -102,13 +126,13 @@ fn main() -> ExitCode {
         Some(other) => {
             eprintln!("hephaestus: unknown subcommand `{other}`");
             eprintln!(
-                "usage: hephaestus <ping|run|rootfs|vz-boot|vz-exec|vz-sh|vz-snapshot|vz-warm>"
+                "usage: hephaestus <ping|run|rootfs|vz-boot|vz-exec|vz-sh|vz-snapshot|vz-warm|pool>"
             );
             ExitCode::from(2)
         }
         None => {
             eprintln!(
-                "usage: hephaestus <ping|run|rootfs|vz-boot|vz-exec|vz-sh|vz-snapshot|vz-warm>"
+                "usage: hephaestus <ping|run|rootfs|vz-boot|vz-exec|vz-sh|vz-snapshot|vz-warm|pool>"
             );
             ExitCode::from(2)
         }
@@ -603,6 +627,243 @@ fn vz_exec_cmd(opts: VzExecOptions) -> ExitCode {
         }
         Err(e) => {
             eprintln!("hephaestus: vz-exec: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+// =============================================================================
+// pool subcommand — disk-persistent warm pool of pre-warmed VMs.
+// =============================================================================
+
+const POOL_USAGE: &str = "\
+usage:
+  hephaestus pool init --dir D --kernel K --rootfs R \\
+      [--size N] [--initramfs build/agent.cpio.gz] \\
+      [--cpus N] [--memory-mib N]
+  hephaestus pool run --dir D --cmd CMD
+  hephaestus pool stats --dir D
+  hephaestus pool destroy --dir D
+
+`pool run` never blocks; when every slot is busy it exits non-zero so
+the caller owns retry/queueing. Set HEPHAESTUS_POOL_LOG=PATH to capture
+guest serial output for a run.";
+
+fn pool_usage_err(msg: &str) -> ExitCode {
+    eprintln!("hephaestus: {msg}");
+    eprintln!("{POOL_USAGE}");
+    ExitCode::from(2)
+}
+
+#[derive(Debug)]
+struct PoolInitOptions {
+    dir: PathBuf,
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    initramfs: PathBuf,
+    size: u32,
+    cpus: u32,
+    memory_mib: u64,
+}
+
+fn parse_pool_init(args: &mut impl Iterator<Item = String>) -> Result<PoolInitOptions, String> {
+    let mut o = PoolInitOptions {
+        dir: PathBuf::new(),
+        kernel: PathBuf::new(),
+        rootfs: PathBuf::new(),
+        initramfs: PathBuf::from("build/agent.cpio.gz"),
+        size: 4,
+        cpus: 0,
+        memory_mib: 0,
+    };
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--dir" => o.dir = require_value(args, "--dir")?.into(),
+            "--kernel" => o.kernel = require_value(args, "--kernel")?.into(),
+            "--rootfs" => o.rootfs = require_value(args, "--rootfs")?.into(),
+            "--initramfs" => o.initramfs = require_value(args, "--initramfs")?.into(),
+            "--size" => {
+                o.size = require_value(args, "--size")?
+                    .parse()
+                    .map_err(|e| format!("invalid --size: {e}"))?;
+            }
+            "--cpus" => {
+                o.cpus = require_value(args, "--cpus")?
+                    .parse()
+                    .map_err(|e| format!("invalid --cpus: {e}"))?;
+            }
+            "--memory-mib" => {
+                o.memory_mib = require_value(args, "--memory-mib")?
+                    .parse()
+                    .map_err(|e| format!("invalid --memory-mib: {e}"))?;
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    for (label, p, must_exist) in [
+        ("--dir", &o.dir, false),
+        ("--kernel", &o.kernel, true),
+        ("--rootfs", &o.rootfs, true),
+        ("--initramfs", &o.initramfs, true),
+    ] {
+        if p.as_os_str().is_empty() {
+            return Err(format!("missing {label}"));
+        }
+        if must_exist && !p.exists() {
+            return Err(format!("{label} path does not exist: {}", p.display()));
+        }
+    }
+    Ok(o)
+}
+
+#[derive(Debug)]
+struct PoolRunOptions {
+    dir: PathBuf,
+    command: String,
+}
+
+fn parse_pool_run(args: &mut impl Iterator<Item = String>) -> Result<PoolRunOptions, String> {
+    let mut o = PoolRunOptions { dir: PathBuf::new(), command: String::new() };
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--dir" => o.dir = require_value(args, "--dir")?.into(),
+            "--cmd" => o.command = require_value(args, "--cmd")?,
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    if o.dir.as_os_str().is_empty() {
+        return Err("missing --dir".into());
+    }
+    if o.command.is_empty() {
+        return Err("missing --cmd".into());
+    }
+    Ok(o)
+}
+
+fn parse_pool_dir_only(args: &mut impl Iterator<Item = String>) -> Result<PathBuf, String> {
+    let mut dir = PathBuf::new();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--dir" => dir = require_value(args, "--dir")?.into(),
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    if dir.as_os_str().is_empty() {
+        return Err("missing --dir".into());
+    }
+    Ok(dir)
+}
+
+fn pool_init_cmd(o: PoolInitOptions) -> ExitCode {
+    eprintln!(
+        "hephaestus: pool init  dir={}  size={}  (warming…)",
+        o.dir.display(),
+        o.size
+    );
+    let start = std::time::Instant::now();
+    match pool::Pool::init(
+        &o.dir,
+        &o.kernel,
+        &o.initramfs,
+        &o.rootfs,
+        o.size,
+        o.cpus,
+        o.memory_mib,
+    ) {
+        Ok(_) => {
+            eprintln!(
+                "hephaestus: pool init complete in {:?} ({} slots ready)",
+                start.elapsed(),
+                o.size
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("hephaestus: pool init: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn pool_run_cmd(o: PoolRunOptions) -> ExitCode {
+    let pool = match pool::Pool::open(&o.dir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("hephaestus: pool run: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let slot = match pool.try_claim_slot() {
+        Ok(Some(slot)) => slot,
+        Ok(None) => {
+            eprintln!("hephaestus: pool run: all {} slots are busy", pool.meta.slots);
+            // Exit code 75 is `EX_TEMPFAIL` from sysexits.h — a
+            // well-known "transient failure, try again" signal.
+            return ExitCode::from(75);
+        }
+        Err(e) => {
+            eprintln!("hephaestus: pool run: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let wall = std::time::Instant::now();
+    let idx = slot.index;
+    match pool.run(&slot, &o.command) {
+        Ok(code) => {
+            eprintln!(
+                "hephaestus: pool run  slot={idx}  guest exit {code}  wall {:?}",
+                wall.elapsed()
+            );
+            if let Ok(c) = u8::try_from(code) {
+                ExitCode::from(c)
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(e) => {
+            eprintln!("hephaestus: pool run: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn pool_stats_cmd(dir: &Path) -> ExitCode {
+    let pool = match pool::Pool::open(dir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("hephaestus: pool stats: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match pool.stats() {
+        Ok(slots) => {
+            let busy = slots.iter().filter(|s| s.busy).count();
+            println!("pool: {}  total: {}  busy: {busy}  free: {}",
+                pool.dir.display(), pool.meta.slots, pool.meta.slots as usize - busy);
+            for s in slots {
+                println!("  slot-{}: {}{}",
+                    s.index,
+                    if s.busy { "BUSY" } else { "free" },
+                    if s.has_rootfs { "  (lingering rootfs)" } else { "" }
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("hephaestus: pool stats: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn pool_destroy_cmd(dir: &Path) -> ExitCode {
+    match pool::Pool::destroy(dir) {
+        Ok(()) => {
+            eprintln!("hephaestus: pool destroy  {}", dir.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("hephaestus: pool destroy: {e}");
             ExitCode::from(1)
         }
     }

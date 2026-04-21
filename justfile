@@ -107,6 +107,38 @@ sh: build
 build-agent:
     scripts/build-agent.sh
 
+# Pool default dir. Everything below honours $HEPHAESTUS_POOL_DIR if set.
+pool_dir := env_var_or_default('HEPHAESTUS_POOL_DIR', '/tmp/hephaestus-pool')
+
+# Initialize a warm pool of pre-snapshotted VMs.
+# Usage: just pool-init       # 4 slots (default)
+#        just pool-init 8     # positional arg == slot count
+pool-init size='4': build build-agent
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cdir="$HOME/Library/Application Support/com.apple.container"
+    kernel="$(ls "$cdir"/kernels/vmlinux-* 2>/dev/null | head -1 || true)"
+    snaps=("$cdir"/snapshots/*/snapshot)
+    rootfs_src=$(stat -f '%z %N' "${snaps[@]}" | sort -nr | head -1 | cut -d' ' -f2-)
+    {{bin}} pool destroy --dir {{pool_dir}} 2>/dev/null || true
+    {{bin}} pool init --dir {{pool_dir}} \
+        --kernel "$kernel" --rootfs "$rootfs_src" \
+        --size {{size}}
+
+# Claim a warm slot and run a command inside the restored VM. Exits 75 if
+# every slot is busy — caller owns retry/queueing (Firecracker-esque).
+# Usage: just pool-run 'uname -a; echo hi'
+pool-run cmd: build
+    {{bin}} pool run --dir {{pool_dir}} --cmd {{quote(cmd)}}
+
+# Show slot ready/busy counts.
+pool-stats: build
+    {{bin}} pool stats --dir {{pool_dir}}
+
+# Tear down the pool dir.
+pool-destroy: build
+    {{bin}} pool destroy --dir {{pool_dir}}
+
 # Pre-warm a direct-VZ VM with our agent listening on vsock and snapshot it.
 # The saved VM is "ready to accept a command"; pair with `just vz-warm-run`.
 vz-warm-save save='build/hh-warm.save': build build-agent
