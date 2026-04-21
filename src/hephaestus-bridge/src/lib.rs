@@ -450,6 +450,70 @@ pub fn build_rootfs_from_tar(
     status.into_result(out_err)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_detect_gzip_magic() {
+        let tmp = std::env::temp_dir().join("hephaestus-test-gzip");
+        std::fs::write(&tmp, [0x1f, 0x8b, 0x08, 0x00, 0x00]).unwrap();
+        let res = Compression::auto_detect(&tmp).unwrap();
+        assert_eq!(res, Some(Compression::Gzip));
+    }
+
+    #[test]
+    fn auto_detect_zstd_magic() {
+        let tmp = std::env::temp_dir().join("hephaestus-test-zstd");
+        std::fs::write(&tmp, [0x28, 0xb5, 0x2f, 0xfd, 0x00]).unwrap();
+        let res = Compression::auto_detect(&tmp).unwrap();
+        assert_eq!(res, Some(Compression::Zstd));
+    }
+
+    #[test]
+    fn auto_detect_plain_tar_returns_none() {
+        let tmp = std::env::temp_dir().join("hephaestus-test-plain");
+        // Fake tar header sentinel; real tars start with filename bytes.
+        std::fs::write(&tmp, b"./some/path\0\0").unwrap();
+        let res = Compression::auto_detect(&tmp).unwrap();
+        assert_eq!(res, None);
+    }
+
+    #[test]
+    fn auto_detect_missing_path_errors() {
+        let tmp = std::env::temp_dir().join("hephaestus-test-does-not-exist-xyz");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(Compression::auto_detect(&tmp).is_err());
+    }
+
+    #[test]
+    fn spec_builder_sets_fields() {
+        let spec = Spec::new(
+            "id",
+            Path::new("/k"),
+            Path::new("/i"),
+            Path::new("/r"),
+        )
+        .argv(["a", "b"])
+        .cwd("/workdir")
+        .cpus(4)
+        .memory_mib(1024);
+        assert_eq!(spec.id, "id");
+        assert_eq!(spec.argv, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(spec.cwd.as_deref(), Some("/workdir"));
+        assert_eq!(spec.cpus, 4);
+        assert_eq!(spec.memory_mib, 1024);
+    }
+
+    #[test]
+    fn compression_codes_are_stable() {
+        // Swift side reads these numeric codes; order must not shift.
+        assert_eq!(Compression::None.code(), 0);
+        assert_eq!(Compression::Gzip.code(), 1);
+        assert_eq!(Compression::Zstd.code(), 2);
+    }
+}
+
 /// Take ownership of a Swift-heap-allocated error string and free it.
 fn take_swift_string(ptr: *mut c_char) -> Option<String> {
     if ptr.is_null() {

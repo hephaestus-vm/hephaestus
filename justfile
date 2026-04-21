@@ -93,6 +93,12 @@ bootlog id='dev':
 rootfs-build tar out size='512': build
     {{bin}} rootfs --from-tar {{tar}} --output {{out}} --size-mib {{size}}
 
+# Run cargo unit tests + ping + test-rootfs. No VM boot; safe without artifacts.
+test: build
+    cargo test --workspace
+    @just ping
+    @just test-rootfs
+
 # Sanity check: build a tiny tar, convert to ext4, run `file` on it.
 test-rootfs: build
     #!/usr/bin/env bash
