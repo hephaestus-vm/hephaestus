@@ -1,0 +1,18 @@
+[package]
+name = "hephaestus-fc-api"
+version = "0.3.0-dev"
+edition = "2024"
+license = "Apache-2.0"
+description = "Firecracker HTTP API wire types and VmmBackend trait for macOS, copied from upstream src/vmm/src/vmm_config/* and kept wire-compatible."
+
+[lib]
+bench = false
+
+[dependencies]
+displaydoc = "0.2.5"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+
+[lints]
+workspace = true

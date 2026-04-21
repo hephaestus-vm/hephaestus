@@ -1,0 +1,208 @@
+//! `VmmBackend` implementation that drives `hephaestus-vmm`'s direct-VZ path.
+//!
+//! v0.3 scope note: we collect config over the HTTP API and dispatch
+//! `vz_boot` on `InstanceStart`. `vz_boot` is currently timeout-based
+//! (blocks for N seconds then exits), so for HTTP-driven use we pass a
+//! very large timeout and run the boot on a blocking task. A proper
+//! long-running/stoppable VM API lives in the session-2 scope sketch —
+//! replacing the `vz_boot` call site here will be the single-point change.
+//!
+//! Single-VM-per-process matches upstream's contract; `VzBackend` holds
+//! the accumulated pre-boot config and, once booted, the join handle to
+//! the background VM task.
+
+use std::path::PathBuf;
+use std::thread::JoinHandle;
+
+use hephaestus_fc_api::vmm_config::boot_source::BootSourceConfig;
+use hephaestus_fc_api::vmm_config::drive::BlockDeviceConfig;
+use hephaestus_fc_api::vmm_config::instance_info::{InstanceInfo, VmState};
+use hephaestus_fc_api::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
+use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
+use hephaestus_fc_api::{VmmBackend, VmmBackendError};
+
+/// A very large timeout approximating "run until the process is killed".
+/// ~68 years of seconds; replaces vz_boot's finite timeout when driven
+/// from an HTTP client that expects a long-running VM.
+const ESSENTIALLY_FOREVER_SECS: u32 = u32::MAX;
+
+#[derive(Debug)]
+pub struct VzBackend {
+    id: String,
+    state: VmState,
+    boot_source: Option<BootSourceConfig>,
+    root_drive: Option<PathBuf>,
+    iface: Option<NetworkInterfaceConfig>,
+    machine_config: MachineConfig,
+    vm_thread: Option<JoinHandle<Result<(), String>>>,
+}
+
+impl VzBackend {
+    pub fn new(id: String) -> Self {
+        Self {
+            id,
+            state: VmState::NotStarted,
+            boot_source: None,
+            root_drive: None,
+            iface: None,
+            machine_config: MachineConfig::default(),
+            vm_thread: None,
+        }
+    }
+
+    fn require_preboot(&self) -> Result<(), VmmBackendError> {
+        if matches!(self.state, VmState::NotStarted) {
+            Ok(())
+        } else {
+            Err(VmmBackendError::InvalidState(
+                "operation not supported post-boot".into(),
+            ))
+        }
+    }
+}
+
+impl VmmBackend for VzBackend {
+    fn instance_info(&self) -> InstanceInfo {
+        InstanceInfo {
+            id: self.id.clone(),
+            state: self.state.clone(),
+            vmm_version: env!("CARGO_PKG_VERSION").to_string(),
+            app_name: "hephaestus-firecracker".to_string(),
+        }
+    }
+
+    fn configure_boot_source(
+        &mut self,
+        cfg: BootSourceConfig,
+    ) -> Result<(), VmmBackendError> {
+        self.require_preboot()?;
+        if !std::path::Path::new(&cfg.kernel_image_path).exists() {
+            return Err(VmmBackendError::InvalidConfig(format!(
+                "kernel image not found at {}",
+                cfg.kernel_image_path
+            )));
+        }
+        self.boot_source = Some(cfg);
+        Ok(())
+    }
+
+    fn insert_block_device(
+        &mut self,
+        cfg: BlockDeviceConfig,
+    ) -> Result<(), VmmBackendError> {
+        self.require_preboot()?;
+        if !cfg.is_root_device {
+            return Err(VmmBackendError::NotSupported(
+                "only root block devices are supported on macOS".into(),
+            ));
+        }
+        let path = cfg.path_on_host.ok_or_else(|| {
+            VmmBackendError::InvalidConfig("drive.path_on_host is required".into())
+        })?;
+        let path = PathBuf::from(path);
+        if !path.exists() {
+            return Err(VmmBackendError::InvalidConfig(format!(
+                "rootfs not found at {}",
+                path.display()
+            )));
+        }
+        self.root_drive = Some(path);
+        Ok(())
+    }
+
+    fn insert_network_device(
+        &mut self,
+        cfg: NetworkInterfaceConfig,
+    ) -> Result<(), VmmBackendError> {
+        self.require_preboot()?;
+        self.iface = Some(cfg);
+        Ok(())
+    }
+
+    fn get_machine_config(&self) -> MachineConfig {
+        self.machine_config.clone()
+    }
+
+    fn put_machine_config(&mut self, cfg: MachineConfig) -> Result<(), VmmBackendError> {
+        self.require_preboot()?;
+        if cfg.vcpu_count == 0 {
+            return Err(VmmBackendError::InvalidConfig(
+                "vcpu_count must be >= 1".into(),
+            ));
+        }
+        if cfg.mem_size_mib == 0 {
+            return Err(VmmBackendError::InvalidConfig(
+                "mem_size_mib must be > 0".into(),
+            ));
+        }
+        self.machine_config = cfg;
+        Ok(())
+    }
+
+    fn patch_machine_config(
+        &mut self,
+        update: MachineConfigUpdate,
+    ) -> Result<(), VmmBackendError> {
+        self.require_preboot()?;
+        if update.is_empty() {
+            return Err(VmmBackendError::InvalidConfig(
+                "empty machine-config patch".into(),
+            ));
+        }
+        let mut cfg = self.machine_config.clone();
+        if let Some(n) = update.vcpu_count {
+            cfg.vcpu_count = n;
+        }
+        if let Some(m) = update.mem_size_mib {
+            cfg.mem_size_mib = m;
+        }
+        if let Some(smt) = update.smt {
+            cfg.smt = smt;
+        }
+        if let Some(t) = update.track_dirty_pages {
+            cfg.track_dirty_pages = t;
+        }
+        if let Some(h) = update.huge_pages {
+            cfg.huge_pages = h;
+        }
+        if let Some(v) = update.cpu_template {
+            cfg.cpu_template = Some(v);
+        }
+        self.put_machine_config(cfg)
+    }
+
+    fn start_micro_vm(&mut self) -> Result<(), VmmBackendError> {
+        self.require_preboot()?;
+
+        let boot = self.boot_source.as_ref().ok_or_else(|| {
+            VmmBackendError::InvalidState("boot-source not configured".into())
+        })?;
+        let rootfs = self.root_drive.clone().ok_or_else(|| {
+            VmmBackendError::InvalidState("root drive not configured".into())
+        })?;
+        let kernel = PathBuf::from(&boot.kernel_image_path);
+        let cpu = u32::from(self.machine_config.vcpu_count);
+        let memory = u64::try_from(self.machine_config.mem_size_mib)
+            .map_err(|err| VmmBackendError::InvalidConfig(err.to_string()))?;
+        let log = PathBuf::from(format!("/tmp/hephaestus-firecracker-{}.log", self.id));
+
+        let handle = std::thread::Builder::new()
+            .name(format!("vz-boot-{}", self.id))
+            .spawn(move || {
+                hephaestus_vmm::vz_boot(
+                    &kernel,
+                    &rootfs,
+                    &log,
+                    cpu,
+                    memory,
+                    ESSENTIALLY_FOREVER_SECS,
+                )
+                .map_err(|err| err.to_string())
+            })
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
+
+        self.vm_thread = Some(handle);
+        self.state = VmState::Running;
+        Ok(())
+    }
+}

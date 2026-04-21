@@ -1,0 +1,73 @@
+//! Firecracker-compatible HTTP API shim for macOS.
+//!
+//! One process = one microVM, matching upstream's contract. Accepts a
+//! UNIX-socket path via `--api-sock` (default
+//! `/tmp/hephaestus-firecracker.socket`), listens over hyper/HTTP-1.1, and
+//! dispatches into a `VmmBackend` impl (currently the VZ-backed one in
+//! `hephaestus-vmm`). Request/response JSON shapes mirror upstream verbatim
+//! via the types in `hephaestus-fc-api`.
+//!
+//! Endpoints wired for v0.3 cold boot:
+//!   GET    /
+//!   GET    /machine-config
+//!   PUT    /machine-config
+//!   PATCH  /machine-config
+//!   PUT    /boot-source
+//!   PUT    /drives/{id}
+//!   PUT    /network-interfaces/{id}
+//!   PUT    /actions            (InstanceStart only)
+//!
+//! Everything else returns 400 with a Firecracker-compat error body until
+//! a client needs it.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use clap::Parser;
+use tokio::net::UnixListener;
+use tokio::sync::Mutex;
+
+mod backend;
+mod server;
+
+use backend::VzBackend;
+
+#[derive(Parser, Debug)]
+#[command(name = "hephaestus-firecracker", version)]
+struct Args {
+    /// Path to the UNIX socket the HTTP API listens on.
+    #[arg(long, default_value = "/tmp/hephaestus-firecracker.socket")]
+    api_sock: PathBuf,
+    /// MicroVM identifier used in instance-info responses.
+    #[arg(long, default_value = "anonymous-instance")]
+    id: String,
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    // Remove any stale socket from a previous run; UnixListener::bind fails
+    // if the path already exists.
+    if args.api_sock.exists() {
+        std::fs::remove_file(&args.api_sock)?;
+    }
+
+    let listener = UnixListener::bind(&args.api_sock)?;
+    eprintln!(
+        "hephaestus-firecracker listening on {}",
+        args.api_sock.display()
+    );
+
+    let backend = Arc::new(Mutex::new(VzBackend::new(args.id)));
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let backend = backend.clone();
+        tokio::task::spawn(async move {
+            if let Err(err) = server::serve_connection(stream, backend).await {
+                eprintln!("connection error: {err}");
+            }
+        });
+    }
+}
