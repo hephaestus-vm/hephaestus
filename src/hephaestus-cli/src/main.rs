@@ -47,7 +47,7 @@ usage: hephaestus run \\
     --initfs <path-to-ext4> \\
     --rootfs <path-to-ext4> \\
     [--cpus N] [--memory-mib N] [--cwd <path>] \\
-    [--network] \\
+    [--network] [--tty] \\
     -- <argv...>";
 
 #[derive(Debug)]
@@ -61,6 +61,7 @@ struct RunOptions {
     cwd: Option<String>,
     argv: Vec<String>,
     network: bool,
+    tty: bool,
 }
 
 fn parse_run_args(args: &mut impl Iterator<Item = String>) -> Result<RunOptions, String> {
@@ -74,6 +75,7 @@ fn parse_run_args(args: &mut impl Iterator<Item = String>) -> Result<RunOptions,
         cwd: None,
         argv: Vec::new(),
         network: false,
+        tty: false,
     };
     let mut past_double_dash = false;
     while let Some(arg) = args.next() {
@@ -103,6 +105,7 @@ fn parse_run_args(args: &mut impl Iterator<Item = String>) -> Result<RunOptions,
             }
             "--cwd" => opts.cwd = Some(require_value(args, "--cwd")?),
             "--network" => opts.network = true,
+            "--tty" => opts.tty = true,
             other => return Err(format!("unknown flag `{other}`")),
         }
     }
@@ -148,7 +151,7 @@ fn run(opts: RunOptions) -> ExitCode {
     if let Some(cwd) = opts.cwd.clone() {
         spec = spec.cwd(cwd);
     }
-    spec = spec.networking(opts.network);
+    spec = spec.networking(opts.network).tty(opts.tty);
 
     let stdio = TerminalSink::default();
     let vm = match spec.build(stdio) {

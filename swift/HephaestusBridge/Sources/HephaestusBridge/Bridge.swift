@@ -8,6 +8,7 @@ import ContainerizationArchive
 import ContainerizationEXT4
 import ContainerizationError
 import ContainerizationExtras
+import ContainerizationOS
 import Dispatch
 import Foundation
 
@@ -176,9 +177,19 @@ private final class CallbackWriter: Writer, @unchecked Sendable {
 
 private final class VmHandle: @unchecked Sendable {
     let container: LinuxContainer
+    /// Host's controlling terminal, retained when TTY mode is requested so
+    /// we can restore its termios attributes when the handle is freed.
+    let terminal: Terminal?
 
-    init(container: LinuxContainer) {
+    init(container: LinuxContainer, terminal: Terminal?) {
         self.container = container
+        self.terminal = terminal
+    }
+
+    deinit {
+        // Belt-and-suspenders: if the caller missed a stop() we still want
+        // the user's shell back from raw mode.
+        terminal?.tryReset()
     }
 }
 
@@ -245,6 +256,12 @@ public func hb_vm_new(
             CallbackWriter(callback: $0, userdata: cfg.stdio_userdata)
         }
 
+        // TTY mode: when requested, grab the host's controlling terminal so
+        // we can wire both stdio and pty behavior. The actual `setraw()`
+        // happens at start time (in hb_vm_start) so that if construction
+        // errors out the user's terminal is never disturbed.
+        let terminal: Terminal? = cfg.enable_tty ? try Terminal.current : nil
+
         // Send the guest's serial console to a file so we can tail it for
         // boot diagnostics when things go wrong inside the VM.
         let bootLogURL = URL(
@@ -268,8 +285,16 @@ public func hb_vm_new(
             if cfg.memory_mib > 0 {
                 c.memoryInBytes = cfg.memory_mib * (1 << 20)
             }
-            c.process.stdout = stdoutWriter
-            c.process.stderr = stderrWriter
+            if let terminal {
+                // setTerminalIO sets terminal=true and wires stdin+stdout
+                // through the pty. Containerization validates that stderr is
+                // *not* set in that mode (stderr is merged into the pty
+                // stream), so we leave it nil.
+                c.process.setTerminalIO(terminal: terminal)
+            } else {
+                c.process.stdout = stdoutWriter
+                c.process.stderr = stderrWriter
+            }
             c.bootLog = BootLog.file(path: bootLogURL)
             if cfg.enable_networking {
                 // Use VZ's built-in NAT (VZNATNetworkDeviceAttachment) via
@@ -289,7 +314,7 @@ public func hb_vm_new(
             }
         }
 
-        let handle = VmHandle(container: container)
+        let handle = VmHandle(container: container, terminal: terminal)
         let opaque = Unmanaged.passRetained(handle).toOpaque()
         outVm.pointee = opaque.assumingMemoryBound(to: HbVm.self)
         outErr?.pointee = nil
@@ -338,10 +363,16 @@ public func hb_vm_start(
 ) -> Int32 {
     guard let handle = borrow(vm, outErr) else { return Status.invalidArgument }
     do {
+        // In TTY mode we take over the host terminal just before starting
+        // the guest. Any failure below should still restore cooked mode,
+        // which `deinit` guarantees; this path gives prompt recovery on
+        // the happy path via hb_vm_stop.
+        try handle.terminal?.setraw()
         try runSync { try await handle.container.start() }
         outErr?.pointee = nil
         return Status.ok
     } catch {
+        handle.terminal?.tryReset()
         writeError(outErr, formatError(error))
         return Status.swiftError
     }
@@ -373,9 +404,11 @@ public func hb_vm_stop(
     guard let handle = borrow(vm, outErr) else { return Status.invalidArgument }
     do {
         try runSync { try await handle.container.stop() }
+        handle.terminal?.tryReset()
         outErr?.pointee = nil
         return Status.ok
     } catch {
+        handle.terminal?.tryReset()
         writeError(outErr, formatError(error))
         return Status.swiftError
     }

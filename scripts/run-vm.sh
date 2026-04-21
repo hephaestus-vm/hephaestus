@@ -35,6 +35,9 @@ extra_flags=()
 if [[ "${HEPHAESTUS_NETWORK:-0}" == "1" ]]; then
     extra_flags+=(--network)
 fi
+if [[ "${HEPHAESTUS_TTY:-0}" == "1" ]]; then
+    extra_flags+=(--tty)
+fi
 
 exec "$bin" run --id dev \
     --kernel "$kernel" \

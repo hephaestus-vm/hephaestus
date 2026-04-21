@@ -57,6 +57,12 @@ pub struct HbVmConfig {
     /// outbound IPv4 connectivity. Uses VZ's built-in NAT which only
     /// requires the virtualization entitlement.
     pub enable_networking: bool,
+    /// When true, wire the guest process to the host's controlling
+    /// terminal as a pty. Puts the host TTY in raw mode so keystrokes
+    /// (including Ctrl-C, Ctrl-D) are delivered to the guest rather than
+    /// interpreted by the host shell. The bridge restores the original
+    /// TTY attributes when the handle is freed, even on error paths.
+    pub enable_tty: bool,
 }
 
 /// Return status for fallible FFI calls.
@@ -131,6 +137,7 @@ pub struct Spec {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
     pub networking: bool,
+    pub tty: bool,
 }
 
 impl Spec {
@@ -170,6 +177,11 @@ impl Spec {
 
     pub fn networking(mut self, enabled: bool) -> Self {
         self.networking = enabled;
+        self
+    }
+
+    pub fn tty(mut self, enabled: bool) -> Self {
+        self.tty = enabled;
         self
     }
 
@@ -239,6 +251,7 @@ impl Vm {
             on_stderr: Some(trampoline_stderr),
             stdio_userdata: stdio_state.userdata(),
             enable_networking: spec.networking,
+            enable_tty: spec.tty,
         };
 
         let mut out_vm: *mut HbVm = std::ptr::null_mut();

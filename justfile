@@ -81,6 +81,11 @@ shell: build
 network-check: build
     HEPHAESTUS_NETWORK=1 scripts/run-vm.sh /bin/sh -c 'ip addr; ip route; wget -q -O- http://example.com | head -c 200'
 
+# Drop into an interactive /bin/sh inside the guest with networking on.
+# Use Ctrl-D or `exit` to leave.
+sh: build
+    HEPHAESTUS_NETWORK=1 HEPHAESTUS_TTY=1 scripts/run-vm.sh /bin/sh
+
 # Tail the kernel boot log from the last VM run (default id=dev).
 bootlog id='dev':
     #!/usr/bin/env bash
