@@ -12,3 +12,7 @@ AWS_LC_SYS_NO_JITTER_ENTROPY = "1"
 # disable AVX512 as it adds 600k of binary size
 # this was only used for MMDS token generation
 AWS_LC_SYS_CFLAGS = "-DMY_ASSEMBLER_IS_TOO_OLD_FOR_512AVX"
+# Match SwiftPM's macOS floor so the linker doesn't pull in back-deploy
+# Swift runtime shims (libswift_Concurrency.dylib etc. at @rpath) for
+# deployment targets older than 12.
+MACOSX_DEPLOYMENT_TARGET = "15.0"

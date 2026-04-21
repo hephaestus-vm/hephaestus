@@ -21,4 +21,5 @@ tags
 # hephaestus additions
 /swift/**/.build
 /swift/**/.swiftpm
+/swift/HephaestusBridge/Sources/CHephaestusBridge/include/hephaestus_bridge.h
 

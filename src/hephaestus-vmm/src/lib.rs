@@ -1,7 +1,9 @@
 //! Placeholder for the containerization-backed VMM.
 //!
-//! M0 only exposes a ping passthrough to prove the FFI pipeline. Real VM
-//! lifecycle (boot, wait, stop) arrives in M1/M2.
+//! M1 re-exports the bridge's `Vm` wrapper so callers don't reach across the
+//! FFI crate directly. Real VM lifecycle (start, wait, stop) arrives in M2.
+
+pub use hephaestus_bridge::{Vm, VmError};
 
 pub fn ping() -> &'static str {
     hephaestus_bridge::ping()

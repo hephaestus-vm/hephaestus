@@ -9,7 +9,7 @@ description = "Rust-side of the Swift FFI bridge to Apple's containerization fra
 bench = false
 
 [build-dependencies]
-# build.rs has no Rust deps; it only shells out to `swift build`.
+cbindgen = "0.29"
 
 [dependencies]
 

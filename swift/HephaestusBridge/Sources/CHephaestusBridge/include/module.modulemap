@@ -1,0 +1,4 @@
+module CHephaestusBridge {
+    umbrella header "hephaestus_bridge.h"
+    export *
+}
