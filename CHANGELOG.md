@@ -16,7 +16,8 @@ or vminitd.
 ### Added
 
 - `guest/hephaestus-agent` — new out-of-workspace Rust crate cross-
-  compiled to `aarch64-unknown-linux-musl` via `zig cc`. Serves as PID 1
+  compiled to `aarch64-unknown-linux-musl` (rustup + `rust-lld`, no
+  third-party toolchain). Serves as PID 1
   out of a 184 KB gzipped-cpio initramfs: mounts `/proc`/`/sys`/`/dev`,
   mounts `/dev/vda` at `/newroot`, `chroot`s in, listens on vsock port
   1234, reads a length-prefixed UTF-8 command, `exec`s `/bin/sh -c CMD`,
