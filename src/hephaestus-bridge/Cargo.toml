@@ -1,6 +1,6 @@
 [package]
 name = "hephaestus-bridge"
-version = "0.0.1-dev"
+version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Rust-side of the Swift FFI bridge to Apple's containerization framework."
