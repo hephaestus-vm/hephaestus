@@ -41,6 +41,12 @@ struct Args {
     /// MicroVM identifier used in instance-info responses.
     #[arg(long, default_value = "anonymous-instance")]
     id: String,
+    /// Optional warm-pool directory built by `hephaestus pool init`.
+    /// When set, `InstanceStart` tries to restore from a matching slot
+    /// before falling back to cold boot. See `docs/hephaestus-progress.md`
+    /// for the agent-init divergence note.
+    #[arg(long)]
+    pool_dir: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -59,7 +65,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.api_sock.display()
     );
 
-    let backend = Arc::new(Mutex::new(VzBackend::new(args.id)));
+    let mut backend = VzBackend::new(args.id);
+    if let Some(dir) = args.pool_dir.as_deref() {
+        match hephaestus_pool::Pool::open(dir) {
+            Ok(pool) => {
+                eprintln!(
+                    "hephaestus-firecracker: pool attached at {} ({} slots)",
+                    pool.dir.display(),
+                    pool.meta.slots
+                );
+                backend = backend.with_pool(pool);
+            }
+            Err(err) => {
+                eprintln!(
+                    "hephaestus-firecracker: --pool-dir {} unusable: {err}; running pool-less",
+                    dir.display()
+                );
+            }
+        }
+    }
+    let backend = Arc::new(Mutex::new(backend));
 
     loop {
         let (stream, _) = listener.accept().await?;

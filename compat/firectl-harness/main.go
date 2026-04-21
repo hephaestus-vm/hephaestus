@@ -47,6 +47,9 @@ func main() {
 		logFile  = flag.String("log", "", "if set, PUT /logger with this path before boot")
 		skipBoot = flag.Bool("skip-boot", false, "configure only, do not InstanceStart")
 		pause    = flag.Bool("pause", false, "after boot, exercise PATCH /vm Paused/Resumed")
+		vcpu     = flag.Int64("vcpu", 1, "vcpu count for PUT /machine-config")
+		mem      = flag.Int64("mem", 256, "initial memory MiB for PUT /machine-config")
+		memPatch = flag.Int64("mem-patch", 512, "memory MiB for the PATCH /machine-config bump")
 	)
 	flag.Parse()
 
@@ -101,21 +104,16 @@ func main() {
 	}
 
 	h.run("PUT /machine-config", func() error {
-		var (
-			vcpu int64 = 1
-			mem  int64 = 256
-		)
 		_, err := ops.PutMachineConfiguration(operations.NewPutMachineConfigurationParams().WithBody(&models.MachineConfiguration{
-			VcpuCount:  &vcpu,
-			MemSizeMib: &mem,
+			VcpuCount:  vcpu,
+			MemSizeMib: mem,
 		}))
 		return err
 	})
 
 	h.run("PATCH /machine-config (mem bump)", func() error {
-		var mem int64 = 512
 		_, err := ops.PatchMachineConfiguration(operations.NewPatchMachineConfigurationParams().WithBody(&models.MachineConfiguration{
-			MemSizeMib: &mem,
+			MemSizeMib: memPatch,
 		}))
 		return err
 	})

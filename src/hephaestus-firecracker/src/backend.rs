@@ -13,6 +13,7 @@ use hephaestus_fc_api::vmm_config::logger::LoggerConfig;
 use hephaestus_fc_api::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
+use hephaestus_pool::{ClaimedSlot, Pool, PoolMatchSpec};
 use hephaestus_vmm::{VzSpec, VzVm};
 
 #[derive(Debug)]
@@ -23,7 +24,12 @@ pub struct VzBackend {
     root_drive: Option<PathBuf>,
     iface: Option<NetworkInterfaceConfig>,
     machine_config: MachineConfig,
+    /// Drop order matters: `vm` is dropped before `pool_slot` so the
+    /// VM tears down before the slot's `Drop` deletes the rootfs the VM
+    /// was reading from.
     vm: Option<VzVm>,
+    pool_slot: Option<ClaimedSlot>,
+    pool: Option<Pool>,
 }
 
 impl VzBackend {
@@ -36,7 +42,18 @@ impl VzBackend {
             iface: None,
             machine_config: MachineConfig::default(),
             vm: None,
+            pool_slot: None,
+            pool: None,
         }
+    }
+
+    /// Attach a warm pool the backend will try to claim from at
+    /// `InstanceStart`. On a config mismatch or all-slots-busy, the
+    /// backend silently falls back to cold boot — the client sees
+    /// `start_micro_vm` either way.
+    pub fn with_pool(mut self, pool: Pool) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     fn require_preboot(&self) -> Result<(), VmmBackendError> {
@@ -228,6 +245,53 @@ impl VmmBackend for VzBackend {
         let memory = u64::try_from(self.machine_config.mem_size_mib)
             .map_err(|err| VmmBackendError::InvalidConfig(err.to_string()))?;
         let log = PathBuf::from(format!("/tmp/hephaestus-firecracker-{}.log", self.id));
+
+        // Pool fast-path. Match against the requested kernel+rootfs+cpu+
+        // memory tuple; on a hit we restore from the snapshot, skip
+        // cold-boot kernel init, and the client sees an InstanceStart
+        // 204 in ~tens of ms instead of hundreds. On any miss
+        // (no pool, config mismatch, all slots busy, restore failure)
+        // we silently fall through to cold boot — same client-visible
+        // contract.
+        if let Some(pool) = self.pool.as_ref() {
+            let spec = PoolMatchSpec {
+                kernel: kernel.clone(),
+                rootfs: rootfs.clone(),
+                vcpu_count: cpu,
+                memory_mib: memory,
+            }
+            .canonicalize();
+            match pool.try_claim_matching_slot(&spec) {
+                Ok(Some(slot)) => match pool.restore_into_vm(&slot, Some(&log)) {
+                    Ok((vm, restore_nanos)) => {
+                        eprintln!(
+                            "hephaestus-firecracker: pool hit slot={} restore={}ms",
+                            slot.index,
+                            restore_nanos / 1_000_000
+                        );
+                        self.vm = Some(vm);
+                        self.pool_slot = Some(slot);
+                        self.state = VmState::Running;
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "hephaestus-firecracker: pool restore failed ({err}); cold-booting"
+                        );
+                        // Slot dropped here releases the flock; cold path
+                        // takes over below.
+                    }
+                },
+                Ok(None) => {
+                    // Either config mismatch or all slots busy — cold-boot.
+                }
+                Err(err) => {
+                    eprintln!(
+                        "hephaestus-firecracker: pool claim error ({err}); cold-booting"
+                    );
+                }
+            }
+        }
 
         let mut spec = VzSpec::new(&kernel, &rootfs, &log, boot_args)
             .cpus(cpu)

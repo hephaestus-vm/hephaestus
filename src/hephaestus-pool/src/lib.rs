@@ -29,7 +29,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use hephaestus_vmm::{vz_exec_snapshot_restore, vz_exec_snapshot_save};
+use hephaestus_vmm::{
+    VzVm, vz_exec_snapshot_restore, vz_exec_snapshot_save, vz_pool_restore_long,
+};
+
+/// Mirror Swift `hb_vz_exec_snapshot_save`'s 0-means-default fallback.
+/// Surfaced here so `PoolMeta` always records concrete values.
+const DEFAULT_CPUS: u32 = 2;
+const DEFAULT_MEMORY_MIB: u64 = 512;
 use nix::fcntl::{Flock, FlockArg};
 
 /// Pool state persisted to `<dir>/meta`.
@@ -49,15 +56,49 @@ pub struct PoolMeta {
 /// slot's rootfs clone so the slot becomes "ready" for the next claimant.
 pub struct ClaimedSlot {
     pub index: u32,
-    /// Slot directory on disk. Kept for future consumers (e.g., the
-    /// Firecracker-compat HTTP daemon) that want to introspect a claim —
-    /// the CLI doesn't use it today.
-    #[allow(dead_code)]
     pub path: PathBuf,
     pub rootfs: PathBuf,
     /// Held as long as we own the slot. Dropping this struct releases the
     /// flock and closes the fd.
     _lock: Flock<File>,
+}
+
+impl std::fmt::Debug for ClaimedSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimedSlot")
+            .field("index", &self.index)
+            .field("path", &self.path)
+            .field("rootfs", &self.rootfs)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What an HTTP-API caller asks for at `InstanceStart` time. The pool
+/// matches it against `PoolMeta` to decide hit vs cold-boot.
+///
+/// `boot_args` is intentionally absent: VZ's `restoreMachineStateFrom:`
+/// resumes from the saved kernel state, so the cmdline encoded in the
+/// snapshot's bootloader config is what the guest sees. The client's
+/// supplied cmdline can't take effect on a restored VM. Comparing it
+/// would just shrink the hit rate without changing semantics. See the
+/// "agent-init divergence" design note in `docs/hephaestus-progress.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolMatchSpec {
+    pub kernel: PathBuf,
+    pub rootfs: PathBuf,
+    pub vcpu_count: u32,
+    pub memory_mib: u64,
+}
+
+impl PoolMatchSpec {
+    /// Canonicalize the path fields. Returns the spec unchanged for any
+    /// path that fails to canonicalize (missing file, permission denied)
+    /// — the pool match will then just miss, which is the right outcome.
+    pub fn canonicalize(mut self) -> Self {
+        if let Ok(p) = self.kernel.canonicalize() { self.kernel = p; }
+        if let Ok(p) = self.rootfs.canonicalize() { self.rootfs = p; }
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -104,6 +145,13 @@ impl Pool {
         let pristine = dir.join("pristine.ext4");
         let save = dir.join("save.bin");
 
+        // Normalize 0 → Swift-side defaults so PoolMeta matches what the
+        // VM was actually warmed with. Without this, the HTTP backend's
+        // strict `(cpu, mem)` match check rejects every request from a
+        // client that asked for the same defaults the user implied.
+        let cpus = if cpus == 0 { DEFAULT_CPUS } else { cpus };
+        let memory_mib = if memory_mib == 0 { DEFAULT_MEMORY_MIB } else { memory_mib };
+
         // Clone the source rootfs into the pool. cp -c = APFS CoW, so
         // this is near-instant for any size.
         clone_file(rootfs_source, &pristine)?;
@@ -146,6 +194,31 @@ impl Pool {
         }
         let meta = PoolMeta::read(&meta_path)?;
         Ok(Pool { dir, meta })
+    }
+
+    /// True iff the pool was warmed for a config compatible with `spec`.
+    /// `pristine` is the canonicalized rootfs that VZ's snapshot points
+    /// at, so we compare against that (not `meta.rootfs`, which doesn't
+    /// exist as a separate field).
+    pub fn matches(&self, spec: &PoolMatchSpec) -> bool {
+        self.meta.kernel == spec.kernel
+            && self.meta.pristine == spec.rootfs
+            && self.meta.cpus == spec.vcpu_count
+            && self.meta.memory_mib == spec.memory_mib
+    }
+
+    /// Non-blocking claim, gated on a config match. Returns `Ok(None)`
+    /// either when the pool's config doesn't match (cold-boot intent)
+    /// or when every slot is held — caller can't tell which, but for
+    /// the HTTP backend that's fine: both fall through to cold boot.
+    pub fn try_claim_matching_slot(
+        &self,
+        spec: &PoolMatchSpec,
+    ) -> Result<Option<ClaimedSlot>, PoolError> {
+        if !self.matches(spec) {
+            return Ok(None);
+        }
+        self.try_claim_slot()
     }
 
     /// Non-blocking claim. Walks slots in order and returns the first
@@ -240,6 +313,43 @@ impl Pool {
         let _ = fs::remove_file(&slot.rootfs);
 
         result.map(|(code, _nanos)| code).map_err(PoolError::VmRestore)
+    }
+
+    /// Restore the pool snapshot into a long-running [`VzVm`] handle and
+    /// return it together with the restore wall-time (nanoseconds). Used
+    /// by the HTTP API path: the caller (e.g. `VzBackend`) holds the VM
+    /// handle for the server's lifetime and the `ClaimedSlot` for at
+    /// least as long, so the per-slot rootfs clone stays alive while the
+    /// VM is reading from it.
+    ///
+    /// Drop order is the caller's responsibility: the [`VzVm`] handle
+    /// must be dropped *before* the [`ClaimedSlot`], otherwise the slot's
+    /// `Drop` will delete the rootfs out from under a still-attached VM.
+    /// `VzBackend` arranges this by listing `vm` before `pool_slot` in
+    /// its struct definition (Rust drops fields in declaration order).
+    pub fn restore_into_vm(
+        &self,
+        slot: &ClaimedSlot,
+        log: Option<&Path>,
+    ) -> Result<(VzVm, u64), PoolError> {
+        clone_file(&self.meta.pristine, &slot.rootfs)?;
+        match vz_pool_restore_long(
+            &self.meta.kernel,
+            &self.meta.initramfs,
+            &slot.rootfs,
+            &self.meta.save,
+            log,
+            self.meta.cpus,
+            self.meta.memory_mib,
+        ) {
+            Ok(pair) => Ok(pair),
+            Err(err) => {
+                // Restore failed → tear down the rootfs we just cloned so
+                // the slot is left "ready", not "stuck mid-claim".
+                let _ = fs::remove_file(&slot.rootfs);
+                Err(PoolError::VmRestore(err))
+            }
+        }
     }
 
     /// Remove every file/dir under `dir` and the pool dir itself. Safe
@@ -581,6 +691,62 @@ memory_mib=128
         drop(claim);
         let after = pool.stats().unwrap();
         assert_eq!(after.iter().filter(|s| s.busy).count(), 0);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn spec_for(pool: &Pool) -> PoolMatchSpec {
+        PoolMatchSpec {
+            kernel: pool.meta.kernel.clone(),
+            rootfs: pool.meta.pristine.clone(),
+            vcpu_count: pool.meta.cpus,
+            memory_mib: pool.meta.memory_mib,
+        }
+    }
+
+    #[test]
+    fn matches_exact_spec() {
+        let d = tmp_for("match_exact");
+        let pool = make_fake_pool(&d, 1);
+        assert!(pool.matches(&spec_for(&pool)));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn matches_rejects_each_field_when_changed() {
+        let d = tmp_for("match_field");
+        let pool = make_fake_pool(&d, 1);
+        let base = spec_for(&pool);
+
+        let mut s = base.clone(); s.kernel = PathBuf::from("/different/kernel");
+        assert!(!pool.matches(&s), "kernel mismatch should miss");
+        let mut s = base.clone(); s.rootfs = PathBuf::from("/different/rootfs");
+        assert!(!pool.matches(&s), "rootfs mismatch should miss");
+        let mut s = base.clone(); s.vcpu_count = pool.meta.cpus + 1;
+        assert!(!pool.matches(&s), "vcpu mismatch should miss");
+        let mut s = base.clone(); s.memory_mib = pool.meta.memory_mib + 1;
+        assert!(!pool.matches(&s), "memory mismatch should miss");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn try_claim_matching_returns_none_on_config_mismatch() {
+        let d = tmp_for("match_claim_miss");
+        let pool = make_fake_pool(&d, 1);
+        let mut spec = spec_for(&pool);
+        spec.memory_mib += 1;
+        let claim = pool.try_claim_matching_slot(&spec).unwrap();
+        assert!(claim.is_none(), "mismatched spec must not consume a slot");
+        // And the slot is still claimable via the unmatched primitive.
+        assert!(pool.try_claim_slot().unwrap().is_some());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn try_claim_matching_succeeds_on_matching_spec() {
+        let d = tmp_for("match_claim_hit");
+        let pool = make_fake_pool(&d, 1);
+        let claim = pool.try_claim_matching_slot(&spec_for(&pool)).unwrap();
+        assert!(claim.is_some(), "matching spec should yield a claim");
         fs::remove_dir_all(&d).unwrap();
     }
 

@@ -208,6 +208,18 @@ unsafe extern "C" {
     fn hb_vz_long_resume(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
     fn hb_vz_long_stop(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
     fn hb_vz_long_free(vm: *mut HbVzVm);
+    fn hb_vz_pool_restore_long(
+        kernel_path: *const c_char,
+        initramfs_path: *const c_char,
+        rootfs_path: *const c_char,
+        save_path: *const c_char,
+        log_path: *const c_char,
+        cpu_count: u32,
+        memory_mib: u64,
+        out_vm: *mut *mut HbVzVm,
+        out_restore_nanos: *mut u64,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
 }
 
 // =============================================================================
@@ -872,6 +884,53 @@ pub fn vz_exec_snapshot_restore(
     };
     status.into_result(out_err)?;
     Ok((exit_code, restore_nanos))
+}
+
+/// Restore a pool snapshot into a long-running [`VzVm`] handle. Caller
+/// owns the resulting VM (start has already happened — VZ resumed from
+/// the saved state during the restore call) and is responsible for
+/// dropping it to release VZ resources.
+///
+/// Returns the (handle, restore-wall-time-nanos) pair so the caller can
+/// log warm-start latency.
+pub fn vz_pool_restore_long(
+    kernel: &Path,
+    initramfs: &Path,
+    rootfs: &Path,
+    save: &Path,
+    log: Option<&Path>,
+    cpu_count: u32,
+    memory_mib: u64,
+) -> Result<(VzVm, u64), VmError> {
+    let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
+    let initramfs_c = CString::new(path_to_str(initramfs, "initramfs")?)?;
+    let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
+    let save_c = CString::new(path_to_str(save, "save")?)?;
+    let log_c = log
+        .map(|p| CString::new(path_to_str(p, "log").unwrap_or("")))
+        .transpose()?;
+    let log_ptr = log_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+
+    let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
+    let mut out_err: *mut c_char = std::ptr::null_mut();
+    let mut restore_nanos: u64 = 0;
+    let status = unsafe {
+        hb_vz_pool_restore_long(
+            kernel_c.as_ptr(),
+            initramfs_c.as_ptr(),
+            rootfs_c.as_ptr(),
+            save_c.as_ptr(),
+            log_ptr,
+            cpu_count,
+            memory_mib,
+            &mut out_vm,
+            &mut restore_nanos,
+            &mut out_err,
+        )
+    };
+    status.into_result(out_err)?;
+    debug_assert!(!out_vm.is_null());
+    Ok((VzVm { handle: out_vm }, restore_nanos))
 }
 
 /// Pause a booted VM and save its full state to disk. Builds a fresh

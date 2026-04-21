@@ -8,7 +8,7 @@ use hephaestus_vmm::{
     vz_exec_snapshot_restore, vz_exec_snapshot_save, vz_sh, vz_snapshot_restore, vz_snapshot_save,
 };
 
-mod pool;
+use hephaestus_pool as pool;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);

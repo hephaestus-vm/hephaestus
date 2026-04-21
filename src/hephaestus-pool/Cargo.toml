@@ -1,0 +1,13 @@
+[package]
+name = "hephaestus-pool"
+version = "0.3.0-dev"
+edition = "2024"
+license = "Apache-2.0"
+description = "Warm-pool primitive for hephaestus: disk-backed, flock-guarded VM snapshot slots."
+
+[dependencies]
+hephaestus-vmm = { path = "../hephaestus-vmm" }
+nix = { version = "0.30", features = ["fs"] }
+
+[lints]
+workspace = true

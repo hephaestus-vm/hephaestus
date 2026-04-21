@@ -263,6 +263,41 @@ fc-compat boot='1': build fc-harness-build
     if [[ "{{boot}}" == "0" ]]; then args+=(-skip-boot); else args+=(-pause); fi
     compat/firectl-harness/firectl-harness "${args[@]}"
 
+# Pool-backed compat smoke. Initializes a 1-slot warm pool with the same
+# kernel + rootfs + 2 CPU / 512 MiB tuple the harness asks for, then
+# starts hephaestus-firecracker --pool-dir and runs the harness; the
+# server log should show "pool hit slot=0 restore=...ms" instead of a
+# cold boot.
+fc-compat-pool: build build-agent fc-harness-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cdir="$HOME/Library/Application Support/com.apple.container"
+    kernel="$(ls "$cdir"/kernels/vmlinux-* 2>/dev/null | head -1 || true)"
+    snaps=("$cdir"/snapshots/*/snapshot)
+    if [[ -z "$kernel" ]] || [[ ! -e "${snaps[0]:-}" ]]; then
+        echo "no artifacts; run: just artifacts" >&2; exit 1
+    fi
+    rootfs_src=$(stat -f '%z %N' "${snaps[@]}" | sort -nr | head -1 | cut -d' ' -f2-)
+    pool="${TMPDIR:-/tmp}/hephaestus-fc-pool"
+    {{bin}} pool destroy --dir "$pool" 2>/dev/null || true
+    {{bin}} pool init --dir "$pool" --kernel "$kernel" --rootfs "$rootfs_src" --size 1
+    sock="${TMPDIR:-/tmp}/hephaestus-fc-pool.socket"
+    log="${TMPDIR:-/tmp}/hephaestus/fc-pool.log"
+    rm -f "$sock" "$log"
+    {{bin}}-firecracker --api-sock "$sock" --id fc-pool --pool-dir "$pool" &
+    server=$!
+    trap 'kill $server 2>/dev/null || true; {{bin}} pool destroy --dir "$pool" 2>/dev/null || true' EXIT
+    for _ in $(seq 1 20); do [[ -S "$sock" ]] && break; sleep 0.1; done
+    # Match key needs the pool's pristine.ext4 path verbatim — pool's save
+    # references that exact file, so the client must point at it (not the
+    # apple/container snapshot the pool was *built from*).
+    # Pool was warmed at the Swift defaults (2 CPU, 512 MiB) — match those
+    # so the backend's strict tuple check hits.
+    compat/firectl-harness/firectl-harness \
+        -sock "$sock" -kernel "$kernel" -rootfs "$pool/pristine.ext4" \
+        -log "$log" -pause \
+        -vcpu 2 -mem 512 -mem-patch 512
+
 # Run cargo unit tests + ping + test-rootfs. No VM boot; safe without artifacts.
 test: build
     cargo test --workspace

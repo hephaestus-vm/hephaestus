@@ -1358,3 +1358,95 @@ private func borrowVz(
     let opaque = UnsafeMutableRawPointer(vm)
     return Unmanaged<VzVmHandle>.fromOpaque(opaque).takeUnretainedValue()
 }
+
+// =============================================================================
+// FFI: hb_vz_pool_restore_long — restore a pre-warmed snapshot into a
+// long-running VzVm handle (no command injection, no auto-stop).
+//
+// Counterpart to `hb_vz_long_new` + `hb_vz_long_start` for the cold-boot
+// path: rebuilds the snapshot-compatible config, restores from `savePath`,
+// resumes, and hands the caller a handle they pause/resume/stop/free with
+// the existing `hb_vz_long_*` family.
+//
+// Critical: the config we build here MUST mirror what
+// `ExecSession.makeSnapshotable` produced at save time, or VZ rejects
+// the restore with "configuration mismatch". `outRestoreNanos` reports
+// the wall time of restore+resume — the warm-start latency we'd want to
+// surface in metrics later.
+// =============================================================================
+
+@_cdecl("hb_vz_pool_restore_long")
+public func hb_vz_pool_restore_long(
+    kernelPath: UnsafePointer<CChar>?,
+    initramfsPath: UnsafePointer<CChar>?,
+    rootfsPath: UnsafePointer<CChar>?,
+    savePath: UnsafePointer<CChar>?,
+    logPath: UnsafePointer<CChar>?,
+    cpuCount: UInt32,
+    memoryMib: UInt64,
+    outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
+    outRestoreNanos: UnsafeMutablePointer<UInt64>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let kernelPath, let initramfsPath, let rootfsPath, let savePath, let outVm else {
+        writeError(outErr, "null path/out argument")
+        return Status.invalidArgument
+    }
+    let kernel = URL(fileURLWithPath: String(cString: kernelPath))
+    let initramfs = URL(fileURLWithPath: String(cString: initramfsPath))
+    let rootfs = URL(fileURLWithPath: String(cString: rootfsPath))
+    let save = URL(fileURLWithPath: String(cString: savePath))
+    let log: URL? = logPath.map { URL(fileURLWithPath: String(cString: $0)) }
+
+    let machineId = machineIdURL(forSavePath: save)
+
+    do {
+        let session = try ExecSession.makeSnapshotable(
+            kernel: kernel,
+            initramfs: initramfs,
+            rootfs: rootfs,
+            logURL: log,
+            machineIdURL: machineId,
+            cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
+            memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20)
+        )
+        // makeSnapshotable's session has no readabilityHandler / log handle
+        // to keep alive; the URL-based serial attachment owns its file.
+
+        let queue = DispatchQueue(label: "com.hephaestus.vz-pool-restore-\(UUID().uuidString)")
+        let holder = VMHolder()
+        queue.sync {
+            holder.vm = VZVirtualMachine(configuration: session.config, queue: queue)
+        }
+        guard holder.vm != nil else {
+            writeError(outErr, "failed to construct VZVirtualMachine")
+            return Status.swiftError
+        }
+
+        let restoreStart = DispatchTime.now()
+        try blockingRestore(queue: queue, holder: holder, from: save)
+        try blockingResume(queue: queue, holder: holder)
+        let restoreElapsed = DispatchTime.now().uptimeNanoseconds - restoreStart.uptimeNanoseconds
+        outRestoreNanos?.pointee = restoreElapsed
+
+        // The agent inside is sitting at accept() on vsock 1234 forever —
+        // we never connect, never send a command. Client treats this VM
+        // as a generic running instance. See "agent-init divergence" in
+        // docs/hephaestus-progress.md.
+        let serialLog = log ?? URL(fileURLWithPath: "/dev/null")
+        let handle = VzVmHandle(
+            queue: queue,
+            holder: holder,
+            config: session.config,
+            logURL: serialLog,
+            machineIdURL: machineId
+        )
+        let opaque = Unmanaged.passRetained(handle).toOpaque()
+        outVm.pointee = opaque.assumingMemoryBound(to: HbVzVm.self)
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}

@@ -12,6 +12,7 @@ bench = false
 
 [dependencies]
 hephaestus-fc-api = { path = "../hephaestus-fc-api" }
+hephaestus-pool = { path = "../hephaestus-pool" }
 hephaestus-vmm = { path = "../hephaestus-vmm" }
 
 clap = { version = "4.6.0", features = ["derive", "string"] }
