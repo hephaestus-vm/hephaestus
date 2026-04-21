@@ -90,6 +90,13 @@ unsafe extern "C" {
     fn hb_vm_stop(vm: *mut HbVm, out_err: *mut *mut c_char) -> HbStatus;
     fn hb_vm_free(vm: *mut HbVm);
     fn hb_string_free(s: *mut c_char);
+    fn hb_rootfs_from_tar(
+        tar_path: *const c_char,
+        out_path: *const c_char,
+        block_size_mib: u64,
+        compression: u32,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
 }
 
 // =============================================================================
@@ -379,6 +386,68 @@ impl HbStatus {
 
 fn path_to_str<'a>(p: &'a Path, label: &str) -> Result<&'a str, VmError> {
     p.to_str().ok_or_else(|| VmError::InvalidArgument(format!("{label} path is not UTF-8")))
+}
+
+// =============================================================================
+// Rootfs helpers — produce an ext4 block device from a tar archive.
+// =============================================================================
+
+/// Compression of a tar archive fed to `build_rootfs_from_tar`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    None,
+    Gzip,
+    Zstd,
+}
+
+impl Compression {
+    fn code(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Gzip => 1,
+            Self::Zstd => 2,
+        }
+    }
+
+    /// Peek the first bytes of a file to identify its compression format.
+    /// Returns `None` if the signature doesn't match a known format.
+    pub fn auto_detect(path: &Path) -> std::io::Result<Option<Self>> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path)?;
+        let mut head = [0u8; 4];
+        let n = f.read(&mut head)?;
+        if n >= 2 && head[0] == 0x1f && head[1] == 0x8b {
+            return Ok(Some(Self::Gzip));
+        }
+        if n >= 4 && head == [0x28, 0xb5, 0x2f, 0xfd] {
+            return Ok(Some(Self::Zstd));
+        }
+        Ok(None) // plausible uncompressed tar; caller may treat as None
+    }
+}
+
+/// Build an ext4 block device at `out` from the tar archive at `tar`.
+///
+/// `block_size_mib` is the minimum filesystem size; 0 → framework default.
+pub fn build_rootfs_from_tar(
+    tar: &Path,
+    out: &Path,
+    block_size_mib: u64,
+    compression: Compression,
+) -> Result<(), VmError> {
+    let tar_c = CString::new(path_to_str(tar, "tar")?)?;
+    let out_c = CString::new(path_to_str(out, "output")?)?;
+    let mut out_err: *mut c_char = std::ptr::null_mut();
+    let status = unsafe {
+        hb_rootfs_from_tar(
+            tar_c.as_ptr(),
+            out_c.as_ptr(),
+            block_size_mib,
+            compression.code(),
+            &mut out_err,
+        )
+    };
+    status.into_result(out_err)
 }
 
 /// Take ownership of a Swift-heap-allocated error string and free it.

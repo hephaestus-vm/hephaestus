@@ -37,6 +37,8 @@ let package = Package(
             dependencies: [
                 "CHephaestusBridge",
                 .product(name: "Containerization", package: "containerization"),
+                .product(name: "ContainerizationArchive", package: "containerization"),
+                .product(name: "ContainerizationEXT4", package: "containerization"),
             ],
             path: "Sources/HephaestusBridge"
         ),

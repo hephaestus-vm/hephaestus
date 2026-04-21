@@ -4,6 +4,8 @@
 
 import CHephaestusBridge
 import Containerization
+import ContainerizationArchive
+import ContainerizationEXT4
 import ContainerizationError
 import Dispatch
 import Foundation
@@ -335,4 +337,51 @@ private func borrow(
     }
     let opaque = UnsafeMutableRawPointer(vm)
     return Unmanaged<VmHandle>.fromOpaque(opaque).takeUnretainedValue()
+}
+
+// =============================================================================
+// hb_rootfs_from_tar — build an ext4 block device from a tar archive.
+// =============================================================================
+
+@_cdecl("hb_rootfs_from_tar")
+public func hb_rootfs_from_tar(
+    tarPath: UnsafePointer<CChar>?,
+    outPath: UnsafePointer<CChar>?,
+    blockSizeMib: UInt64,
+    compressionCode: UInt32,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let tarPath, let outPath else {
+        writeError(outErr, "null path")
+        return Status.invalidArgument
+    }
+
+    let tar = URL(fileURLWithPath: String(cString: tarPath))
+    let out = URL(fileURLWithPath: String(cString: outPath))
+
+    let filter: ContainerizationArchive.Filter
+    switch compressionCode {
+    case 0: filter = .none
+    case 1: filter = .gzip
+    case 2: filter = .zstd
+    default:
+        writeError(outErr, "unknown compression code \(compressionCode)")
+        return Status.invalidArgument
+    }
+
+    let sizeInBytes: UInt64 = (blockSizeMib == 0 ? 512 : blockSizeMib) * (1 << 20)
+
+    do {
+        // EXT4Unpacker isn't Sendable, so construct and use it inside the
+        // closure rather than capturing it across the actor hop.
+        try runSync {
+            let unpacker = EXT4Unpacker(blockSizeInBytes: sizeInBytes)
+            try await unpacker.unpack(archive: tar, compression: filter, at: out)
+        }
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, "\(error)")
+        return Status.swiftError
+    }
 }

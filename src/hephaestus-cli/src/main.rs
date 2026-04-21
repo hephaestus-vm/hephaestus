@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
 
-use hephaestus_vmm::{Spec, StdioSink};
+use hephaestus_vmm::{Compression, Spec, StdioSink, build_rootfs_from_tar};
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -20,13 +20,21 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("rootfs") => match parse_rootfs_args(&mut args) {
+            Ok(opts) => rootfs(opts),
+            Err(msg) => {
+                eprintln!("hephaestus: {msg}");
+                eprintln!("{ROOTFS_USAGE}");
+                ExitCode::from(2)
+            }
+        },
         Some(other) => {
             eprintln!("hephaestus: unknown subcommand `{other}`");
-            eprintln!("usage: hephaestus <ping|run>");
+            eprintln!("usage: hephaestus <ping|run|rootfs>");
             ExitCode::from(2)
         }
         None => {
-            eprintln!("usage: hephaestus <ping|run>");
+            eprintln!("usage: hephaestus <ping|run|rootfs>");
             ExitCode::from(2)
         }
     }
@@ -175,6 +183,97 @@ fn run(opts: RunOptions) -> ExitCode {
         ExitCode::from(code)
     } else {
         ExitCode::from(1)
+    }
+}
+
+const ROOTFS_USAGE: &str = "\
+usage: hephaestus rootfs --from-tar <path> --output <path.ext4> \\
+    [--size-mib N] [--compression auto|none|gzip|zstd]";
+
+#[derive(Debug)]
+struct RootfsOptions {
+    tar: PathBuf,
+    output: PathBuf,
+    size_mib: u64,
+    compression: Option<Compression>, // None → auto-detect
+}
+
+fn parse_rootfs_args(args: &mut impl Iterator<Item = String>) -> Result<RootfsOptions, String> {
+    let mut opts = RootfsOptions {
+        tar: PathBuf::new(),
+        output: PathBuf::new(),
+        size_mib: 512,
+        compression: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--from-tar" => opts.tar = require_value(args, "--from-tar")?.into(),
+            "--output" => opts.output = require_value(args, "--output")?.into(),
+            "--size-mib" => {
+                opts.size_mib = require_value(args, "--size-mib")?
+                    .parse()
+                    .map_err(|e| format!("invalid --size-mib: {e}"))?;
+            }
+            "--compression" => {
+                opts.compression = Some(match require_value(args, "--compression")?.as_str() {
+                    "auto" => return Err("--compression=auto is the default; omit the flag".into()),
+                    "none" => Compression::None,
+                    "gzip" => Compression::Gzip,
+                    "zstd" => Compression::Zstd,
+                    other => return Err(format!("unknown compression `{other}`")),
+                });
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    if opts.tar.as_os_str().is_empty() {
+        return Err("missing --from-tar".into());
+    }
+    if opts.output.as_os_str().is_empty() {
+        return Err("missing --output".into());
+    }
+    if !opts.tar.exists() {
+        return Err(format!("--from-tar path does not exist: {}", opts.tar.display()));
+    }
+    Ok(opts)
+}
+
+fn rootfs(opts: RootfsOptions) -> ExitCode {
+    let compression = match opts.compression {
+        Some(c) => c,
+        None => match Compression::auto_detect(&opts.tar) {
+            Ok(Some(c)) => {
+                eprintln!("hephaestus: auto-detected compression: {c:?}");
+                c
+            }
+            Ok(None) => {
+                eprintln!("hephaestus: no known compression header; assuming plain tar");
+                Compression::None
+            }
+            Err(e) => {
+                eprintln!("hephaestus: cannot read --from-tar: {e}");
+                return ExitCode::from(1);
+            }
+        },
+    };
+
+    eprintln!(
+        "hephaestus: unpacking {} → {} ({} MiB, {:?})",
+        opts.tar.display(),
+        opts.output.display(),
+        opts.size_mib,
+        compression
+    );
+
+    match build_rootfs_from_tar(&opts.tar, &opts.output, opts.size_mib, compression) {
+        Ok(()) => {
+            eprintln!("hephaestus: wrote {}", opts.output.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("hephaestus: rootfs build failed: {e}");
+            ExitCode::from(1)
+        }
     }
 }
 
