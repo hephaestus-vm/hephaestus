@@ -578,12 +578,16 @@ private final class ExitCodeBox: @unchecked Sendable {
 // no containerization.
 // =============================================================================
 
+/// Port the guest agent listens on for the command channel. Kept in sync
+/// with `guest/hephaestus-agent/src/main.rs::COMMAND_PORT`.
+private let agentCommandPort: UInt32 = 1234
+
 @_cdecl("hb_vz_exec")
 public func hb_vz_exec(
     kernelPath: UnsafePointer<CChar>?,
     initramfsPath: UnsafePointer<CChar>?,
     rootfsPath: UnsafePointer<CChar>?,
-    commandHex: UnsafePointer<CChar>?,
+    commandUtf8: UnsafePointer<CChar>?,
     logPath: UnsafePointer<CChar>?,
     cpuCount: UInt32,
     memoryMib: UInt64,
@@ -591,84 +595,29 @@ public func hb_vz_exec(
     outExitCode: UnsafeMutablePointer<Int32>?,
     outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
-    guard let kernelPath, let initramfsPath, let rootfsPath, let commandHex else {
+    guard let kernelPath, let initramfsPath, let rootfsPath, let commandUtf8 else {
         writeError(outErr, "null path or command argument")
         return Status.invalidArgument
     }
     let kernel = URL(fileURLWithPath: String(cString: kernelPath))
     let initramfs = URL(fileURLWithPath: String(cString: initramfsPath))
     let rootfs = URL(fileURLWithPath: String(cString: rootfsPath))
-    let commandHexStr = String(cString: commandHex)
-    // `logPath` is optional — if nil we discard serial output entirely.
+    let command = String(cString: commandUtf8)
     let log: URL? = logPath.map { URL(fileURLWithPath: String(cString: $0)) }
 
     do {
-        let config = VZVirtualMachineConfiguration()
-        config.cpuCount = Int(cpuCount == 0 ? 2 : cpuCount)
-        config.memorySize = (memoryMib == 0 ? 512 : memoryMib) * (1 << 20)
-
-        let bootloader = VZLinuxBootLoader(kernelURL: kernel)
-        bootloader.initialRamdiskURL = initramfs
-        // `rdinit=/init` tells the kernel to exec our agent as PID 1 out of
-        // the initramfs. `hephaestus.cmd=<hex>` is the payload the agent
-        // reads from /proc/cmdline. `quiet loglevel=3` keeps kernel chatter
-        // out of the serial stream so the agent's exit sentinel is easy to
-        // spot.
-        bootloader.commandLine =
-            "console=hvc0 rdinit=/init quiet loglevel=3 hephaestus.cmd=\(commandHexStr)"
-        config.bootLoader = bootloader
-
-        let rootfsAttachment = try VZDiskImageStorageDeviceAttachment(
-            url: rootfs,
-            readOnly: false
+        let session = try ExecSession.make(
+            kernel: kernel,
+            initramfs: initramfs,
+            rootfs: rootfs,
+            logURL: log,
+            cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
+            memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20)
         )
-        config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)]
-
-        // Intercept guest serial output: forward to `log` if given, parse
-        // for the `__HEPHAESTUS_EXIT_<code>__` sentinel, and signal the VM
-        // to stop once we've captured it.
-        let outputPipe = Pipe()
-        let exitSem = DispatchSemaphore(value: 0)
-        let exitBox = ExitFlagBox()
-        let codeBox = ExitCodeBox()
-        let logHandle: FileHandle? = log.flatMap { url in
-            FileManager.default.createFile(atPath: url.path, contents: nil)
-            return try? FileHandle(forWritingTo: url)
-        }
-        outputPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty || exitBox.signalled { return }
-            // Always write to the log (captures everything verbatim).
-            try? logHandle?.write(contentsOf: data)
-            // Stream to host stdout too, but strip the exit sentinel so it
-            // doesn't leak into the user's visible output.
-            if let text = String(data: data, encoding: .utf8),
-               let sentinelStart = text.range(of: exitSentinelPrefix)
-            {
-                // Everything before the sentinel: the user's command output
-                // (and agent diagnostics, which we accept as noise for now).
-                let before = text[..<sentinelStart.lowerBound]
-                if !before.isEmpty {
-                    try? FileHandle.standardOutput.write(contentsOf: Data(before.utf8))
-                }
-                if let code = parseExitSentinel(in: text) {
-                    codeBox.code = code
-                    exitBox.signalled = true
-                    exitSem.signal()
-                }
-            } else {
-                try? FileHandle.standardOutput.write(contentsOf: data)
-            }
-        }
-        let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
-        serial.attachment = VZFileHandleSerialPortAttachment(
-            fileHandleForReading: nil,
-            fileHandleForWriting: outputPipe.fileHandleForWriting
-        )
-        config.serialPorts = [serial]
-
-        config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
-        try config.validate()
+        let config = session.config
+        // Retain the session for the rest of this function so the serial
+        // pipe + log handle stay alive.
+        _ = session
 
         let queue = DispatchQueue(label: "com.hephaestus.vz-exec")
         let holder = VMHolder()
@@ -680,35 +629,41 @@ public func hb_vz_exec(
             return Status.swiftError
         }
 
-        // Also observe VZ state so a crash or early stop doesn't hang the
-        // host forever.
+        // KVO on state catches crashes / unexpected stops.
+        let stopSem = DispatchSemaphore(value: 0)
         let observerBox = ObservationBox()
         queue.sync {
             guard let vm = holder.vm else { return }
             observerBox.observation = vm.observe(\.state, options: [.new]) { vm, _ in
                 if vm.state == .stopped || vm.state == .error {
-                    if !exitBox.signalled {
-                        exitBox.signalled = true
-                        exitSem.signal()
-                    }
+                    stopSem.signal()
                 }
             }
         }
 
         try blockingStart(queue: queue, holder: holder)
 
-        let timeout = DispatchTime.now() + .seconds(Int(timeoutSeconds == 0 ? 300 : timeoutSeconds))
-        _ = exitSem.wait(timeout: timeout)
+        // Connect to the agent's vsock listener, send the command, read the
+        // exit code. Retries a few times so the host-side connect doesn't
+        // race against the agent finishing its mount+listen.
+        let exitCode = try sendCommandAndAwaitExit(
+            holder: holder,
+            queue: queue,
+            command: command
+        )
 
-        outputPipe.fileHandleForReading.readabilityHandler = nil
+        // Agent halts after responding, so wait for the clean VZ shutdown.
+        let timeout = DispatchTime.now() + .seconds(Int(timeoutSeconds == 0 ? 30 : timeoutSeconds))
+        _ = stopSem.wait(timeout: timeout)
+
+        session.close()
         _ = blockingStop(queue: queue, holder: holder)
         queue.sync {
             observerBox.observation?.invalidate()
             observerBox.observation = nil
         }
-        try? logHandle?.close()
 
-        outExitCode?.pointee = codeBox.code
+        outExitCode?.pointee = exitCode
         outErr?.pointee = nil
         return Status.ok
     } catch {
@@ -717,15 +672,430 @@ public func hb_vz_exec(
     }
 }
 
-private let exitSentinelPrefix = "__HEPHAESTUS_EXIT_"
-private let exitSentinelSuffix = "__"
+// =============================================================================
+// ExecSession: holds the VM config and all the resources (pipes, log
+// handles) that need to outlive `buildExecConfig`'s return. Stored on the
+// stack of the caller so ARC keeps the pipe/file alive for the session.
+// =============================================================================
 
-/// Scan a chunk of guest serial output for `__HEPHAESTUS_EXIT_<code>__` and
-/// return the parsed exit code, or nil if not present.
-private func parseExitSentinel(in text: String) -> Int32? {
-    guard let start = text.range(of: exitSentinelPrefix) else { return nil }
-    let after = text[start.upperBound...]
-    guard let end = after.range(of: exitSentinelSuffix) else { return nil }
-    let numeric = after[..<end.lowerBound]
-    return Int32(numeric)
+// =============================================================================
+// FFI: hb_vz_exec_snapshot_save — pre-warm a VM that's ready to accept
+// commands, then save its state. Pair with hb_vz_exec_snapshot_restore.
+// =============================================================================
+
+@_cdecl("hb_vz_exec_snapshot_save")
+public func hb_vz_exec_snapshot_save(
+    kernelPath: UnsafePointer<CChar>?,
+    initramfsPath: UnsafePointer<CChar>?,
+    rootfsPath: UnsafePointer<CChar>?,
+    savePath: UnsafePointer<CChar>?,
+    logPath: UnsafePointer<CChar>?,
+    cpuCount: UInt32,
+    memoryMib: UInt64,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let kernelPath, let initramfsPath, let rootfsPath, let savePath else {
+        writeError(outErr, "null path argument")
+        return Status.invalidArgument
+    }
+    let kernel = URL(fileURLWithPath: String(cString: kernelPath))
+    let initramfs = URL(fileURLWithPath: String(cString: initramfsPath))
+    let rootfs = URL(fileURLWithPath: String(cString: rootfsPath))
+    let save = URL(fileURLWithPath: String(cString: savePath))
+    let log: URL? = logPath.map { URL(fileURLWithPath: String(cString: $0)) }
+
+    do {
+        let session = try ExecSession.makeSnapshotable(
+            kernel: kernel,
+            initramfs: initramfs,
+            rootfs: rootfs,
+            logURL: log,
+            machineIdURL: machineIdURL(forSavePath: save),
+            cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
+            memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20)
+        )
+        defer { session.close() }
+
+        let queue = DispatchQueue(label: "com.hephaestus.vz-exec-save")
+        let holder = VMHolder()
+        queue.sync {
+            holder.vm = VZVirtualMachine(configuration: session.config, queue: queue)
+        }
+        guard holder.vm != nil else {
+            writeError(outErr, "failed to construct VZVirtualMachine")
+            return Status.swiftError
+        }
+
+        try blockingStart(queue: queue, holder: holder)
+
+        // Probe-connect until the agent is listening. Each failed connect
+        // just retries; the first success means the agent has reached
+        // accept() — exactly the steady state we want to snapshot.
+        let probe = try connectToAgent(holder: holder, queue: queue)
+        probe.close()
+        // Give the agent a brief moment to go back to accept() after
+        // reading EOF from the probe; otherwise the snapshot might capture
+        // mid-cleanup state which restores weirdly.
+        usleep(200_000)
+
+        try blockingPause(queue: queue, holder: holder)
+        try blockingSave(queue: queue, holder: holder, to: save)
+        _ = blockingStop(queue: queue, holder: holder)
+
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}
+
+// =============================================================================
+// FFI: hb_vz_exec_snapshot_restore — restore a pre-warmed VM, send it a
+// command over vsock, collect the exit code.
+// =============================================================================
+
+@_cdecl("hb_vz_exec_snapshot_restore")
+public func hb_vz_exec_snapshot_restore(
+    kernelPath: UnsafePointer<CChar>?,
+    initramfsPath: UnsafePointer<CChar>?,
+    rootfsPath: UnsafePointer<CChar>?,
+    savePath: UnsafePointer<CChar>?,
+    commandUtf8: UnsafePointer<CChar>?,
+    logPath: UnsafePointer<CChar>?,
+    cpuCount: UInt32,
+    memoryMib: UInt64,
+    outExitCode: UnsafeMutablePointer<Int32>?,
+    outRestoreNanos: UnsafeMutablePointer<UInt64>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let kernelPath, let initramfsPath, let rootfsPath, let savePath, let commandUtf8 else {
+        writeError(outErr, "null path or command argument")
+        return Status.invalidArgument
+    }
+    let kernel = URL(fileURLWithPath: String(cString: kernelPath))
+    let initramfs = URL(fileURLWithPath: String(cString: initramfsPath))
+    let rootfs = URL(fileURLWithPath: String(cString: rootfsPath))
+    let save = URL(fileURLWithPath: String(cString: savePath))
+    let command = String(cString: commandUtf8)
+    let log: URL? = logPath.map { URL(fileURLWithPath: String(cString: $0)) }
+
+    do {
+        let session = try ExecSession.makeSnapshotable(
+            kernel: kernel,
+            initramfs: initramfs,
+            rootfs: rootfs,
+            logURL: log,
+            machineIdURL: machineIdURL(forSavePath: save),
+            cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
+            memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20)
+        )
+        defer { session.close() }
+
+        let queue = DispatchQueue(label: "com.hephaestus.vz-exec-restore")
+        let holder = VMHolder()
+        queue.sync {
+            holder.vm = VZVirtualMachine(configuration: session.config, queue: queue)
+        }
+        guard holder.vm != nil else {
+            writeError(outErr, "failed to construct VZVirtualMachine")
+            return Status.swiftError
+        }
+
+        // Time restore + resume — the headline metric for the warm-start
+        // story.
+        let restoreStart = DispatchTime.now()
+        try blockingRestore(queue: queue, holder: holder, from: save)
+        try blockingResume(queue: queue, holder: holder)
+        let restoreElapsed = DispatchTime.now().uptimeNanoseconds - restoreStart.uptimeNanoseconds
+        outRestoreNanos?.pointee = restoreElapsed
+
+        let exitCode = try sendCommandAndAwaitExit(
+            holder: holder,
+            queue: queue,
+            command: command
+        )
+
+        // Give the agent a beat to halt the VM cleanly.
+        usleep(100_000)
+        _ = blockingStop(queue: queue, holder: holder)
+
+        outExitCode?.pointee = exitCode
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}
+
+private final class ExecSession: @unchecked Sendable {
+    let config: VZVirtualMachineConfiguration
+    let outputPipe: Pipe
+    let logHandle: FileHandle?
+
+    private init(
+        config: VZVirtualMachineConfiguration,
+        outputPipe: Pipe,
+        logHandle: FileHandle?
+    ) {
+        self.config = config
+        self.outputPipe = outputPipe
+        self.logHandle = logHandle
+    }
+
+    static func make(
+        kernel: URL,
+        initramfs: URL,
+        rootfs: URL,
+        logURL: URL?,
+        cpuCount: Int,
+        memoryBytes: UInt64
+    ) throws -> ExecSession {
+        let config = VZVirtualMachineConfiguration()
+        config.cpuCount = cpuCount
+        config.memorySize = memoryBytes
+
+        let bootloader = VZLinuxBootLoader(kernelURL: kernel)
+        bootloader.initialRamdiskURL = initramfs
+        // `rdinit=/init` execs our agent out of the initramfs. Commands
+        // now arrive over vsock after boot (see hb_vz_exec) — no more
+        // baking into the kernel cmdline.
+        bootloader.commandLine = "console=hvc0 rdinit=/init quiet loglevel=3"
+        config.bootLoader = bootloader
+
+        let rootfsAttachment = try VZDiskImageStorageDeviceAttachment(
+            url: rootfs,
+            readOnly: false
+        )
+        config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)]
+
+        // Serial port streams guest stdio (agent diagnostics + guest
+        // command stdout) to host stdout, tee'd to `logURL` if supplied.
+        let outputPipe = Pipe()
+        let logHandle: FileHandle? = logURL.flatMap { url in
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+            return try? FileHandle(forWritingTo: url)
+        }
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty { return }
+            try? logHandle?.write(contentsOf: data)
+            try? FileHandle.standardOutput.write(contentsOf: data)
+        }
+        let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
+        serial.attachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: nil,
+            fileHandleForWriting: outputPipe.fileHandleForWriting
+        )
+        config.serialPorts = [serial]
+
+        config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
+        config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+        try config.validate()
+
+        return ExecSession(config: config, outputPipe: outputPipe, logHandle: logHandle)
+    }
+
+    func close() {
+        outputPipe.fileHandleForReading.readabilityHandler = nil
+        try? logHandle?.close()
+    }
+
+    /// Snapshot-compatible variant: URL-based serial attachment (the
+    /// FileHandle one doesn't survive save/restore), persistent machine
+    /// identifier, validated for save/restore support. Callers lose the
+    /// live stdout streaming the cold-exec path gets; the log file is
+    /// where output lands.
+    static func makeSnapshotable(
+        kernel: URL,
+        initramfs: URL,
+        rootfs: URL,
+        logURL: URL?,
+        machineIdURL: URL,
+        cpuCount: Int,
+        memoryBytes: UInt64
+    ) throws -> ExecSession {
+        let config = VZVirtualMachineConfiguration()
+        config.cpuCount = cpuCount
+        config.memorySize = memoryBytes
+
+        // Persistent machine identity: save captures it, restore reuses it.
+        let platform = VZGenericPlatformConfiguration()
+        if let data = try? Data(contentsOf: machineIdURL),
+           let id = VZGenericMachineIdentifier(dataRepresentation: data) {
+            platform.machineIdentifier = id
+        } else {
+            let id = VZGenericMachineIdentifier()
+            try id.dataRepresentation.write(to: machineIdURL)
+            platform.machineIdentifier = id
+        }
+        config.platform = platform
+
+        let bootloader = VZLinuxBootLoader(kernelURL: kernel)
+        bootloader.initialRamdiskURL = initramfs
+        bootloader.commandLine = "console=hvc0 rdinit=/init quiet loglevel=3"
+        config.bootLoader = bootloader
+
+        let rootfsAttachment = try VZDiskImageStorageDeviceAttachment(
+            url: rootfs,
+            readOnly: false
+        )
+        config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)]
+
+        // URL-based serial: VZ can serialize this across save/restore.
+        // User can `tail -f` the log to see output in real time.
+        let serialLog = logURL ?? URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("hephaestus-vz-exec-\(UUID().uuidString).log")
+        FileManager.default.createFile(atPath: serialLog.path, contents: nil)
+        let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
+        serial.attachment = try VZFileSerialPortAttachment(url: serialLog, append: true)
+        config.serialPorts = [serial]
+
+        config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
+        config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+        try config.validate()
+        if #available(macOS 14.0, *) {
+            try config.validateSaveRestoreSupport()
+        }
+
+        // No Pipe → no readabilityHandler, no logHandle to close on our side.
+        return ExecSession(config: config, outputPipe: Pipe(), logHandle: nil)
+    }
+}
+
+private enum VsockError: Error, CustomStringConvertible {
+    case noSocketDevice
+    case connectTimedOut(attempts: Int)
+    case shortRead
+    case connect(Error)
+    case write(Error)
+    var description: String {
+        switch self {
+        case .noSocketDevice: return "VM has no virtio-vsock device configured"
+        case .connectTimedOut(let n): return "vsock connect timed out after \(n) attempts"
+        case .shortRead: return "short read on vsock exit-code response"
+        case .connect(let e): return "vsock connect failed: \(e)"
+        case .write(let e): return "vsock write failed: \(e)"
+        }
+    }
+}
+
+/// Connect to the guest agent's vsock listener, send the command, read the
+/// exit code i32 little-endian, close. Retries the initial connect for up
+/// to ~5 seconds so the host doesn't race against the guest's `listen()`.
+private func sendCommandAndAwaitExit(
+    holder: VMHolder,
+    queue: DispatchQueue,
+    command: String
+) throws -> Int32 {
+    let connection = try connectToAgent(holder: holder, queue: queue)
+    defer { connection.close() }
+
+    let fd = connection.fileDescriptor
+    // Command frame: u32 LE length + UTF-8 bytes.
+    let body = Array(command.utf8)
+    var header = UInt32(body.count).littleEndian
+    try withUnsafeBytes(of: &header) { hdr in
+        try writeAll(fd: fd, bytes: hdr)
+    }
+    try body.withUnsafeBufferPointer { buf in
+        try writeAll(fd: fd, bytes: UnsafeRawBufferPointer(buf))
+    }
+
+    // Response: i32 LE exit code.
+    var codeBytes = [UInt8](repeating: 0, count: 4)
+    try codeBytes.withUnsafeMutableBufferPointer { buf in
+        try readAll(fd: fd, into: UnsafeMutableRawBufferPointer(buf))
+    }
+    let code = Int32(bitPattern:
+        UInt32(codeBytes[0])
+        | (UInt32(codeBytes[1]) << 8)
+        | (UInt32(codeBytes[2]) << 16)
+        | (UInt32(codeBytes[3]) << 24)
+    )
+    return code
+}
+
+private func connectToAgent(
+    holder: VMHolder,
+    queue: DispatchQueue
+) throws -> VZVirtioSocketConnection {
+    // 50 × 100ms = 5s of retries. Mount + listen is usually done in <200ms.
+    let maxAttempts = 50
+    var lastError: Error?
+    for _ in 0..<maxAttempts {
+        do {
+            return try connectOnce(holder: holder, queue: queue)
+        } catch {
+            lastError = error
+            usleep(100_000)
+        }
+    }
+    throw lastError ?? VsockError.connectTimedOut(attempts: maxAttempts)
+}
+
+private func connectOnce(
+    holder: VMHolder,
+    queue: DispatchQueue
+) throws -> VZVirtioSocketConnection {
+    let sem = DispatchSemaphore(value: 0)
+    let resultBox = ConnectionResultBox()
+    queue.async {
+        guard let vm = holder.vm,
+              let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice
+        else {
+            resultBox.result = .failure(VsockError.noSocketDevice)
+            sem.signal()
+            return
+        }
+        socketDevice.connect(toPort: agentCommandPort) { result in
+            switch result {
+            case .success(let conn):
+                resultBox.result = .success(conn)
+            case .failure(let err):
+                resultBox.result = .failure(VsockError.connect(err))
+            }
+            sem.signal()
+        }
+    }
+    sem.wait()
+    switch resultBox.result {
+    case .success(let conn): return conn
+    case .failure(let err): throw err
+    case nil: throw VsockError.noSocketDevice
+    }
+}
+
+private final class ConnectionResultBox: @unchecked Sendable {
+    var result: Result<VZVirtioSocketConnection, Error>?
+}
+
+private func writeAll(fd: Int32, bytes: UnsafeRawBufferPointer) throws {
+    var remaining = bytes.count
+    var offset = 0
+    while remaining > 0 {
+        let n = write(fd, bytes.baseAddress!.advanced(by: offset), remaining)
+        if n < 0 {
+            throw VsockError.write(POSIXError(.init(rawValue: errno) ?? .EIO))
+        }
+        offset += n
+        remaining -= n
+    }
+}
+
+private func readAll(fd: Int32, into buf: UnsafeMutableRawBufferPointer) throws {
+    var remaining = buf.count
+    var offset = 0
+    while remaining > 0 {
+        let n = read(fd, buf.baseAddress!.advanced(by: offset), remaining)
+        if n < 0 {
+            throw VsockError.write(POSIXError(.init(rawValue: errno) ?? .EIO))
+        }
+        if n == 0 {
+            throw VsockError.shortRead
+        }
+        offset += n
+        remaining -= n
+    }
 }

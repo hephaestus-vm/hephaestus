@@ -15,7 +15,7 @@ name = "hephaestus-agent"
 path = "src/main.rs"
 
 [dependencies]
-nix = { version = "0.30", features = ["mount", "process", "reboot", "fs"] }
+nix = { version = "0.30", features = ["mount", "process", "reboot", "fs", "socket"] }
 libc = "0.2"
 
 [profile.release]

@@ -107,6 +107,42 @@ sh: build
 build-agent:
     scripts/build-agent.sh
 
+# Pre-warm a direct-VZ VM with our agent listening on vsock and snapshot it.
+# The saved VM is "ready to accept a command"; pair with `just vz-warm-run`.
+vz-warm-save save='build/hh-warm.save': build build-agent
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cdir="$HOME/Library/Application Support/com.apple.container"
+    kernel="$(ls "$cdir"/kernels/vmlinux-* 2>/dev/null | head -1 || true)"
+    snaps=("$cdir"/snapshots/*/snapshot)
+    rootfs_src=$(stat -f '%z %N' "${snaps[@]}" | sort -nr | head -1 | cut -d' ' -f2-)
+    # Clone rootfs so the save doesn't mutate apple/container's state.
+    rootfs="${TMPDIR:-/tmp}/hephaestus/vz-warm-rootfs.ext4"
+    mkdir -p "$(dirname "$rootfs")"
+    cp -c "$rootfs_src" "$rootfs"
+    rm -f {{save}} {{save}}.machineid
+    {{bin}} vz-warm save \
+        --kernel "$kernel" --rootfs "$rootfs" \
+        --save {{save}} --log "${TMPDIR:-/tmp}/hephaestus/vz-warm-save.log"
+
+# Restore a pre-warmed VM and run an arbitrary command against it. Must be
+# paired with an earlier `just vz-warm-save`. The rootfs + kernel passed
+# here must match the ones used at save time.
+vz-warm-run cmd save='build/hh-warm.save': build build-agent
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cdir="$HOME/Library/Application Support/com.apple.container"
+    kernel="$(ls "$cdir"/kernels/vmlinux-* 2>/dev/null | head -1 || true)"
+    rootfs="${TMPDIR:-/tmp}/hephaestus/vz-warm-rootfs.ext4"
+    if [[ ! -e "$rootfs" ]] || [[ ! -e {{save}} ]]; then
+        echo "no warm snapshot found; run: just vz-warm-save" >&2
+        exit 1
+    fi
+    {{bin}} vz-warm run \
+        --kernel "$kernel" --rootfs "$rootfs" \
+        --save {{save}} --cmd {{quote(cmd)}} \
+        --log "${TMPDIR:-/tmp}/hephaestus/vz-warm-run.log"
+
 # Run a single guest command via the direct-VZ path + our own init agent.
 # No vminitd, no containerization. Uses build/agent.cpio.gz (run `just build-agent` first).
 # Usage: just vz-exec 'uname -a; echo $HOSTNAME'

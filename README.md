@@ -141,6 +141,12 @@ upstream cherry-picks.
   via `zig cc`). Packaged as a 186 KB `cpio.gz` initramfs. Boot → run →
   exit → halt wall-clock lands at 200–400 ms on alpine for trivial
   commands.
+- **Warm-start via snapshot** via `hephaestus vz-warm save` / `vz-warm run`.
+  Pre-warm a VM with the agent listening on vsock and save its state.
+  Subsequent restores deliver a fresh command over vsock and return the
+  exit code — the command is **not** baked into the snapshot, so one
+  save file drives many commands. Restore + resume lands at ~200 ms;
+  wall-clock per command is ~340 ms.
 
 ### Still missing
 

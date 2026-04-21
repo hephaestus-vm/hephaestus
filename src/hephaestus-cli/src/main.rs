@@ -4,8 +4,8 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 
 use hephaestus_vmm::{
-    Compression, Spec, StdioSink, build_rootfs_from_tar, vz_boot, vz_exec, vz_sh,
-    vz_snapshot_restore, vz_snapshot_save,
+    Compression, Spec, StdioSink, build_rootfs_from_tar, vz_boot, vz_exec,
+    vz_exec_snapshot_restore, vz_exec_snapshot_save, vz_sh, vz_snapshot_restore, vz_snapshot_save,
 };
 
 fn main() -> ExitCode {
@@ -47,6 +47,28 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("vz-warm") => match args.next().as_deref() {
+            Some("save") => match parse_vz_warm_args(&mut args, /* restoring = */ false) {
+                Ok(opts) => vz_warm_save_cmd(opts),
+                Err(msg) => {
+                    eprintln!("hephaestus: {msg}");
+                    eprintln!("{VZ_WARM_USAGE}");
+                    ExitCode::from(2)
+                }
+            },
+            Some("run") => match parse_vz_warm_args(&mut args, /* restoring = */ true) {
+                Ok(opts) => vz_warm_run_cmd(opts),
+                Err(msg) => {
+                    eprintln!("hephaestus: {msg}");
+                    eprintln!("{VZ_WARM_USAGE}");
+                    ExitCode::from(2)
+                }
+            },
+            _ => {
+                eprintln!("{VZ_WARM_USAGE}");
+                ExitCode::from(2)
+            }
+        },
         Some("vz-sh") => match parse_vz_sh_args(&mut args) {
             Ok(opts) => vz_sh_cmd(opts),
             Err(msg) => {
@@ -79,11 +101,15 @@ fn main() -> ExitCode {
         },
         Some(other) => {
             eprintln!("hephaestus: unknown subcommand `{other}`");
-            eprintln!("usage: hephaestus <ping|run|rootfs|vz-boot|vz-exec|vz-sh|vz-snapshot>");
+            eprintln!(
+                "usage: hephaestus <ping|run|rootfs|vz-boot|vz-exec|vz-sh|vz-snapshot|vz-warm>"
+            );
             ExitCode::from(2)
         }
         None => {
-            eprintln!("usage: hephaestus <ping|run|rootfs|vz-boot|vz-exec|vz-sh|vz-snapshot>");
+            eprintln!(
+                "usage: hephaestus <ping|run|rootfs|vz-boot|vz-exec|vz-sh|vz-snapshot|vz-warm>"
+            );
             ExitCode::from(2)
         }
     }
@@ -577,6 +603,162 @@ fn vz_exec_cmd(opts: VzExecOptions) -> ExitCode {
         }
         Err(e) => {
             eprintln!("hephaestus: vz-exec: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+// =============================================================================
+// vz-warm subcommand — pre-warm a VM with our agent ready, save state,
+// then run arbitrary commands against restored copies in ~100ms.
+// =============================================================================
+
+const VZ_WARM_USAGE: &str = "\
+usage:
+  hephaestus vz-warm save \\
+      --kernel K --rootfs R --save PATH \\
+      [--initramfs build/agent.cpio.gz] [--log PATH]
+      [--cpus N] [--memory-mib N]
+  hephaestus vz-warm run \\
+      --kernel K --rootfs R --save PATH --cmd CMD \\
+      [--initramfs build/agent.cpio.gz] [--log PATH]
+      [--cpus N] [--memory-mib N]
+
+The config at `run` time MUST structurally match what was used at `save`
+time (same kernel, same initramfs, same cpu/memory counts) — the sibling
+.machineid file pins the VZ machine identifier for you.";
+
+#[derive(Debug)]
+struct VzWarmOptions {
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    initramfs: PathBuf,
+    save: PathBuf,
+    log: Option<PathBuf>,
+    command: String, // empty for save
+    cpus: u32,
+    memory_mib: u64,
+}
+
+fn parse_vz_warm_args(
+    args: &mut impl Iterator<Item = String>,
+    restoring: bool,
+) -> Result<VzWarmOptions, String> {
+    let mut opts = VzWarmOptions {
+        kernel: PathBuf::new(),
+        rootfs: PathBuf::new(),
+        initramfs: PathBuf::from("build/agent.cpio.gz"),
+        save: PathBuf::new(),
+        log: None,
+        command: String::new(),
+        cpus: 0,
+        memory_mib: 0,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--kernel" => opts.kernel = require_value(args, "--kernel")?.into(),
+            "--rootfs" => opts.rootfs = require_value(args, "--rootfs")?.into(),
+            "--initramfs" => opts.initramfs = require_value(args, "--initramfs")?.into(),
+            "--save" => opts.save = require_value(args, "--save")?.into(),
+            "--log" => opts.log = Some(require_value(args, "--log")?.into()),
+            "--cmd" => opts.command = require_value(args, "--cmd")?,
+            "--cpus" => {
+                opts.cpus = require_value(args, "--cpus")?
+                    .parse()
+                    .map_err(|e| format!("invalid --cpus: {e}"))?;
+            }
+            "--memory-mib" => {
+                opts.memory_mib = require_value(args, "--memory-mib")?
+                    .parse()
+                    .map_err(|e| format!("invalid --memory-mib: {e}"))?;
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    if opts.kernel.as_os_str().is_empty() {
+        return Err("missing --kernel".into());
+    }
+    if opts.rootfs.as_os_str().is_empty() {
+        return Err("missing --rootfs".into());
+    }
+    if opts.save.as_os_str().is_empty() {
+        return Err("missing --save".into());
+    }
+    if restoring && opts.command.is_empty() {
+        return Err("missing --cmd (required for `vz-warm run`)".into());
+    }
+    for (label, path, must_exist) in [
+        ("--kernel", &opts.kernel, true),
+        ("--rootfs", &opts.rootfs, true),
+        ("--initramfs", &opts.initramfs, true),
+        ("--save", &opts.save, restoring),
+    ] {
+        if must_exist && !path.exists() {
+            return Err(format!("{label} path does not exist: {}", path.display()));
+        }
+    }
+    Ok(opts)
+}
+
+fn vz_warm_save_cmd(opts: VzWarmOptions) -> ExitCode {
+    eprintln!("hephaestus: vz-warm save → {}", opts.save.display());
+    let start = std::time::Instant::now();
+    match vz_exec_snapshot_save(
+        &opts.kernel,
+        &opts.initramfs,
+        &opts.rootfs,
+        &opts.save,
+        opts.log.as_deref(),
+        opts.cpus,
+        opts.memory_mib,
+    ) {
+        Ok(()) => {
+            let size = std::fs::metadata(&opts.save).map(|m| m.len()).unwrap_or(0);
+            eprintln!(
+                "hephaestus: saved {} bytes in {:?} (includes cold boot + agent ready)",
+                size,
+                start.elapsed()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("hephaestus: vz-warm save: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn vz_warm_run_cmd(opts: VzWarmOptions) -> ExitCode {
+    eprintln!(
+        "hephaestus: vz-warm run ← {}  cmd={:?}",
+        opts.save.display(),
+        opts.command
+    );
+    let wall_start = std::time::Instant::now();
+    match vz_exec_snapshot_restore(
+        &opts.kernel,
+        &opts.initramfs,
+        &opts.rootfs,
+        &opts.save,
+        &opts.command,
+        opts.log.as_deref(),
+        opts.cpus,
+        opts.memory_mib,
+    ) {
+        Ok((code, restore_nanos)) => {
+            eprintln!(
+                "hephaestus: restore+resume {:.2} ms | guest exit {code} | wall {:?}",
+                restore_nanos as f64 / 1_000_000.0,
+                wall_start.elapsed()
+            );
+            if let Ok(c) = u8::try_from(code) {
+                ExitCode::from(c)
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(e) => {
+            eprintln!("hephaestus: vz-warm run: {e}");
             ExitCode::from(1)
         }
     }

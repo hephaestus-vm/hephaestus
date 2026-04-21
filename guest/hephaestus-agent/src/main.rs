@@ -1,49 +1,54 @@
 //! hephaestus-agent
 //!
-//! The tiniest useful Linux init: the kernel hands us PID 1 from an
-//! initramfs, we mount the container rootfs off `/dev/vda`, `chroot` into
-//! it, exec the command the host encoded in `/proc/cmdline`, print an
-//! exit-code sentinel back through the serial console, and halt.
+//! Minimal Linux init for the hephaestus direct-VZ path. Host-facing
+//! contract:
 //!
-//! Host-facing contract:
+//! 1. The kernel hands us PID 1 out of the initramfs.
+//! 2. We mount /proc, /sys, /dev, the container rootfs on /dev/vda, then
+//!    `chroot` into the rootfs.
+//! 3. We listen on vsock port 1234. The host connects and sends a
+//!    length-prefixed UTF-8 command string.
+//! 4. We `fork` + `exec /bin/sh -c <cmd>` and `waitpid`.
+//! 5. We write the exit code back over the same vsock connection as a
+//!    little-endian i32, close, `sync`, and call
+//!    `reboot(RB_POWER_OFF)` so the host observes a clean `.stopped`
+//!    state transition.
 //!
-//! - Input via kernel cmdline key `hephaestus.cmd=<hex>` where `<hex>` is
-//!   the command string hex-encoded (avoids quoting / space issues in the
-//!   cmdline parser — hex characters are safe everywhere).
-//! - Output via the standard serial console. Host watches for
-//!   `__HEPHAESTUS_EXIT_<code>__\n` to parse the exit code.
-//! - The guest shuts down via `reboot(RB_POWER_OFF)` when done, so the
-//!   host's KVO observer sees a clean `.stopped` state transition.
+//! The wire protocol is intentionally trivial — no framing beyond the
+//! length prefix — because there's exactly one exchange per boot.
 
 use std::ffi::CString;
 use std::fs;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+// OwnedFd is used via its AsRawFd impl on the listen socket.
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::ExitCode;
 
 use nix::mount::{MsFlags, mount};
 use nix::sys::reboot::{RebootMode, reboot};
+use nix::sys::socket::{
+    AddressFamily, Backlog, SockFlag, SockType, VsockAddr, accept, bind, listen, socket,
+};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, chdir, chroot, execv, fork};
 
 type AgentResult<T> = Result<T, String>;
 
-fn main() -> ExitCode {
-    // Print a banner early so the host serial log proves we're alive even
-    // if mount or exec fails before the exit sentinel.
-    eprintln!("hephaestus-agent: init starting (pid {})", std::process::id());
+/// Vsock port the agent listens on. Hard-coded because there's only one
+/// agent per VM; the host knows where to connect.
+const COMMAND_PORT: u32 = 1234;
 
+fn main() -> ExitCode {
+    eprintln!("hephaestus-agent: init starting (pid {})", std::process::id());
     match run() {
         Ok(()) => {
-            // run() always halts on success; unreachable but keeps the
-            // signature tidy.
             eprintln!("hephaestus-agent: run returned Ok unexpectedly");
             halt();
         }
         Err(e) => {
-            // Failure path: emit the sentinel so the host doesn't hang
-            // waiting for it, then halt.
             eprintln!("hephaestus-agent: fatal: {e}");
-            println!("\n__HEPHAESTUS_EXIT_127__");
             halt();
         }
     }
@@ -51,18 +56,42 @@ fn main() -> ExitCode {
 
 fn run() -> AgentResult<()> {
     mount_essentials()?;
-
-    let cmd = read_command_from_cmdline()?;
-    eprintln!("hephaestus-agent: cmd = {cmd:?}");
-
     mount_rootfs("/dev/vda", "/newroot")?;
     enter_rootfs("/newroot")?;
 
-    let exit_code = run_command(&cmd)?;
+    // Open the vsock socket BEFORE the host tries to connect. Once listen
+    // has returned, any connect from the host will succeed.
+    let listen_fd = vsock_listen(COMMAND_PORT)?;
+    eprintln!("hephaestus-agent: listening on vsock port {COMMAND_PORT}");
 
-    // Must be the last printed line — host consumes everything up to here.
-    println!("\n__HEPHAESTUS_EXIT_{exit_code}__");
+    // Loop accepting connections until we receive a real command. This
+    // lets the host "probe" by connecting without writing (to confirm the
+    // agent is live before snapshotting) without using up our single
+    // command slot.
+    let (command, mut stream) = accept_command_loop(&listen_fd)?;
+    eprintln!("hephaestus-agent: cmd = {command:?}");
+
+    let exit_code = run_command(&command)?;
+    write_exit_code(&mut stream, exit_code)?;
+    drop(stream); // flush before halt
     halt();
+}
+
+fn accept_command_loop(listen_fd: &OwnedFd) -> AgentResult<(String, UnixStream)> {
+    loop {
+        let conn_raw = accept(listen_fd.as_raw_fd()).map_err(|e| format!("vsock accept: {e}"))?;
+        // SAFETY: `accept` returns a freshly-allocated fd we own exclusively.
+        let mut stream = unsafe { UnixStream::from_raw_fd(conn_raw) };
+        match read_command(&mut stream) {
+            Ok(cmd) if !cmd.is_empty() => return Ok((cmd, stream)),
+            _ => {
+                // Probe connection (host closed without writing, or sent a
+                // zero-length frame). Drop the stream and wait for the
+                // real command to arrive.
+                drop(stream);
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -70,17 +99,11 @@ fn run() -> AgentResult<()> {
 // =============================================================================
 
 fn mount_essentials() -> AgentResult<()> {
-    // /proc is required to read cmdline; others help guest programs behave
-    // normally. devtmpfs populates /dev/vda, without which we can't mount
-    // the rootfs.
     mkdir_p("/proc")?;
     mkdir_p("/sys")?;
     mkdir_p("/dev")?;
     mkdir_p("/tmp")?;
-
     do_mount(Some("proc"), "/proc", Some("proc"), MsFlags::empty())?;
-    // sysfs / devtmpfs are nice-to-have but not fatal if they fail on some
-    // exotic kernel build.
     let _ = do_mount(Some("sys"), "/sys", Some("sysfs"), MsFlags::empty());
     let _ = do_mount(Some("dev"), "/dev", Some("devtmpfs"), MsFlags::empty());
     let _ = do_mount(Some("tmpfs"), "/tmp", Some("tmpfs"), MsFlags::empty());
@@ -89,24 +112,18 @@ fn mount_essentials() -> AgentResult<()> {
 
 fn mount_rootfs(source: &str, target: &str) -> AgentResult<()> {
     mkdir_p(target)?;
-    // Try ext4 first; most container rootfses we'll be pointed at are ext4.
     do_mount(Some(source), target, Some("ext4"), MsFlags::empty())
         .map_err(|e| format!("mounting rootfs {source} → {target} as ext4: {e}"))
 }
 
 fn enter_rootfs(new_root: &str) -> AgentResult<()> {
-    // Bind essential vfs mounts into the new root so programs that read
-    // /proc (coreutils, busybox, python, …) keep working after chroot.
-    mkdir_p(&format!("{new_root}/proc"))?;
-    mkdir_p(&format!("{new_root}/sys"))?;
-    mkdir_p(&format!("{new_root}/dev"))?;
-    mkdir_p(&format!("{new_root}/tmp"))?;
-
+    for sub in ["proc", "sys", "dev", "tmp"] {
+        mkdir_p(&format!("{new_root}/{sub}"))?;
+    }
     let _ = do_mount(Some("/proc"), &format!("{new_root}/proc"), None, MsFlags::MS_BIND);
     let _ = do_mount(Some("/sys"), &format!("{new_root}/sys"), None, MsFlags::MS_BIND);
     let _ = do_mount(Some("/dev"), &format!("{new_root}/dev"), None, MsFlags::MS_BIND);
     let _ = do_mount(Some("/tmp"), &format!("{new_root}/tmp"), None, MsFlags::MS_BIND);
-
     chroot(new_root).map_err(|e| format!("chroot({new_root}): {e}"))?;
     chdir("/").map_err(|e| format!("chdir(/): {e}"))?;
     Ok(())
@@ -130,41 +147,49 @@ fn mkdir_p(path: &str) -> AgentResult<()> {
 }
 
 // =============================================================================
-// Command parsing.
+// Vsock listener + framed I/O.
 // =============================================================================
 
-fn read_command_from_cmdline() -> AgentResult<String> {
-    let raw = fs::read_to_string("/proc/cmdline")
-        .map_err(|e| format!("reading /proc/cmdline: {e}"))?;
-    let hex = raw
-        .split_whitespace()
-        .find_map(|tok| tok.strip_prefix("hephaestus.cmd="))
-        .ok_or_else(|| String::from("missing hephaestus.cmd= on kernel cmdline"))?;
-    let bytes = hex_decode(hex)?;
-    String::from_utf8(bytes).map_err(|e| format!("command is not UTF-8: {e}"))
+fn vsock_listen(port: u32) -> AgentResult<OwnedFd> {
+    let fd = socket(
+        AddressFamily::Vsock,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )
+    .map_err(|e| format!("vsock socket: {e}"))?;
+    // CID_ANY (0xFFFFFFFF) binds to whichever CID the kernel assigns us.
+    let addr = VsockAddr::new(libc::VMADDR_CID_ANY, port);
+    bind(fd.as_raw_fd(), &addr).map_err(|e| format!("vsock bind port {port}: {e}"))?;
+    listen(&fd, Backlog::new(1).unwrap()).map_err(|e| format!("vsock listen: {e}"))?;
+    Ok(fd)
 }
 
-fn hex_decode(s: &str) -> AgentResult<Vec<u8>> {
-    let b = s.as_bytes();
-    if !b.len().is_multiple_of(2) {
-        return Err(format!("hex length {} is odd", b.len()));
+fn read_command(stream: &mut UnixStream) -> AgentResult<String> {
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|e| format!("reading command length: {e}"))?;
+    let len = u32::from_le_bytes(len_buf);
+    if len > 1 << 20 {
+        return Err(format!("command length {len} exceeds 1 MiB sanity cap"));
     }
-    let mut out = Vec::with_capacity(b.len() / 2);
-    for chunk in b.chunks(2) {
-        let hi = nibble(chunk[0])?;
-        let lo = nibble(chunk[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
+    let mut buf = vec![0u8; len as usize];
+    stream
+        .read_exact(&mut buf)
+        .map_err(|e| format!("reading command body: {e}"))?;
+    String::from_utf8(buf).map_err(|e| format!("command is not UTF-8: {e}"))
 }
 
-fn nibble(c: u8) -> AgentResult<u8> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(format!("bad hex char {:?}", c as char)),
-    }
+fn write_exit_code(stream: &mut UnixStream, code: i32) -> AgentResult<()> {
+    let bytes = code.to_le_bytes();
+    stream
+        .write_all(&bytes)
+        .map_err(|e| format!("writing exit code: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("flushing exit code: {e}"))?;
+    Ok(())
 }
 
 // =============================================================================
@@ -176,8 +201,8 @@ fn run_command(cmd: &str) -> AgentResult<i32> {
     let flag = CString::new("-c").unwrap();
     let cmd_c = CString::new(cmd).map_err(|e| format!("cmd has NUL byte: {e}"))?;
 
-    // SAFETY: fork() is unsafe because a multi-threaded parent can leave
-    // the child in a bad state. We're single-threaded here by construction.
+    // SAFETY: single-threaded agent; post-fork we only call async-signal-safe
+    // operations before execv.
     match unsafe { fork() }.map_err(|e| format!("fork: {e}"))? {
         ForkResult::Parent { child } => match waitpid(child, None) {
             Ok(WaitStatus::Exited(_, code)) => Ok(code),
@@ -187,7 +212,7 @@ fn run_command(cmd: &str) -> AgentResult<i32> {
         },
         ForkResult::Child => {
             let _ = execv(&sh, &[sh.as_c_str(), flag.as_c_str(), cmd_c.as_c_str()]);
-            // Only reached if execv failed.
+            // execv only returns on error.
             eprintln!("hephaestus-agent: execv failed");
             std::process::exit(127);
         }
@@ -199,18 +224,14 @@ fn run_command(cmd: &str) -> AgentResult<i32> {
 // =============================================================================
 
 fn halt() -> ! {
-    // Give the kernel a moment to drain the serial buffer so the exit
-    // sentinel actually reaches the host before we power off.
-    use std::io::Write;
+    use std::io::Write as _;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    // sync()
     unsafe { libc::sync() };
     match reboot(RebootMode::RB_POWER_OFF) {
         Ok(_) => {}
         Err(e) => eprintln!("hephaestus-agent: reboot(POWER_OFF) failed: {e}"),
     }
-    // If reboot() somehow returns, park forever.
     loop {
         std::thread::park();
     }
