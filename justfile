@@ -298,6 +298,37 @@ fc-compat-pool: build build-agent fc-harness-build
         -log "$log" -pause \
         -vcpu 2 -mem 512 -mem-patch 512
 
+# Stock-init pool variant of fc-compat-pool. Snapshots the rootfs's own
+# /bin/sh as PID 1 (no hephaestus-agent, no vsock, no initramfs) so
+# restored VMs are behaviorally indistinguishable from cold-boot for the
+# HTTP API consumer. This is the session-3.5 follow-up that closes the
+# agent-init divergence.
+fc-compat-pool-stock: build fc-harness-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cdir="$HOME/Library/Application Support/com.apple.container"
+    kernel="$(ls "$cdir"/kernels/vmlinux-* 2>/dev/null | head -1 || true)"
+    snaps=("$cdir"/snapshots/*/snapshot)
+    if [[ -z "$kernel" ]] || [[ ! -e "${snaps[0]:-}" ]]; then
+        echo "no artifacts; run: just artifacts" >&2; exit 1
+    fi
+    rootfs_src=$(stat -f '%z %N' "${snaps[@]}" | sort -nr | head -1 | cut -d' ' -f2-)
+    pool="${TMPDIR:-/tmp}/hephaestus-fc-pool-stock"
+    {{bin}} pool destroy --dir "$pool" 2>/dev/null || true
+    {{bin}} pool init --dir "$pool" --kernel "$kernel" --rootfs "$rootfs_src" \
+        --size 1 --stock-init --settle-seconds 3
+    sock="${TMPDIR:-/tmp}/hephaestus-fc-pool-stock.socket"
+    log="${TMPDIR:-/tmp}/hephaestus/fc-pool-stock.log"
+    rm -f "$sock" "$log"
+    {{bin}}-firecracker --api-sock "$sock" --id fc-pool-stock --pool-dir "$pool" &
+    server=$!
+    trap 'kill $server 2>/dev/null || true; {{bin}} pool destroy --dir "$pool" 2>/dev/null || true' EXIT
+    for _ in $(seq 1 20); do [[ -S "$sock" ]] && break; sleep 0.1; done
+    compat/firectl-harness/firectl-harness \
+        -sock "$sock" -kernel "$kernel" -rootfs "$pool/pristine.ext4" \
+        -log "$log" -pause \
+        -vcpu 2 -mem 512 -mem-patch 512
+
 # Run cargo unit tests + ping + test-rootfs. No VM boot; safe without artifacts.
 test: build
     cargo test --workspace

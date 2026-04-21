@@ -24,6 +24,7 @@ use hephaestus_fc_api::vmm_config::boot_source::BootSourceConfig;
 use hephaestus_fc_api::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
 use hephaestus_fc_api::vmm_config::logger::LoggerConfig;
 use hephaestus_fc_api::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
+use hephaestus_fc_api::vmm_config::metrics::MetricsConfig;
 use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
 use hephaestus_fc_api::vmm_config::vm::{UpdatedVm, VmUpdatedState};
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
@@ -127,6 +128,24 @@ async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Respon
                 Err(resp) => resp,
             }
         }
+        (Method::PATCH, p) if p.starts_with("/network-interfaces/") => {
+            let id = p.trim_start_matches("/network-interfaces/");
+            if id.is_empty() || id.contains('/') {
+                return fault(StatusCode::BAD_REQUEST, "invalid iface id");
+            }
+            match parse_body::<NetworkInterfaceConfig>(req).await {
+                Ok(cfg) if cfg.iface_id != id => fault(
+                    StatusCode::BAD_REQUEST,
+                    "iface_id in body does not match URL",
+                ),
+                Ok(cfg) => to_response(backend.lock().await.update_network_device(cfg)),
+                Err(resp) => resp,
+            }
+        }
+        (Method::PUT, "/metrics") => match parse_body::<MetricsConfig>(req).await {
+            Ok(cfg) => to_response(backend.lock().await.configure_metrics(cfg)),
+            Err(resp) => resp,
+        },
         (Method::PUT, "/actions") => match parse_body::<ActionBody>(req).await {
             Ok(ActionBody {
                 action_type: ActionType::InstanceStart,

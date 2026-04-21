@@ -20,6 +20,7 @@ use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::logger::LoggerConfig;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
+use crate::vmm_config::metrics::MetricsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
 
 /// Errors a backend method can surface to the HTTP layer.
@@ -74,10 +75,31 @@ pub trait VmmBackend {
         cfg: NetworkInterfaceConfig,
     ) -> Result<(), VmmBackendError>;
 
+    /// `PATCH /network-interfaces/{id}`. Upstream uses this primarily for
+    /// rate-limiter updates; macOS VZ doesn't enforce rate limits, so the
+    /// default impl accepts-and-noops to match `firectl`/Kata's expectation
+    /// that the call returns 204.
+    fn update_network_device(
+        &mut self,
+        _cfg: NetworkInterfaceConfig,
+    ) -> Result<(), VmmBackendError> {
+        Ok(())
+    }
+
     /// `PUT /logger`. Backends that can't honor the config fully should
     /// still accept-and-best-effort rather than error — Firecracker
     /// clients treat this as fire-and-forget config.
     fn configure_logger(&mut self, cfg: LoggerConfig) -> Result<(), VmmBackendError>;
+
+    /// `PUT /metrics`. Same accept-and-best-effort convention as
+    /// `configure_logger` — Firecracker clients send this fire-and-forget.
+    /// The macOS backend's metrics surface is sparse (no KVM exit
+    /// counters etc.), so the default impl just opens the file and
+    /// writes one init line so consumers that grep for "the metrics
+    /// file exists and has content" are satisfied.
+    fn configure_metrics(&mut self, _cfg: MetricsConfig) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("metrics".into()))
+    }
 
     /// `GET /machine-config`
     fn get_machine_config(&self) -> MachineConfig;

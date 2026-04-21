@@ -664,6 +664,13 @@ struct PoolInitOptions {
     size: u32,
     cpus: u32,
     memory_mib: u64,
+    /// True iff `--stock-init` was passed; selects `PoolFlavor::StockInit`.
+    /// In that mode `initramfs` is unused (kernel boots straight into the
+    /// rootfs's `/bin/sh` per the v0.2 `vz-snapshot` convention).
+    stock_init: bool,
+    /// Wall-time the StockInit save lets the rootfs settle before
+    /// snapshotting. Ignored for Agent flavor.
+    settle_seconds: u32,
 }
 
 fn parse_pool_init(args: &mut impl Iterator<Item = String>) -> Result<PoolInitOptions, String> {
@@ -675,6 +682,8 @@ fn parse_pool_init(args: &mut impl Iterator<Item = String>) -> Result<PoolInitOp
         size: 4,
         cpus: 0,
         memory_mib: 0,
+        stock_init: false,
+        settle_seconds: 3,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -697,15 +706,24 @@ fn parse_pool_init(args: &mut impl Iterator<Item = String>) -> Result<PoolInitOp
                     .parse()
                     .map_err(|e| format!("invalid --memory-mib: {e}"))?;
             }
+            "--stock-init" => o.stock_init = true,
+            "--settle-seconds" => {
+                o.settle_seconds = require_value(args, "--settle-seconds")?
+                    .parse()
+                    .map_err(|e| format!("invalid --settle-seconds: {e}"))?;
+            }
             other => return Err(format!("unknown flag `{other}`")),
         }
     }
-    for (label, p, must_exist) in [
+    let mut required: Vec<(&str, &PathBuf, bool)> = vec![
         ("--dir", &o.dir, false),
         ("--kernel", &o.kernel, true),
         ("--rootfs", &o.rootfs, true),
-        ("--initramfs", &o.initramfs, true),
-    ] {
+    ];
+    if !o.stock_init {
+        required.push(("--initramfs", &o.initramfs, true));
+    }
+    for (label, p, must_exist) in required {
         if p.as_os_str().is_empty() {
             return Err(format!("missing {label}"));
         }
@@ -755,21 +773,30 @@ fn parse_pool_dir_only(args: &mut impl Iterator<Item = String>) -> Result<PathBu
 }
 
 fn pool_init_cmd(o: PoolInitOptions) -> ExitCode {
+    let flavor = if o.stock_init {
+        pool::PoolFlavor::StockInit
+    } else {
+        pool::PoolFlavor::Agent
+    };
     eprintln!(
-        "hephaestus: pool init  dir={}  size={}  (warming…)",
+        "hephaestus: pool init  dir={}  size={}  flavor={:?}  (warming…)",
         o.dir.display(),
-        o.size
+        o.size,
+        flavor
     );
     let start = std::time::Instant::now();
-    match pool::Pool::init(
-        &o.dir,
-        &o.kernel,
-        &o.initramfs,
-        &o.rootfs,
-        o.size,
-        o.cpus,
-        o.memory_mib,
-    ) {
+    let initramfs = if o.stock_init { None } else { Some(o.initramfs.as_path()) };
+    match pool::Pool::init(pool::PoolInit {
+        dir: &o.dir,
+        kernel: &o.kernel,
+        rootfs_source: &o.rootfs,
+        slots: o.size,
+        cpus: o.cpus,
+        memory_mib: o.memory_mib,
+        flavor,
+        initramfs,
+        settle_seconds: o.settle_seconds,
+    }) {
         Ok(_) => {
             eprintln!(
                 "hephaestus: pool init complete in {:?} ({} slots ready)",

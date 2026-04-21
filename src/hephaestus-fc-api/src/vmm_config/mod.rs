@@ -15,6 +15,8 @@ pub mod drive;
 pub mod instance_info;
 /// Host-side logger config wire struct (`PUT /logger`).
 pub mod logger;
+/// Host-side metrics config wire struct (`PUT /metrics`).
+pub mod metrics;
 /// Machine config wire struct (`GET`/`PUT`/`PATCH /machine-config`).
 pub mod machine_config;
 /// Network interface wire struct (`PUT /network-interfaces/{id}`).

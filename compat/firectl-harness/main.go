@@ -101,6 +101,13 @@ func main() {
 			}))
 			return err
 		})
+		h.run("PUT /metrics", func() error {
+			mp := abs(*logFile + ".metrics")
+			_, err := ops.PutMetrics(operations.NewPutMetricsParams().WithBody(&models.Metrics{
+				MetricsPath: &mp,
+			}))
+			return err
+		})
 	}
 
 	h.run("PUT /machine-config", func() error {

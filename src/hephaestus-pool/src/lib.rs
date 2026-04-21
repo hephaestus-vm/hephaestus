@@ -30,7 +30,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use hephaestus_vmm::{
-    VzVm, vz_exec_snapshot_restore, vz_exec_snapshot_save, vz_pool_restore_long,
+    VzVm, vz_exec_snapshot_restore, vz_exec_snapshot_save, vz_pool_restore_long, vz_snapshot_save,
+    vz_stock_pool_restore_long,
 };
 
 /// Mirror Swift `hb_vz_exec_snapshot_save`'s 0-means-default fallback.
@@ -39,16 +40,53 @@ const DEFAULT_CPUS: u32 = 2;
 const DEFAULT_MEMORY_MIB: u64 = 512;
 use nix::fcntl::{Flock, FlockArg};
 
+/// Whether a pool's snapshot has the hephaestus agent as PID 1 (the v0.3
+/// "agent-init" flavor used by `pool run`'s command-injection model) or
+/// boots into a minimal `/bin/sh` from the rootfs (session 3.5's
+/// "stock-init" flavor — no agent, no vsock, behaves indistinguishably
+/// from a cold-boot VM for HTTP-API consumers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolFlavor {
+    /// Agent on vsock 1234 as PID 1. Compatible with `Pool::run`'s
+    /// command-over-vsock dispatch.
+    Agent,
+    /// Minimal `/bin/sh` PID 1 from the rootfs. Suited to the HTTP API
+    /// path; no command channel.
+    StockInit,
+}
+
+impl PoolFlavor {
+    fn as_str(self) -> &'static str {
+        match self {
+            PoolFlavor::Agent => "Agent",
+            PoolFlavor::StockInit => "StockInit",
+        }
+    }
+
+    fn from_str(s: &str) -> Result<Self, PoolError> {
+        match s {
+            "Agent" => Ok(PoolFlavor::Agent),
+            "StockInit" => Ok(PoolFlavor::StockInit),
+            other => Err(PoolError::BadMeta(format!("unknown flavor `{other}`"))),
+        }
+    }
+}
+
 /// Pool state persisted to `<dir>/meta`.
+///
+/// `initramfs` is `Some(_)` for `PoolFlavor::Agent` (pointing at the
+/// hephaestus-agent cpio.gz) and `None` for `PoolFlavor::StockInit`
+/// (no initramfs needed — kernel mounts the rootfs directly).
 #[derive(Debug, Clone)]
 pub struct PoolMeta {
     pub kernel: PathBuf,
-    pub initramfs: PathBuf,
+    pub initramfs: Option<PathBuf>,
     pub pristine: PathBuf,
     pub save: PathBuf,
     pub slots: u32,
     pub cpus: u32,
     pub memory_mib: u64,
+    pub flavor: PoolFlavor,
 }
 
 /// A claimed slot. Drop releases the exclusive lock (kernel cleans up the
@@ -118,29 +156,50 @@ pub struct SlotState {
     pub has_rootfs: bool,
 }
 
+/// Args for [`Pool::init`]. A struct so callers don't have to keep two
+/// flavors of positional `init` straight, and so adding fields (e.g.
+/// settle-seconds tweaks per flavor) doesn't break call sites.
+#[derive(Debug)]
+pub struct PoolInit<'a> {
+    pub dir: &'a Path,
+    pub kernel: &'a Path,
+    pub rootfs_source: &'a Path,
+    pub slots: u32,
+    pub cpus: u32,
+    pub memory_mib: u64,
+    pub flavor: PoolFlavor,
+    /// Required for `PoolFlavor::Agent`; ignored for `StockInit`.
+    pub initramfs: Option<&'a Path>,
+    /// Wall-time the stock-init flavor lets the rootfs settle before
+    /// snapshotting (so PID-1 has gotten past whatever userspace it's
+    /// going to do at boot). Ignored for `Agent` flavor — its readiness
+    /// is signaled by the agent reaching `accept()` on vsock.
+    pub settle_seconds: u32,
+}
+
 impl Pool {
     /// Build a fresh pool: clone rootfs, warm up + save, create empty
     /// slot directories.
     ///
     /// Refuses to overwrite an existing pool; caller should call
     /// [`Pool::destroy`] first if they want a clean slate.
-    pub fn init(
-        dir: &Path,
-        kernel: &Path,
-        initramfs: &Path,
-        rootfs_source: &Path,
-        slots: u32,
-        cpus: u32,
-        memory_mib: u64,
-    ) -> Result<Self, PoolError> {
-        if dir.exists() {
-            return Err(PoolError::AlreadyExists(dir.to_path_buf()));
+    pub fn init(args: PoolInit<'_>) -> Result<Self, PoolError> {
+        if args.dir.exists() {
+            return Err(PoolError::AlreadyExists(args.dir.to_path_buf()));
         }
-        if slots == 0 {
+        if args.slots == 0 {
             return Err(PoolError::InvalidSize);
         }
-        fs::create_dir_all(dir).map_err(|e| PoolError::Io("create pool dir", e))?;
-        let dir = dir.canonicalize().map_err(|e| PoolError::Io("canonicalize pool dir", e))?;
+        if args.flavor == PoolFlavor::Agent && args.initramfs.is_none() {
+            return Err(PoolError::BadMeta(
+                "Agent flavor requires an initramfs".into(),
+            ));
+        }
+        fs::create_dir_all(args.dir).map_err(|e| PoolError::Io("create pool dir", e))?;
+        let dir = args
+            .dir
+            .canonicalize()
+            .map_err(|e| PoolError::Io("canonicalize pool dir", e))?;
 
         let pristine = dir.join("pristine.ext4");
         let save = dir.join("save.bin");
@@ -149,22 +208,50 @@ impl Pool {
         // VM was actually warmed with. Without this, the HTTP backend's
         // strict `(cpu, mem)` match check rejects every request from a
         // client that asked for the same defaults the user implied.
-        let cpus = if cpus == 0 { DEFAULT_CPUS } else { cpus };
-        let memory_mib = if memory_mib == 0 { DEFAULT_MEMORY_MIB } else { memory_mib };
+        let cpus = if args.cpus == 0 { DEFAULT_CPUS } else { args.cpus };
+        let memory_mib = if args.memory_mib == 0 {
+            DEFAULT_MEMORY_MIB
+        } else {
+            args.memory_mib
+        };
 
         // Clone the source rootfs into the pool. cp -c = APFS CoW, so
         // this is near-instant for any size.
-        clone_file(rootfs_source, &pristine)?;
+        clone_file(args.rootfs_source, &pristine)?;
 
         // Warm the VM against the cloned rootfs and persist the VZ state.
         // This mutates pristine.ext4 — that's intentional. After save,
         // pristine.ext4 is the reference disk state the snapshot refers
         // to, and every slot's rootfs will be a clone of it.
-        vz_exec_snapshot_save(kernel, initramfs, &pristine, &save, None, cpus, memory_mib)
-            .map_err(PoolError::VmSave)?;
+        match args.flavor {
+            PoolFlavor::Agent => {
+                let initramfs = args.initramfs.expect("checked above");
+                vz_exec_snapshot_save(
+                    args.kernel, initramfs, &pristine, &save, None, cpus, memory_mib,
+                )
+                .map_err(PoolError::VmSave)?;
+            }
+            PoolFlavor::StockInit => {
+                // Per-pool serial log — the snapshot is taken with this
+                // file as the URL-based serial attachment, and restore
+                // re-opens the same path. Lives in the pool dir so it
+                // survives across runs.
+                let log = dir.join("save.log");
+                vz_snapshot_save(
+                    args.kernel,
+                    &pristine,
+                    &log,
+                    &save,
+                    cpus,
+                    memory_mib,
+                    args.settle_seconds,
+                )
+                .map_err(PoolError::VmSave)?;
+            }
+        }
 
         // Empty slot directories, each holding just a lock file.
-        for i in 0..slots {
+        for i in 0..args.slots {
             let slot = dir.join(format!("slot-{i}"));
             fs::create_dir(&slot).map_err(|e| PoolError::Io("create slot dir", e))?;
             File::create(slot.join("lock"))
@@ -172,13 +259,19 @@ impl Pool {
         }
 
         let meta = PoolMeta {
-            kernel: kernel.canonicalize().unwrap_or_else(|_| kernel.into()),
-            initramfs: initramfs.canonicalize().unwrap_or_else(|_| initramfs.into()),
+            kernel: args
+                .kernel
+                .canonicalize()
+                .unwrap_or_else(|_| args.kernel.into()),
+            initramfs: args
+                .initramfs
+                .map(|p| p.canonicalize().unwrap_or_else(|_| p.into())),
             pristine,
             save,
-            slots,
+            slots: args.slots,
             cpus,
             memory_mib,
+            flavor: args.flavor,
         };
         meta.write(&dir.join("meta"))?;
 
@@ -284,7 +377,23 @@ impl Pool {
     /// `log` is optional; when `None` the guest serial output is written
     /// to a per-slot temp file that's deleted on success (callers who
     /// want to see guest output should pass `Some`).
+    ///
+    /// Only valid for `PoolFlavor::Agent` pools — `StockInit` pools have
+    /// no command channel, so calling this returns `PoolError::WrongFlavor`.
     pub fn run(&self, slot: &ClaimedSlot, command: &str) -> Result<i32, PoolError> {
+        if self.meta.flavor != PoolFlavor::Agent {
+            return Err(PoolError::WrongFlavor {
+                op: "run",
+                got: self.meta.flavor,
+                want: PoolFlavor::Agent,
+            });
+        }
+        let initramfs = self
+            .meta
+            .initramfs
+            .as_deref()
+            .ok_or_else(|| PoolError::BadMeta("Agent flavor missing initramfs".into()))?;
+
         // Clone pristine → slot rootfs for this run only.
         clone_file(&self.meta.pristine, &slot.rootfs)?;
 
@@ -299,7 +408,7 @@ impl Pool {
 
         let result = vz_exec_snapshot_restore(
             &self.meta.kernel,
-            &self.meta.initramfs,
+            initramfs,
             &slot.rootfs,
             &self.meta.save,
             command,
@@ -333,15 +442,31 @@ impl Pool {
         log: Option<&Path>,
     ) -> Result<(VzVm, u64), PoolError> {
         clone_file(&self.meta.pristine, &slot.rootfs)?;
-        match vz_pool_restore_long(
-            &self.meta.kernel,
-            &self.meta.initramfs,
-            &slot.rootfs,
-            &self.meta.save,
-            log,
-            self.meta.cpus,
-            self.meta.memory_mib,
-        ) {
+        let result = match self.meta.flavor {
+            PoolFlavor::Agent => {
+                let initramfs = self.meta.initramfs.as_deref().ok_or_else(|| {
+                    PoolError::BadMeta("Agent flavor missing initramfs".into())
+                })?;
+                vz_pool_restore_long(
+                    &self.meta.kernel,
+                    initramfs,
+                    &slot.rootfs,
+                    &self.meta.save,
+                    log,
+                    self.meta.cpus,
+                    self.meta.memory_mib,
+                )
+            }
+            PoolFlavor::StockInit => vz_stock_pool_restore_long(
+                &self.meta.kernel,
+                &slot.rootfs,
+                &self.meta.save,
+                log,
+                self.meta.cpus,
+                self.meta.memory_mib,
+            ),
+        };
+        match result {
             Ok(pair) => Ok(pair),
             Err(err) => {
                 // Restore failed → tear down the rootfs we just cloned so
@@ -379,12 +504,19 @@ impl PoolMeta {
     fn write(&self, path: &Path) -> Result<(), PoolError> {
         let mut f = File::create(path).map_err(|e| PoolError::Io("write meta", e))?;
         writeln!(f, "kernel={}", self.kernel.display())
-            .and_then(|_| writeln!(f, "initramfs={}", self.initramfs.display()))
+            .and_then(|_| {
+                if let Some(p) = self.initramfs.as_deref() {
+                    writeln!(f, "initramfs={}", p.display())
+                } else {
+                    Ok(())
+                }
+            })
             .and_then(|_| writeln!(f, "pristine={}", self.pristine.display()))
             .and_then(|_| writeln!(f, "save={}", self.save.display()))
             .and_then(|_| writeln!(f, "slots={}", self.slots))
             .and_then(|_| writeln!(f, "cpus={}", self.cpus))
             .and_then(|_| writeln!(f, "memory_mib={}", self.memory_mib))
+            .and_then(|_| writeln!(f, "flavor={}", self.flavor.as_str()))
             .map_err(|e| PoolError::Io("write meta body", e))?;
         Ok(())
     }
@@ -418,14 +550,21 @@ impl PoolMeta {
                 .parse()
                 .map_err(|e| PoolError::BadMeta(format!("`{k}` not u64: {e}")))
         };
+        // `flavor` defaults to Agent when missing so meta files written
+        // before session 3.5 still load.
+        let flavor = match m.get("flavor") {
+            Some(s) => PoolFlavor::from_str(s)?,
+            None => PoolFlavor::Agent,
+        };
         Ok(PoolMeta {
             kernel: PathBuf::from(get("kernel")?),
-            initramfs: PathBuf::from(get("initramfs")?),
+            initramfs: m.get("initramfs").map(PathBuf::from),
             pristine: PathBuf::from(get("pristine")?),
             save: PathBuf::from(get("save")?),
             slots: parse_u32("slots")?,
             cpus: parse_u32("cpus")?,
             memory_mib: parse_u64("memory_mib")?,
+            flavor,
         })
     }
 }
@@ -467,6 +606,11 @@ pub enum PoolError {
     CpFailed(std::process::ExitStatus),
     VmSave(hephaestus_vmm::VmError),
     VmRestore(hephaestus_vmm::VmError),
+    WrongFlavor {
+        op: &'static str,
+        got: PoolFlavor,
+        want: PoolFlavor,
+    },
 }
 
 impl std::fmt::Display for PoolError {
@@ -481,6 +625,12 @@ impl std::fmt::Display for PoolError {
             PoolError::CpFailed(s) => write!(f, "cp -c exited {s}"),
             PoolError::VmSave(e) => write!(f, "vm save: {e}"),
             PoolError::VmRestore(e) => write!(f, "vm restore: {e}"),
+            PoolError::WrongFlavor { op, got, want } => write!(
+                f,
+                "{op} requires a {}-flavored pool, this one is {}",
+                want.as_str(),
+                got.as_str()
+            ),
         }
     }
 }
@@ -520,12 +670,13 @@ mod tests {
         fs::write(d.join("save.bin"), b"").unwrap();
         let meta = PoolMeta {
             kernel: PathBuf::from("/k"),
-            initramfs: PathBuf::from("/i"),
+            initramfs: Some(PathBuf::from("/i")),
             pristine: d.join("pristine.ext4"),
             save: d.join("save.bin"),
             slots,
             cpus: 2,
             memory_mib: 512,
+            flavor: PoolFlavor::Agent,
         };
         meta.write(&d.join("meta")).unwrap();
         for i in 0..slots {
@@ -541,12 +692,13 @@ mod tests {
         let d = tmp_for("meta_roundtrip");
         let meta = PoolMeta {
             kernel: PathBuf::from("/path/to/kernel"),
-            initramfs: PathBuf::from("/path/to/initramfs.cpio.gz"),
+            initramfs: Some(PathBuf::from("/path/to/initramfs.cpio.gz")),
             pristine: PathBuf::from("/path/to/pristine.ext4"),
             save: PathBuf::from("/path/to/save.bin"),
             slots: 7,
             cpus: 3,
             memory_mib: 1024,
+            flavor: PoolFlavor::Agent,
         };
         meta.write(&d.join("meta")).unwrap();
         let back = PoolMeta::read(&d.join("meta")).unwrap();
@@ -557,6 +709,43 @@ mod tests {
         assert_eq!(back.slots, meta.slots);
         assert_eq!(back.cpus, meta.cpus);
         assert_eq!(back.memory_mib, meta.memory_mib);
+        assert_eq!(back.flavor, meta.flavor);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn meta_roundtrip_stock_init_omits_initramfs() {
+        let d = tmp_for("meta_stock");
+        let meta = PoolMeta {
+            kernel: PathBuf::from("/k"),
+            initramfs: None,
+            pristine: PathBuf::from("/p"),
+            save: PathBuf::from("/s"),
+            slots: 1,
+            cpus: 2,
+            memory_mib: 512,
+            flavor: PoolFlavor::StockInit,
+        };
+        meta.write(&d.join("meta")).unwrap();
+        let body = fs::read_to_string(d.join("meta")).unwrap();
+        assert!(!body.contains("initramfs="), "stock-init meta must skip initramfs= line, got: {body}");
+        let back = PoolMeta::read(&d.join("meta")).unwrap();
+        assert_eq!(back.initramfs, None);
+        assert_eq!(back.flavor, PoolFlavor::StockInit);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn meta_read_defaults_flavor_to_agent_when_missing() {
+        let d = tmp_for("meta_legacy");
+        // Pre-3.5 meta files have no `flavor=` line.
+        fs::write(
+            d.join("meta"),
+            "kernel=/k\ninitramfs=/i\npristine=/p\nsave=/s\nslots=1\ncpus=2\nmemory_mib=512\n",
+        )
+        .unwrap();
+        let m = PoolMeta::read(&d.join("meta")).unwrap();
+        assert_eq!(m.flavor, PoolFlavor::Agent);
         fs::remove_dir_all(&d).unwrap();
     }
 

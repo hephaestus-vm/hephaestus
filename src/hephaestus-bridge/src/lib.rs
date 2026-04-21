@@ -220,6 +220,17 @@ unsafe extern "C" {
         out_restore_nanos: *mut u64,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
+    fn hb_vz_stock_pool_restore_long(
+        kernel_path: *const c_char,
+        rootfs_path: *const c_char,
+        save_path: *const c_char,
+        log_path: *const c_char,
+        cpu_count: u32,
+        memory_mib: u64,
+        out_vm: *mut *mut HbVzVm,
+        out_restore_nanos: *mut u64,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
 }
 
 // =============================================================================
@@ -918,6 +929,48 @@ pub fn vz_pool_restore_long(
         hb_vz_pool_restore_long(
             kernel_c.as_ptr(),
             initramfs_c.as_ptr(),
+            rootfs_c.as_ptr(),
+            save_c.as_ptr(),
+            log_ptr,
+            cpu_count,
+            memory_mib,
+            &mut out_vm,
+            &mut restore_nanos,
+            &mut out_err,
+        )
+    };
+    status.into_result(out_err)?;
+    debug_assert!(!out_vm.is_null());
+    Ok((VzVm { handle: out_vm }, restore_nanos))
+}
+
+/// Stock-init counterpart of [`vz_pool_restore_long`]. Restores a snapshot
+/// produced by [`vz_snapshot_save`] (no agent, no vsock, no initramfs)
+/// into a long-running [`VzVm`] handle. Used by `PoolFlavor::StockInit`
+/// pools so the HTTP backend can hand back a VM that's behaviorally
+/// indistinguishable from a cold-boot one.
+pub fn vz_stock_pool_restore_long(
+    kernel: &Path,
+    rootfs: &Path,
+    save: &Path,
+    log: Option<&Path>,
+    cpu_count: u32,
+    memory_mib: u64,
+) -> Result<(VzVm, u64), VmError> {
+    let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
+    let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
+    let save_c = CString::new(path_to_str(save, "save")?)?;
+    let log_c = log
+        .map(|p| CString::new(path_to_str(p, "log").unwrap_or("")))
+        .transpose()?;
+    let log_ptr = log_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+
+    let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
+    let mut out_err: *mut c_char = std::ptr::null_mut();
+    let mut restore_nanos: u64 = 0;
+    let status = unsafe {
+        hb_vz_stock_pool_restore_long(
+            kernel_c.as_ptr(),
             rootfs_c.as_ptr(),
             save_c.as_ptr(),
             log_ptr,

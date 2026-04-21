@@ -1450,3 +1450,84 @@ public func hb_vz_pool_restore_long(
         return Status.swiftError
     }
 }
+
+// =============================================================================
+// FFI: hb_vz_stock_pool_restore_long — restore a stock-init snapshot (no
+// agent, no vsock, no initramfs) into a long-running VzVm handle.
+//
+// Counterpart of `hb_vz_pool_restore_long` for `PoolFlavor::StockInit`.
+// The save was produced by `hb_vz_snapshot_save`, so the restore config
+// must mirror what `buildConfig` produces (URL serial, machine-id from
+// the .machineid sidecar, the same `init=/bin/sh` cmdline). Anything
+// else triggers VZ's "configuration mismatch" error on restore.
+// =============================================================================
+
+@_cdecl("hb_vz_stock_pool_restore_long")
+public func hb_vz_stock_pool_restore_long(
+    kernelPath: UnsafePointer<CChar>?,
+    rootfsPath: UnsafePointer<CChar>?,
+    savePath: UnsafePointer<CChar>?,
+    logPath: UnsafePointer<CChar>?,
+    cpuCount: UInt32,
+    memoryMib: UInt64,
+    outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
+    outRestoreNanos: UnsafeMutablePointer<UInt64>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let kernelPath, let rootfsPath, let savePath, let outVm else {
+        writeError(outErr, "null path/out argument")
+        return Status.invalidArgument
+    }
+    let kernel = URL(fileURLWithPath: String(cString: kernelPath))
+    let rootfs = URL(fileURLWithPath: String(cString: rootfsPath))
+    let save = URL(fileURLWithPath: String(cString: savePath))
+    // logURL is required by buildConfig (the URL-based serial attachment
+    // needs an existing file). When the caller doesn't pass one, drop it
+    // next to the save file so it's discoverable post-mortem.
+    let logURL = logPath.map { URL(fileURLWithPath: String(cString: $0)) }
+        ?? save.deletingPathExtension().appendingPathExtension("restore.log")
+    let machineId = machineIdURL(forSavePath: save)
+
+    do {
+        let config = try buildConfig(
+            kernel: kernel,
+            rootfs: rootfs,
+            logURL: logURL,
+            machineIdURL: machineId,
+            cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
+            memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
+            commandLine: "console=hvc0 root=/dev/vda rw init=/bin/sh panic=1"
+        )
+
+        let queue = DispatchQueue(label: "com.hephaestus.vz-stock-pool-restore-\(UUID().uuidString)")
+        let holder = VMHolder()
+        queue.sync {
+            holder.vm = VZVirtualMachine(configuration: config, queue: queue)
+        }
+        guard holder.vm != nil else {
+            writeError(outErr, "failed to construct VZVirtualMachine")
+            return Status.swiftError
+        }
+
+        let restoreStart = DispatchTime.now()
+        try blockingRestore(queue: queue, holder: holder, from: save)
+        try blockingResume(queue: queue, holder: holder)
+        let restoreElapsed = DispatchTime.now().uptimeNanoseconds - restoreStart.uptimeNanoseconds
+        outRestoreNanos?.pointee = restoreElapsed
+
+        let handle = VzVmHandle(
+            queue: queue,
+            holder: holder,
+            config: config,
+            logURL: logURL,
+            machineIdURL: machineId
+        )
+        let opaque = Unmanaged.passRetained(handle).toOpaque()
+        outVm.pointee = opaque.assumingMemoryBound(to: HbVzVm.self)
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}

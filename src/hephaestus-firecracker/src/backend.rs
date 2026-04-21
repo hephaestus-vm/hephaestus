@@ -11,6 +11,7 @@ use hephaestus_fc_api::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateC
 use hephaestus_fc_api::vmm_config::instance_info::{InstanceInfo, VmState};
 use hephaestus_fc_api::vmm_config::logger::LoggerConfig;
 use hephaestus_fc_api::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
+use hephaestus_fc_api::vmm_config::metrics::MetricsConfig;
 use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
 use hephaestus_pool::{ClaimedSlot, Pool, PoolMatchSpec};
@@ -173,6 +174,24 @@ impl VmmBackend for VzBackend {
                 })?;
         }
         Ok(())
+    }
+
+    fn configure_metrics(&mut self, cfg: MetricsConfig) -> Result<(), VmmBackendError> {
+        // Same shape as configure_logger: open the file, write a single
+        // structured init line, return. Real periodic-flush plumbing is
+        // deferred (most upstream metrics fields don't map to macOS).
+        let line = "{\"timestamp\":\"init\",\"event\":\"hephaestus-firecracker metrics configured\"}\n";
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&cfg.metrics_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()))
+            .map_err(|err| {
+                VmmBackendError::InvalidConfig(format!(
+                    "cannot open metrics_path {}: {err}",
+                    cfg.metrics_path.display()
+                ))
+            })
     }
 
     fn get_machine_config(&self) -> MachineConfig {
