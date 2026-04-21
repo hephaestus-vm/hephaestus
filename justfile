@@ -226,6 +226,43 @@ bootlog id='dev':
 rootfs-build tar out size='512': build
     {{bin}} rootfs --from-tar {{tar}} --output {{out}} --size-mib {{size}}
 
+# ───────── Firecracker HTTP API compat ─────────
+
+# Build the Go compat harness (drives hephaestus-firecracker via the same
+# firecracker-go-sdk client that firectl/Kata use). Cached binary lives next
+# to the source.
+fc-harness-build:
+    cd compat/firectl-harness && go build -o firectl-harness .
+
+# End-to-end compat smoke: starts hephaestus-firecracker on a fresh socket,
+# replays the firectl request sequence (logger, machine-config, boot-source,
+# drives, InstanceStart, PATCH /vm pause+resume), tears the server down.
+# Pass `boot=0` to stop after pre-boot config and skip the VM start.
+fc-compat boot='1': build fc-harness-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cdir="$HOME/Library/Application Support/com.apple.container"
+    kernel="$(ls "$cdir"/kernels/vmlinux-* 2>/dev/null | head -1 || true)"
+    snaps=("$cdir"/snapshots/*/snapshot)
+    if [[ -z "$kernel" ]] || [[ ! -e "${snaps[0]:-}" ]]; then
+        echo "no artifacts; run: just artifacts" >&2; exit 1
+    fi
+    rootfs_src=$(stat -f '%z %N' "${snaps[@]}" | sort -nr | head -1 | cut -d' ' -f2-)
+    rootfs="${TMPDIR:-/tmp}/hephaestus/fc-compat-rootfs.ext4"
+    mkdir -p "$(dirname "$rootfs")"
+    cp -c "$rootfs_src" "$rootfs"
+    sock="${TMPDIR:-/tmp}/hephaestus-fc-compat.socket"
+    log="${TMPDIR:-/tmp}/hephaestus/fc-compat.log"
+    rm -f "$sock" "$log"
+    {{bin}}-firecracker --api-sock "$sock" --id fc-compat &
+    server=$!
+    trap 'kill $server 2>/dev/null || true' EXIT
+    # Wait for the listener to come up.
+    for _ in $(seq 1 20); do [[ -S "$sock" ]] && break; sleep 0.1; done
+    args=(-sock "$sock" -kernel "$kernel" -rootfs "$rootfs" -log "$log")
+    if [[ "{{boot}}" == "0" ]]; then args+=(-skip-boot); else args+=(-pause); fi
+    compat/firectl-harness/firectl-harness "${args[@]}"
+
 # Run cargo unit tests + ping + test-rootfs. No VM boot; safe without artifacts.
 test: build
     cargo test --workspace
