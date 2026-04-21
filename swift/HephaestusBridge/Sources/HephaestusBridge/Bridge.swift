@@ -32,7 +32,7 @@ public func hb_ping() -> UnsafePointer<CChar> {
 // Error / status helpers.
 // =============================================================================
 
-private enum Status {
+enum Status {
     static let ok: Int32 = 0
     static let invalidArgument: Int32 = 1
     static let swiftError: Int32 = 2
@@ -51,7 +51,7 @@ private func cstrdup(_ s: String) -> UnsafeMutablePointer<CChar> {
     return buf
 }
 
-private func writeError(
+func writeError(
     _ outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
     _ message: String
 ) {
@@ -62,7 +62,7 @@ private func writeError(
 /// Format a caught Swift `Error` into something friendlier than the default
 /// stringification. Adds an action-oriented hint for recognized VZ codes and
 /// drops the noisy `Error Domain=... Code=N UserInfo={…}` prefix.
-private func formatError(_ error: Error) -> String {
+func formatError(_ error: Error) -> String {
     let ns = error as NSError
     guard ns.domain == "VZErrorDomain" else {
         return "\(error)"

@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
 
-use hephaestus_vmm::{Compression, Spec, StdioSink, build_rootfs_from_tar};
+use hephaestus_vmm::{
+    Compression, Spec, StdioSink, build_rootfs_from_tar, vz_boot, vz_snapshot_restore,
+    vz_snapshot_save,
+};
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -28,13 +31,43 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("vz-boot") => match parse_vz_boot_args(&mut args) {
+            Ok(opts) => vz_boot_cmd(opts),
+            Err(msg) => {
+                eprintln!("hephaestus: {msg}");
+                eprintln!("{VZ_BOOT_USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        Some("vz-snapshot") => match args.next().as_deref() {
+            Some("save") => match parse_vz_snap_args(&mut args, true) {
+                Ok(opts) => vz_snap_save_cmd(opts),
+                Err(msg) => {
+                    eprintln!("hephaestus: {msg}");
+                    eprintln!("{VZ_SNAP_USAGE}");
+                    ExitCode::from(2)
+                }
+            },
+            Some("restore") => match parse_vz_snap_args(&mut args, false) {
+                Ok(opts) => vz_snap_restore_cmd(opts),
+                Err(msg) => {
+                    eprintln!("hephaestus: {msg}");
+                    eprintln!("{VZ_SNAP_USAGE}");
+                    ExitCode::from(2)
+                }
+            },
+            _ => {
+                eprintln!("{VZ_SNAP_USAGE}");
+                ExitCode::from(2)
+            }
+        },
         Some(other) => {
             eprintln!("hephaestus: unknown subcommand `{other}`");
-            eprintln!("usage: hephaestus <ping|run|rootfs>");
+            eprintln!("usage: hephaestus <ping|run|rootfs|vz-boot|vz-snapshot>");
             ExitCode::from(2)
         }
         None => {
-            eprintln!("usage: hephaestus <ping|run|rootfs>");
+            eprintln!("usage: hephaestus <ping|run|rootfs|vz-boot|vz-snapshot>");
             ExitCode::from(2)
         }
     }
@@ -280,6 +313,247 @@ fn rootfs(opts: RootfsOptions) -> ExitCode {
         }
         Err(e) => {
             eprintln!("hephaestus: rootfs build failed: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+// =============================================================================
+// vz-boot subcommand — direct Virtualization.framework smoke test (N0 spike).
+// =============================================================================
+
+const VZ_BOOT_USAGE: &str = "\
+usage: hephaestus vz-boot \\
+    --kernel <path> \\
+    --rootfs <path> \\
+    --log <output-path> \\
+    [--cpus N] [--memory-mib N] [--run-seconds N]";
+
+#[derive(Debug)]
+struct VzBootOptions {
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    log: PathBuf,
+    cpus: u32,
+    memory_mib: u64,
+    run_seconds: u32,
+}
+
+fn parse_vz_boot_args(args: &mut impl Iterator<Item = String>) -> Result<VzBootOptions, String> {
+    let mut opts = VzBootOptions {
+        kernel: PathBuf::new(),
+        rootfs: PathBuf::new(),
+        log: PathBuf::new(),
+        cpus: 0,
+        memory_mib: 0,
+        run_seconds: 0,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--kernel" => opts.kernel = require_value(args, "--kernel")?.into(),
+            "--rootfs" => opts.rootfs = require_value(args, "--rootfs")?.into(),
+            "--log" => opts.log = require_value(args, "--log")?.into(),
+            "--cpus" => {
+                opts.cpus = require_value(args, "--cpus")?
+                    .parse()
+                    .map_err(|e| format!("invalid --cpus: {e}"))?;
+            }
+            "--memory-mib" => {
+                opts.memory_mib = require_value(args, "--memory-mib")?
+                    .parse()
+                    .map_err(|e| format!("invalid --memory-mib: {e}"))?;
+            }
+            "--run-seconds" => {
+                opts.run_seconds = require_value(args, "--run-seconds")?
+                    .parse()
+                    .map_err(|e| format!("invalid --run-seconds: {e}"))?;
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    if opts.kernel.as_os_str().is_empty() {
+        return Err("missing --kernel".into());
+    }
+    if opts.rootfs.as_os_str().is_empty() {
+        return Err("missing --rootfs".into());
+    }
+    if opts.log.as_os_str().is_empty() {
+        return Err("missing --log".into());
+    }
+    for (label, path) in [("--kernel", &opts.kernel), ("--rootfs", &opts.rootfs)] {
+        if !path.exists() {
+            return Err(format!("{label} path does not exist: {}", path.display()));
+        }
+    }
+    Ok(opts)
+}
+
+fn vz_boot_cmd(opts: VzBootOptions) -> ExitCode {
+    eprintln!(
+        "hephaestus: vz-boot kernel={} rootfs={} log={} (cpus={} mem={} MiB run={} s)",
+        opts.kernel.display(),
+        opts.rootfs.display(),
+        opts.log.display(),
+        if opts.cpus == 0 { "default".into() } else { opts.cpus.to_string() },
+        if opts.memory_mib == 0 { "default".into() } else { opts.memory_mib.to_string() },
+        if opts.run_seconds == 0 { "default".into() } else { opts.run_seconds.to_string() },
+    );
+    let start = std::time::Instant::now();
+    match vz_boot(
+        &opts.kernel,
+        &opts.rootfs,
+        &opts.log,
+        opts.cpus,
+        opts.memory_mib,
+        opts.run_seconds,
+    ) {
+        Ok(()) => {
+            eprintln!("hephaestus: vz-boot completed in {:?}", start.elapsed());
+            eprintln!("hephaestus: inspect the guest serial log at {}", opts.log.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("hephaestus: vz-boot: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+// =============================================================================
+// vz-snapshot subcommand — direct Virtualization.framework save/restore (N1).
+// =============================================================================
+
+const VZ_SNAP_USAGE: &str = "\
+usage:
+  hephaestus vz-snapshot save \\
+      --kernel <path> --rootfs <path> --log <path> --save <path> \\
+      [--cpus N] [--memory-mib N] [--settle-seconds N]
+  hephaestus vz-snapshot restore \\
+      --kernel <path> --rootfs <path> --log <path> --save <path> \\
+      [--cpus N] [--memory-mib N] [--run-seconds N]";
+
+#[derive(Debug)]
+struct VzSnapOptions {
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    log: PathBuf,
+    save: PathBuf,
+    cpus: u32,
+    memory_mib: u64,
+    seconds: u32, // settle (save) or run (restore)
+}
+
+fn parse_vz_snap_args(
+    args: &mut impl Iterator<Item = String>,
+    saving: bool,
+) -> Result<VzSnapOptions, String> {
+    let mut opts = VzSnapOptions {
+        kernel: PathBuf::new(),
+        rootfs: PathBuf::new(),
+        log: PathBuf::new(),
+        save: PathBuf::new(),
+        cpus: 0,
+        memory_mib: 0,
+        seconds: 0,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--kernel" => opts.kernel = require_value(args, "--kernel")?.into(),
+            "--rootfs" => opts.rootfs = require_value(args, "--rootfs")?.into(),
+            "--log" => opts.log = require_value(args, "--log")?.into(),
+            "--save" => opts.save = require_value(args, "--save")?.into(),
+            "--cpus" => {
+                opts.cpus = require_value(args, "--cpus")?
+                    .parse()
+                    .map_err(|e| format!("invalid --cpus: {e}"))?;
+            }
+            "--memory-mib" => {
+                opts.memory_mib = require_value(args, "--memory-mib")?
+                    .parse()
+                    .map_err(|e| format!("invalid --memory-mib: {e}"))?;
+            }
+            "--settle-seconds" | "--run-seconds" => {
+                opts.seconds = require_value(args, &arg)?
+                    .parse()
+                    .map_err(|e| format!("invalid seconds value: {e}"))?;
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    for (label, path, must_exist) in [
+        ("--kernel", &opts.kernel, true),
+        ("--rootfs", &opts.rootfs, true),
+        ("--log", &opts.log, false),
+        ("--save", &opts.save, !saving), // save file must exist on restore
+    ] {
+        if path.as_os_str().is_empty() {
+            return Err(format!("missing {label}"));
+        }
+        if must_exist && !path.exists() {
+            return Err(format!("{label} path does not exist: {}", path.display()));
+        }
+    }
+    Ok(opts)
+}
+
+fn vz_snap_save_cmd(opts: VzSnapOptions) -> ExitCode {
+    eprintln!(
+        "hephaestus: vz-snapshot save → {} (settle={}s)",
+        opts.save.display(),
+        if opts.seconds == 0 { 3 } else { opts.seconds }
+    );
+    let start = std::time::Instant::now();
+    match vz_snapshot_save(
+        &opts.kernel,
+        &opts.rootfs,
+        &opts.log,
+        &opts.save,
+        opts.cpus,
+        opts.memory_mib,
+        opts.seconds,
+    ) {
+        Ok(()) => {
+            let size = std::fs::metadata(&opts.save).map(|m| m.len()).unwrap_or(0);
+            eprintln!(
+                "hephaestus: saved {} bytes in {:?} (includes settle time)",
+                size,
+                start.elapsed()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("hephaestus: vz-snapshot save: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn vz_snap_restore_cmd(opts: VzSnapOptions) -> ExitCode {
+    eprintln!(
+        "hephaestus: vz-snapshot restore ← {} (run={}s)",
+        opts.save.display(),
+        if opts.seconds == 0 { 3 } else { opts.seconds }
+    );
+    let wall_start = std::time::Instant::now();
+    match vz_snapshot_restore(
+        &opts.kernel,
+        &opts.rootfs,
+        &opts.log,
+        &opts.save,
+        opts.cpus,
+        opts.memory_mib,
+        opts.seconds,
+    ) {
+        Ok(restore_nanos) => {
+            eprintln!(
+                "hephaestus: restore+resume took {:.3} ms (wall clock incl. run: {:?})",
+                restore_nanos as f64 / 1_000_000.0,
+                wall_start.elapsed()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("hephaestus: vz-snapshot restore: {e}");
             ExitCode::from(1)
         }
     }

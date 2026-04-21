@@ -107,6 +107,36 @@ unsafe extern "C" {
         compression: u32,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
+    fn hb_vz_boot(
+        kernel_path: *const c_char,
+        rootfs_path: *const c_char,
+        log_path: *const c_char,
+        cpu_count: u32,
+        memory_mib: u64,
+        run_seconds: u32,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
+    fn hb_vz_snapshot_save(
+        kernel_path: *const c_char,
+        rootfs_path: *const c_char,
+        log_path: *const c_char,
+        save_path: *const c_char,
+        cpu_count: u32,
+        memory_mib: u64,
+        settle_seconds: u32,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
+    fn hb_vz_snapshot_restore(
+        kernel_path: *const c_char,
+        rootfs_path: *const c_char,
+        log_path: *const c_char,
+        save_path: *const c_char,
+        cpu_count: u32,
+        memory_mib: u64,
+        run_seconds: u32,
+        out_restore_nanos: *mut u64,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
 }
 
 // =============================================================================
@@ -448,6 +478,114 @@ impl Compression {
         }
         Ok(None) // plausible uncompressed tar; caller may treat as None
     }
+}
+
+// =============================================================================
+// Direct Virtualization.framework path — N0 spike.
+// Bypasses apple/containerization entirely. Foundation for snapshots (N1).
+// =============================================================================
+
+/// Boot a Linux kernel + rootfs directly via VZVirtualMachine, pipe the
+/// guest's serial console to `log`, and stop after `run_seconds`.
+///
+/// No vminitd, no gRPC, no container orchestration — this is a smoke test
+/// for our direct-VZ path. Use `cpu_count = 0` and `memory_mib = 0` for
+/// framework defaults (2 CPUs, 512 MiB).
+pub fn vz_boot(
+    kernel: &Path,
+    rootfs: &Path,
+    log: &Path,
+    cpu_count: u32,
+    memory_mib: u64,
+    run_seconds: u32,
+) -> Result<(), VmError> {
+    let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
+    let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
+    let log_c = CString::new(path_to_str(log, "log")?)?;
+    let mut out_err: *mut c_char = std::ptr::null_mut();
+    let status = unsafe {
+        hb_vz_boot(
+            kernel_c.as_ptr(),
+            rootfs_c.as_ptr(),
+            log_c.as_ptr(),
+            cpu_count,
+            memory_mib,
+            run_seconds,
+            &mut out_err,
+        )
+    };
+    status.into_result(out_err)
+}
+
+/// Pause a booted VM and save its full state to disk. Builds a fresh
+/// `VZVirtualMachineConfiguration` from the provided artifacts, starts the
+/// VM, waits `settle_seconds` for the guest to reach a quiescent state,
+/// then pauses and dumps state to `save`.
+pub fn vz_snapshot_save(
+    kernel: &Path,
+    rootfs: &Path,
+    log: &Path,
+    save: &Path,
+    cpu_count: u32,
+    memory_mib: u64,
+    settle_seconds: u32,
+) -> Result<(), VmError> {
+    let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
+    let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
+    let log_c = CString::new(path_to_str(log, "log")?)?;
+    let save_c = CString::new(path_to_str(save, "save")?)?;
+    let mut out_err: *mut c_char = std::ptr::null_mut();
+    let status = unsafe {
+        hb_vz_snapshot_save(
+            kernel_c.as_ptr(),
+            rootfs_c.as_ptr(),
+            log_c.as_ptr(),
+            save_c.as_ptr(),
+            cpu_count,
+            memory_mib,
+            settle_seconds,
+            &mut out_err,
+        )
+    };
+    status.into_result(out_err)
+}
+
+/// Restore a VM from a save file and resume it. Returns how long the
+/// `restoreMachineStateFrom:` + `resume()` pair took, in nanoseconds —
+/// the marquee "fast boot" number.
+///
+/// The VM config must structurally match what was saved; pass the same
+/// kernel/rootfs/cpus/memory you saved with.
+pub fn vz_snapshot_restore(
+    kernel: &Path,
+    rootfs: &Path,
+    log: &Path,
+    save: &Path,
+    cpu_count: u32,
+    memory_mib: u64,
+    run_seconds: u32,
+) -> Result<u64, VmError> {
+    let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
+    let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
+    let log_c = CString::new(path_to_str(log, "log")?)?;
+    let save_c = CString::new(path_to_str(save, "save")?)?;
+    let mut out_err: *mut c_char = std::ptr::null_mut();
+    let mut restore_nanos: u64 = 0;
+    let status = unsafe {
+        hb_vz_snapshot_restore(
+            kernel_c.as_ptr(),
+            rootfs_c.as_ptr(),
+            log_c.as_ptr(),
+            save_c.as_ptr(),
+            cpu_count,
+            memory_mib,
+            run_seconds,
+            &mut restore_nanos,
+            &mut out_err,
+        )
+    };
+    status.into_result(out_err)?;
+    Ok(restore_nanos)
 }
 
 /// Build an ext4 block device at `out` from the tar archive at `tar`.
