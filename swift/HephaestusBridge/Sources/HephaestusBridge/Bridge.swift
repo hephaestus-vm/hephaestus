@@ -57,6 +57,47 @@ private func writeError(
     outErr.pointee = cstrdup(message)
 }
 
+/// Format a caught Swift `Error` into something friendlier than the default
+/// stringification. Adds an action-oriented hint for recognized VZ codes and
+/// drops the noisy `Error Domain=... Code=N UserInfo={…}` prefix.
+private func formatError(_ error: Error) -> String {
+    let ns = error as NSError
+    guard ns.domain == "VZErrorDomain" else {
+        return "\(error)"
+    }
+    var parts: [String] = [ns.localizedDescription]
+    // Foundation often embeds the reason inside localizedDescription already
+    // (as ". Reason: …") — only append separately when it's meaningfully new.
+    if let reason = ns.userInfo[NSLocalizedFailureReasonErrorKey] as? String,
+       !ns.localizedDescription.contains(reason) {
+        parts.append(reason)
+    }
+    if let hint = vzErrorHint(code: ns.code) {
+        parts.append("hint: \(hint)")
+    }
+    return parts.joined(separator: " — ")
+}
+
+private func vzErrorHint(code: Int) -> String? {
+    // Mirrors VZErrorCode values documented at
+    // https://developer.apple.com/documentation/virtualization/vzerror/code
+    switch code {
+    case 1:  return "VZ internal error — check kernel and disk image validity"
+    case 2:  return "binary is missing the com.apple.security.virtualization entitlement"
+    case 3:  return "VM is in the wrong state for this operation"
+    case 4:  return "invalid state transition requested"
+    case 5:  return "invalid disk image — is the path a real ext4 block device?"
+    case 6:  return "network error"
+    case 7:  return "out of disk space"
+    case 8:  return "operation cancelled"
+    case 9:  return "operation not supported on this platform / macOS version"
+    case 10: return "save (snapshot) failed"
+    case 11: return "restore (snapshot) failed"
+    case 12: return "device not found"
+    default: return nil
+    }
+}
+
 // =============================================================================
 // Async-to-sync bridge: runs an async Swift closure and blocks the caller
 // until it completes, returning its result or throwing its error.
@@ -237,7 +278,7 @@ public func hb_vm_new(
         outErr?.pointee = nil
         return Status.ok
     } catch {
-        writeError(outErr, "\(error)")
+        writeError(outErr, formatError(error))
         return Status.swiftError
     }
 }
@@ -268,7 +309,7 @@ public func hb_vm_create(
         outErr?.pointee = nil
         return Status.ok
     } catch {
-        writeError(outErr, "\(error)")
+        writeError(outErr, formatError(error))
         return Status.swiftError
     }
 }
@@ -284,7 +325,7 @@ public func hb_vm_start(
         outErr?.pointee = nil
         return Status.ok
     } catch {
-        writeError(outErr, "\(error)")
+        writeError(outErr, formatError(error))
         return Status.swiftError
     }
 }
@@ -302,7 +343,7 @@ public func hb_vm_wait(
         outErr?.pointee = nil
         return Status.ok
     } catch {
-        writeError(outErr, "\(error)")
+        writeError(outErr, formatError(error))
         return Status.swiftError
     }
 }
@@ -318,7 +359,7 @@ public func hb_vm_stop(
         outErr?.pointee = nil
         return Status.ok
     } catch {
-        writeError(outErr, "\(error)")
+        writeError(outErr, formatError(error))
         return Status.swiftError
     }
 }
@@ -395,7 +436,7 @@ public func hb_rootfs_from_tar(
         outErr?.pointee = nil
         return Status.ok
     } catch {
-        writeError(outErr, "\(error)")
+        writeError(outErr, formatError(error))
         return Status.swiftError
     }
 }
