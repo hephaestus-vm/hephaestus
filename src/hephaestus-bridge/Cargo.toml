@@ -1,0 +1,17 @@
+[package]
+name = "hephaestus-bridge"
+version = "0.0.1-dev"
+edition = "2024"
+license = "Apache-2.0"
+description = "Rust-side of the Swift FFI bridge to Apple's containerization framework."
+
+[lib]
+bench = false
+
+[build-dependencies]
+# build.rs has no Rust deps; it only shells out to `swift build`.
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -11,7 +11,9 @@
 # allowlisted using a toolchain that requires it, causing the A/B-test to
 # always fail.
 [toolchain]
-channel = "1.94.1"
-targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+# hephaestus targets macOS/Apple Silicon as host. Keep the channel floor loose
+# so Homebrew's rustc can build the workspace without a forced rustup install.
+channel = "1.94"
+targets = ["aarch64-apple-darwin"]
 profile = "minimal"
 

@@ -1,0 +1,17 @@
+[package]
+name = "hephaestus-cli"
+version = "0.0.1-dev"
+edition = "2024"
+license = "Apache-2.0"
+description = "Command-line driver for hephaestus."
+
+[[bin]]
+name = "hephaestus"
+path = "src/main.rs"
+bench = false
+
+[dependencies]
+hephaestus-vmm = { path = "../hephaestus-vmm" }
+
+[lints]
+workspace = true

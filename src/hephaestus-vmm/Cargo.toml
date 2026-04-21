@@ -1,0 +1,15 @@
+[package]
+name = "hephaestus-vmm"
+version = "0.0.1-dev"
+edition = "2024"
+license = "Apache-2.0"
+description = "Containerization-backed VMM for the hephaestus fork of Firecracker."
+
+[lib]
+bench = false
+
+[dependencies]
+hephaestus-bridge = { path = "../hephaestus-bridge" }
+
+[lints]
+workspace = true

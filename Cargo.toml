@@ -1,17 +1,32 @@
 [workspace]
-members = ["src/*"]
-# We exclude the jailer below so that it does not get build by default. This is because "cargo build" compiles
-# for the gnu target, and the jailer needs a statically compiled binary to work correctly.
-# See https://github.com/firecracker-microvm/firecracker/commit/3bf285c8f8a815149923c562dd7edaffcaf10c4e
-# and https://github.com/firecracker-microvm/firecracker/issues/2102
-default-members = [
+# hephaestus: macOS/Apple-Silicon fork. We enumerate members rather than using
+# `src/*` because Firecracker's original vmm/jailer/utils/etc. are Linux-only
+# and won't build on macOS. Those directories remain on disk for reference and
+# upstream cherry-picks, but are excluded from the workspace until a V2 pass
+# reintroduces them behind a `target_os = "linux"` cfg.
+members = [
+    # OS-agnostic upstream crates we still use
+    "src/acpi-tables",
     "src/clippy-tracing",
+    "src/log-instrument",
+    "src/log-instrument-macros",
+    # hephaestus-native crates
+    "src/hephaestus-bridge",
+    "src/hephaestus-cli",
+    "src/hephaestus-vmm",
+]
+exclude = [
     "src/cpu-template-helper",
     "src/firecracker",
+    "src/jailer",
     "src/rebase-snap",
     "src/seccompiler",
     "src/snapshot-editor",
-    "src/acpi-tables",
+    "src/utils",
+    "src/vmm",
+]
+default-members = [
+    "src/hephaestus-cli",
 ]
 resolver = "2"
 
