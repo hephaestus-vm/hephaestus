@@ -286,6 +286,7 @@ dependencies = [
 name = "hephaestus-cli"
 version = "0.0.1-dev"
 dependencies = [
+ "hephaestus-bridge",
  "hephaestus-vmm",
 ]
 

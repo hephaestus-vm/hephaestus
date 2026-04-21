@@ -4,6 +4,9 @@ version = "0.0.1-dev"
 edition = "2024"
 license = "Apache-2.0"
 description = "Rust-side of the Swift FFI bridge to Apple's containerization framework."
+# The `links` key is what lets cargo propagate our `cargo:archive=…` value to
+# dependent crates' build scripts as `DEP_HEPHAESTUS_BRIDGE_ARCHIVE`.
+links = "hephaestus_bridge_native"
 
 [lib]
 bench = false

@@ -12,6 +12,8 @@ bench = false
 
 [dependencies]
 hephaestus-vmm = { path = "../hephaestus-vmm" }
+# Direct dep so cargo sets DEP_HEPHAESTUS_BRIDGE_NATIVE_ARCHIVE for our build.rs.
+hephaestus-bridge = { path = "../hephaestus-bridge" }
 
 [lints]
 workspace = true

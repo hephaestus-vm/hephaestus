@@ -85,6 +85,18 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=static=HephaestusBridge");
+    // Export the archive path so the bin crate's build.rs can emit a
+    // -force_load at the final link step. (cargo:rustc-link-arg emitted
+    // from a library crate only applies when that crate itself is linking
+    // something, which rlibs don't do.)
+    println!(
+        "cargo:rustc-env=HEPHAESTUS_BRIDGE_ARCHIVE={}",
+        lib_dir.join("libHephaestusBridge.a").display()
+    );
+    println!(
+        "cargo:archive={}",
+        lib_dir.join("libHephaestusBridge.a").display()
+    );
 
     // SwiftPM bundles all transitive Swift-package object files into the
     // library product archive (.a has ~1900 .o files), so we only need to

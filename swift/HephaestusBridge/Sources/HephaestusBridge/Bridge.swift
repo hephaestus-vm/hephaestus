@@ -71,13 +71,20 @@ private func runSync<T: Sendable>(
 ) throws -> T {
     let semaphore = DispatchSemaphore(value: 0)
     let box = ResultBox<T>()
-    Task.detached {
-        do {
-            box.value = .success(try await body())
-        } catch {
-            box.value = .failure(error)
+    // Hop onto a pthread queue before spawning the Task so the Swift
+    // cooperative pool isn't trying to drain a blocked-caller scenario
+    // from the same thread the async work gets scheduled on. Then spawn
+    // an async Task from there; NIO's own EventLoopGroup threads run
+    // happily alongside.
+    DispatchQueue.global(qos: .userInitiated).async {
+        Task {
+            do {
+                box.value = .success(try await body())
+            } catch {
+                box.value = .failure(error)
+            }
+            semaphore.signal()
         }
-        semaphore.signal()
     }
     semaphore.wait()
     return try box.value!.get()
@@ -196,6 +203,12 @@ public func hb_vm_new(
             CallbackWriter(callback: $0, userdata: cfg.stdio_userdata)
         }
 
+        // Send the guest's serial console to a file so we can tail it for
+        // boot diagnostics when things go wrong inside the VM.
+        let bootLogURL = URL(
+            fileURLWithPath: NSTemporaryDirectory(), isDirectory: true
+        ).appendingPathComponent("hephaestus-\(id).bootlog")
+
         let container = try LinuxContainer(
             id,
             rootfs: rootfs,
@@ -215,6 +228,7 @@ public func hb_vm_new(
             }
             c.process.stdout = stdoutWriter
             c.process.stderr = stderrWriter
+            c.bootLog = BootLog.file(path: bootLogURL)
         }
 
         let handle = VmHandle(container: container)
