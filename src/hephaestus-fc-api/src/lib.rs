@@ -25,8 +25,10 @@ pub mod vmm_config;
 
 pub use backend::{VmmBackend, VmmBackendError};
 pub use vmm_config::boot_source::{BootSourceConfig, DEFAULT_KERNEL_CMDLINE};
-pub use vmm_config::drive::{BlockDeviceConfig, CacheType, FileEngineType};
+pub use vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, CacheType, FileEngineType};
 pub use vmm_config::instance_info::{InstanceInfo, VmState};
+pub use vmm_config::logger::LoggerConfig;
 pub use vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 pub use vmm_config::net::NetworkInterfaceConfig;
+pub use vmm_config::vm::{UpdatedVm, VmUpdatedState};
 pub use vmm_config::{RateLimiterConfig, TokenBucketConfig};

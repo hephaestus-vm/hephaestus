@@ -7,8 +7,9 @@
 use std::path::PathBuf;
 
 use hephaestus_fc_api::vmm_config::boot_source::{BootSourceConfig, DEFAULT_KERNEL_CMDLINE};
-use hephaestus_fc_api::vmm_config::drive::BlockDeviceConfig;
+use hephaestus_fc_api::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
 use hephaestus_fc_api::vmm_config::instance_info::{InstanceInfo, VmState};
+use hephaestus_fc_api::vmm_config::logger::LoggerConfig;
 use hephaestus_fc_api::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
@@ -98,12 +99,62 @@ impl VmmBackend for VzBackend {
         Ok(())
     }
 
+    fn update_block_device(
+        &mut self,
+        cfg: BlockDeviceUpdateConfig,
+    ) -> Result<(), VmmBackendError> {
+        // Pre-boot-only because VZ doesn't support hot-swapping a
+        // block-device attachment the way virtio-blk + io_uring does on
+        // Linux. Clients that rely on post-boot patch will need to stop
+        // and restart the VM; firectl/Kata both do their drive patch
+        // before InstanceStart so this covers the typical path.
+        self.require_preboot()?;
+        if let Some(path) = cfg.path_on_host {
+            let path = PathBuf::from(path);
+            if !path.exists() {
+                return Err(VmmBackendError::InvalidConfig(format!(
+                    "rootfs not found at {}",
+                    path.display()
+                )));
+            }
+            self.root_drive = Some(path);
+        }
+        // rate_limiter: accept-and-ignore, we don't enforce rate limits
+        // on macOS VZ's built-in block attachment.
+        Ok(())
+    }
+
     fn insert_network_device(
         &mut self,
         cfg: NetworkInterfaceConfig,
     ) -> Result<(), VmmBackendError> {
         self.require_preboot()?;
         self.iface = Some(cfg);
+        Ok(())
+    }
+
+    fn configure_logger(&mut self, cfg: LoggerConfig) -> Result<(), VmmBackendError> {
+        // Accept pre- or post-boot: Firecracker allows PUT /logger at any
+        // time. Honor log_path best-effort by appending a single
+        // structured line announcing the config; future work can stream
+        // server events through proper `log` crate plumbing.
+        if let Some(path) = cfg.log_path.as_ref() {
+            let line = format!(
+                "{{\"timestamp\":\"init\",\"level\":\"{}\",\"msg\":\"hephaestus-firecracker logger configured\"}}\n",
+                cfg.level.as_deref().unwrap_or("Info"),
+            );
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()))
+                .map_err(|err| {
+                    VmmBackendError::InvalidConfig(format!(
+                        "cannot open log_path {}: {err}",
+                        path.display()
+                    ))
+                })?;
+        }
         Ok(())
     }
 
@@ -191,6 +242,44 @@ impl VmmBackend for VzBackend {
             .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
 
         self.vm = Some(vm);
+        self.state = VmState::Running;
+        Ok(())
+    }
+
+    fn pause(&mut self) -> Result<(), VmmBackendError> {
+        match self.state {
+            VmState::Running => {}
+            VmState::Paused => return Ok(()),
+            VmState::NotStarted => {
+                return Err(VmmBackendError::InvalidState(
+                    "cannot pause before InstanceStart".into(),
+                ));
+            }
+        }
+        let vm = self.vm.as_ref().ok_or_else(|| {
+            VmmBackendError::Internal("running state without a VM handle".into())
+        })?;
+        vm.pause()
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
+        self.state = VmState::Paused;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), VmmBackendError> {
+        match self.state {
+            VmState::Paused => {}
+            VmState::Running => return Ok(()),
+            VmState::NotStarted => {
+                return Err(VmmBackendError::InvalidState(
+                    "cannot resume before InstanceStart".into(),
+                ));
+            }
+        }
+        let vm = self.vm.as_ref().ok_or_else(|| {
+            VmmBackendError::Internal("paused state without a VM handle".into())
+        })?;
+        vm.resume()
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
         self.state = VmState::Running;
         Ok(())
     }

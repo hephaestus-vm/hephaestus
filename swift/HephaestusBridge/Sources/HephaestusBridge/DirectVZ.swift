@@ -1283,6 +1283,38 @@ public func hb_vz_long_start(
     }
 }
 
+@_cdecl("hb_vz_long_pause")
+public func hb_vz_long_pause(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrowVz(vm, outErr) else { return Status.invalidArgument }
+    do {
+        try blockingPause(queue: handle.queue, holder: handle.holder)
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}
+
+@_cdecl("hb_vz_long_resume")
+public func hb_vz_long_resume(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrowVz(vm, outErr) else { return Status.invalidArgument }
+    do {
+        try blockingResume(queue: handle.queue, holder: handle.holder)
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}
+
 @_cdecl("hb_vz_long_stop")
 public func hb_vz_long_stop(
     vm: UnsafeMutablePointer<HbVzVm>?,

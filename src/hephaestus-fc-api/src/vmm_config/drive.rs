@@ -70,6 +70,19 @@ pub struct BlockDeviceConfig {
     pub socket: Option<String>,
 }
 
+/// PATCH /drives/{id} body. Only supplied fields are updated; `None`
+/// means "leave as-is".
+#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockDeviceUpdateConfig {
+    /// The drive ID, as provided by the user at creation time.
+    pub drive_id: String,
+    /// New block file path on the host.
+    pub path_on_host: Option<String>,
+    /// New rate limiter config.
+    pub rate_limiter: Option<RateLimiterConfig>,
+}
+
 /// Errors associated with the operations allowed on a drive.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum DriveError {

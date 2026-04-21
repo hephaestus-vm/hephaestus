@@ -16,8 +16,9 @@
 //! have a client asking for them.
 
 use crate::vmm_config::boot_source::BootSourceConfig;
-use crate::vmm_config::drive::BlockDeviceConfig;
+use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
 use crate::vmm_config::instance_info::InstanceInfo;
+use crate::vmm_config::logger::LoggerConfig;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 use crate::vmm_config::net::NetworkInterfaceConfig;
 
@@ -61,11 +62,22 @@ pub trait VmmBackend {
         cfg: BlockDeviceConfig,
     ) -> Result<(), VmmBackendError>;
 
+    /// `PATCH /drives/{id}`
+    fn update_block_device(
+        &mut self,
+        cfg: BlockDeviceUpdateConfig,
+    ) -> Result<(), VmmBackendError>;
+
     /// `PUT /network-interfaces/{id}`
     fn insert_network_device(
         &mut self,
         cfg: NetworkInterfaceConfig,
     ) -> Result<(), VmmBackendError>;
+
+    /// `PUT /logger`. Backends that can't honor the config fully should
+    /// still accept-and-best-effort rather than error — Firecracker
+    /// clients treat this as fire-and-forget config.
+    fn configure_logger(&mut self, cfg: LoggerConfig) -> Result<(), VmmBackendError>;
 
     /// `GET /machine-config`
     fn get_machine_config(&self) -> MachineConfig;

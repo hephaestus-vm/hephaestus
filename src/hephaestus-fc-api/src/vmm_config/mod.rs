@@ -13,10 +13,14 @@ pub mod boot_source;
 pub mod drive;
 /// Instance info wire struct (`GET /`).
 pub mod instance_info;
+/// Host-side logger config wire struct (`PUT /logger`).
+pub mod logger;
 /// Machine config wire struct (`GET`/`PUT`/`PATCH /machine-config`).
 pub mod machine_config;
 /// Network interface wire struct (`PUT /network-interfaces/{id}`).
 pub mod net;
+/// VM state update wire struct (`PATCH /vm`).
+pub mod vm;
 
 /// A public-facing, stateless structure, holding all the data we need to create a TokenBucket
 /// (live) object.

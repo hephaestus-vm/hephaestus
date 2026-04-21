@@ -21,9 +21,11 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 use hephaestus_fc_api::vmm_config::boot_source::BootSourceConfig;
-use hephaestus_fc_api::vmm_config::drive::BlockDeviceConfig;
+use hephaestus_fc_api::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
+use hephaestus_fc_api::vmm_config::logger::LoggerConfig;
 use hephaestus_fc_api::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
+use hephaestus_fc_api::vmm_config::vm::{UpdatedVm, VmUpdatedState};
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
 
 use crate::backend::VzBackend;
@@ -84,6 +86,33 @@ async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Respon
                 Err(resp) => resp,
             }
         }
+        (Method::PATCH, p) if p.starts_with("/drives/") => {
+            let id = p.trim_start_matches("/drives/");
+            if id.is_empty() || id.contains('/') {
+                return fault(StatusCode::BAD_REQUEST, "invalid drive id");
+            }
+            match parse_body::<BlockDeviceUpdateConfig>(req).await {
+                Ok(cfg) if cfg.drive_id != id => fault(
+                    StatusCode::BAD_REQUEST,
+                    "drive_id in body does not match URL",
+                ),
+                Ok(cfg) => to_response(backend.lock().await.update_block_device(cfg)),
+                Err(resp) => resp,
+            }
+        }
+        (Method::PATCH, "/vm") => match parse_body::<UpdatedVm>(req).await {
+            Ok(UpdatedVm {
+                state: VmUpdatedState::Paused,
+            }) => to_response(backend.lock().await.pause()),
+            Ok(UpdatedVm {
+                state: VmUpdatedState::Resumed,
+            }) => to_response(backend.lock().await.resume()),
+            Err(resp) => resp,
+        },
+        (Method::PUT, "/logger") => match parse_body::<LoggerConfig>(req).await {
+            Ok(cfg) => to_response(backend.lock().await.configure_logger(cfg)),
+            Err(resp) => resp,
+        },
         (Method::PUT, p) if p.starts_with("/network-interfaces/") => {
             let id = p.trim_start_matches("/network-interfaces/");
             if id.is_empty() || id.contains('/') {
