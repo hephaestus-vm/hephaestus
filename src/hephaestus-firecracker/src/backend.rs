@@ -1,30 +1,18 @@
 //! `VmmBackend` implementation that drives `hephaestus-vmm`'s direct-VZ path.
 //!
-//! v0.3 scope note: we collect config over the HTTP API and dispatch
-//! `vz_boot` on `InstanceStart`. `vz_boot` is currently timeout-based
-//! (blocks for N seconds then exits), so for HTTP-driven use we pass a
-//! very large timeout and run the boot on a blocking task. A proper
-//! long-running/stoppable VM API lives in the session-2 scope sketch —
-//! replacing the `vz_boot` call site here will be the single-point change.
-//!
 //! Single-VM-per-process matches upstream's contract; `VzBackend` holds
-//! the accumulated pre-boot config and, once booted, the join handle to
-//! the background VM task.
+//! the accumulated pre-boot config and, once booted, an owned [`VzVm`]
+//! handle. Dropping the backend stops the VM via `VzVm::Drop`.
 
 use std::path::PathBuf;
-use std::thread::JoinHandle;
 
-use hephaestus_fc_api::vmm_config::boot_source::BootSourceConfig;
+use hephaestus_fc_api::vmm_config::boot_source::{BootSourceConfig, DEFAULT_KERNEL_CMDLINE};
 use hephaestus_fc_api::vmm_config::drive::BlockDeviceConfig;
 use hephaestus_fc_api::vmm_config::instance_info::{InstanceInfo, VmState};
 use hephaestus_fc_api::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
-
-/// A very large timeout approximating "run until the process is killed".
-/// ~68 years of seconds; replaces vz_boot's finite timeout when driven
-/// from an HTTP client that expects a long-running VM.
-const ESSENTIALLY_FOREVER_SECS: u32 = u32::MAX;
+use hephaestus_vmm::{VzSpec, VzVm};
 
 #[derive(Debug)]
 pub struct VzBackend {
@@ -34,7 +22,7 @@ pub struct VzBackend {
     root_drive: Option<PathBuf>,
     iface: Option<NetworkInterfaceConfig>,
     machine_config: MachineConfig,
-    vm_thread: Option<JoinHandle<Result<(), String>>>,
+    vm: Option<VzVm>,
 }
 
 impl VzBackend {
@@ -46,7 +34,7 @@ impl VzBackend {
             root_drive: None,
             iface: None,
             machine_config: MachineConfig::default(),
-            vm_thread: None,
+            vm: None,
         }
     }
 
@@ -181,27 +169,28 @@ impl VmmBackend for VzBackend {
             VmmBackendError::InvalidState("root drive not configured".into())
         })?;
         let kernel = PathBuf::from(&boot.kernel_image_path);
+        let boot_args = boot
+            .boot_args
+            .clone()
+            .unwrap_or_else(|| DEFAULT_KERNEL_CMDLINE.to_string());
         let cpu = u32::from(self.machine_config.vcpu_count);
         let memory = u64::try_from(self.machine_config.mem_size_mib)
             .map_err(|err| VmmBackendError::InvalidConfig(err.to_string()))?;
         let log = PathBuf::from(format!("/tmp/hephaestus-firecracker-{}.log", self.id));
 
-        let handle = std::thread::Builder::new()
-            .name(format!("vz-boot-{}", self.id))
-            .spawn(move || {
-                hephaestus_vmm::vz_boot(
-                    &kernel,
-                    &rootfs,
-                    &log,
-                    cpu,
-                    memory,
-                    ESSENTIALLY_FOREVER_SECS,
-                )
-                .map_err(|err| err.to_string())
-            })
+        let mut spec = VzSpec::new(&kernel, &rootfs, &log, boot_args)
+            .cpus(cpu)
+            .memory_mib(memory);
+        if let Some(initrd) = boot.initrd_path.as_ref() {
+            spec = spec.initrd(std::path::Path::new(initrd));
+        }
+        let vm = spec
+            .build()
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
+        vm.start()
             .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
 
-        self.vm_thread = Some(handle);
+        self.vm = Some(vm);
         self.state = VmState::Running;
         Ok(())
     }

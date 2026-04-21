@@ -1099,3 +1099,230 @@ private func readAll(fd: Int32, into buf: UnsafeMutableRawBufferPointer) throws 
         remaining -= n
     }
 }
+
+// =============================================================================
+// FFI: hb_vz_long_* — long-running, client-controlled VM lifecycle.
+//
+// Unlike hb_vz_boot (timeout-driven) or hb_vz_exec (command-over-vsock),
+// this surface exposes start/stop as separate callable steps so an HTTP
+// client — hephaestus-firecracker over a Firecracker-compat socket — can
+// own the VM's lifetime. The shape mirrors the containerization-backed
+// `hb_vm_*` lifecycle but drives a bare VZVirtualMachine directly.
+//
+// Caller retains the opaque `HbVzVm *` handle produced by hb_vz_long_new
+// and frees it with hb_vz_long_free. Dropping the handle without calling
+// stop first is tolerated: hb_vz_long_free best-effort stops before
+// releasing the Swift-side retain.
+// =============================================================================
+
+/// Swift-side holder for a long-running direct-VZ VM. `@unchecked
+/// Sendable` because we serialize all VZVirtualMachine access on a
+/// per-handle dispatch queue; Swift 6 strict concurrency can't prove
+/// that by itself.
+private final class VzVmHandle: @unchecked Sendable {
+    let queue: DispatchQueue
+    let holder: VMHolder
+    /// Retained to keep the serial-log file URL and machine-id URL alive
+    /// for the VM's lifetime. `config` itself holds the serial port
+    /// attachment which references the log URL.
+    let config: VZVirtualMachineConfiguration
+    let logURL: URL
+    let machineIdURL: URL
+
+    init(
+        queue: DispatchQueue,
+        holder: VMHolder,
+        config: VZVirtualMachineConfiguration,
+        logURL: URL,
+        machineIdURL: URL
+    ) {
+        self.queue = queue
+        self.holder = holder
+        self.config = config
+        self.logURL = logURL
+        self.machineIdURL = machineIdURL
+    }
+}
+
+/// Build a VZVirtualMachineConfiguration for the long-running path.
+/// Differs from `buildConfig` in that the caller supplies the command
+/// line verbatim (no kernel cmdline defaults baked in) and an optional
+/// initrd path.
+private func buildLongRunningConfig(
+    kernel: URL,
+    rootfs: URL,
+    initrd: URL?,
+    logURL: URL,
+    machineIdURL: URL,
+    cpuCount: Int,
+    memoryBytes: UInt64,
+    commandLine: String
+) throws -> VZVirtualMachineConfiguration {
+    let config = VZVirtualMachineConfiguration()
+    config.cpuCount = cpuCount
+    config.memorySize = memoryBytes
+
+    let platform = VZGenericPlatformConfiguration()
+    if let data = try? Data(contentsOf: machineIdURL),
+       let id = VZGenericMachineIdentifier(dataRepresentation: data) {
+        platform.machineIdentifier = id
+    } else {
+        let id = VZGenericMachineIdentifier()
+        try id.dataRepresentation.write(to: machineIdURL)
+        platform.machineIdentifier = id
+    }
+    config.platform = platform
+
+    let bootloader = VZLinuxBootLoader(kernelURL: kernel)
+    bootloader.commandLine = commandLine
+    if let initrd {
+        bootloader.initialRamdiskURL = initrd
+    }
+    config.bootLoader = bootloader
+
+    let rootfsAttachment = try VZDiskImageStorageDeviceAttachment(
+        url: rootfs,
+        readOnly: false
+    )
+    config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)]
+
+    FileManager.default.createFile(atPath: logURL.path, contents: nil)
+    let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
+    serial.attachment = try VZFileSerialPortAttachment(url: logURL, append: true)
+    config.serialPorts = [serial]
+
+    config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+    try config.validate()
+    if #available(macOS 14.0, *) {
+        try config.validateSaveRestoreSupport()
+    }
+    return config
+}
+
+@_cdecl("hb_vz_long_new")
+public func hb_vz_long_new(
+    kernelPath: UnsafePointer<CChar>?,
+    rootfsPath: UnsafePointer<CChar>?,
+    initrdPath: UnsafePointer<CChar>?,
+    logPath: UnsafePointer<CChar>?,
+    bootArgs: UnsafePointer<CChar>?,
+    cpuCount: UInt32,
+    memoryMib: UInt64,
+    outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let kernelPath, let rootfsPath, let logPath, let bootArgs, let outVm else {
+        writeError(outErr, "null path/out argument")
+        return Status.invalidArgument
+    }
+
+    let kernel = URL(fileURLWithPath: String(cString: kernelPath))
+    let rootfs = URL(fileURLWithPath: String(cString: rootfsPath))
+    let log = URL(fileURLWithPath: String(cString: logPath))
+    let initrd: URL? = initrdPath.map { URL(fileURLWithPath: String(cString: $0)) }
+    let commandLine = String(cString: bootArgs)
+
+    // Machine-id file lives next to the log. Persisted across calls so a
+    // future "snapshot this long-running VM" feature doesn't trip over
+    // VZ's "identifier must match at restore" invariant.
+    let machineId = log.deletingPathExtension().appendingPathExtension("machineid")
+
+    do {
+        let config = try buildLongRunningConfig(
+            kernel: kernel,
+            rootfs: rootfs,
+            initrd: initrd,
+            logURL: log,
+            machineIdURL: machineId,
+            cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
+            memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
+            commandLine: commandLine
+        )
+
+        let queue = DispatchQueue(label: "com.hephaestus.vz-long-\(UUID().uuidString)")
+        let holder = VMHolder()
+        queue.sync {
+            holder.vm = VZVirtualMachine(configuration: config, queue: queue)
+        }
+        guard holder.vm != nil else {
+            writeError(outErr, "failed to construct VZVirtualMachine")
+            return Status.swiftError
+        }
+
+        let handle = VzVmHandle(
+            queue: queue,
+            holder: holder,
+            config: config,
+            logURL: log,
+            machineIdURL: machineId
+        )
+        let opaque = Unmanaged.passRetained(handle).toOpaque()
+        outVm.pointee = opaque.assumingMemoryBound(to: HbVzVm.self)
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}
+
+@_cdecl("hb_vz_long_start")
+public func hb_vz_long_start(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrowVz(vm, outErr) else { return Status.invalidArgument }
+    do {
+        try blockingStart(queue: handle.queue, holder: handle.holder)
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}
+
+@_cdecl("hb_vz_long_stop")
+public func hb_vz_long_stop(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrowVz(vm, outErr) else { return Status.invalidArgument }
+    // blockingStop returns false on timeout but the VM may still be in a
+    // halting state — surface that as a soft error so the caller can
+    // still try to free the handle.
+    let stopped = blockingStop(queue: handle.queue, holder: handle.holder)
+    if stopped {
+        outErr?.pointee = nil
+        return Status.ok
+    } else {
+        writeError(outErr, "stop timed out after 5s; VM may still be halting")
+        return Status.swiftError
+    }
+}
+
+@_cdecl("hb_vz_long_free")
+public func hb_vz_long_free(vm: UnsafeMutablePointer<HbVzVm>?) {
+    guard let vm else { return }
+    let opaque = UnsafeMutableRawPointer(vm)
+    let handle = Unmanaged<VzVmHandle>.fromOpaque(opaque).takeUnretainedValue()
+    // Best-effort stop. Ignore the result; the caller is releasing, so
+    // there's nothing to report. If the VM has already stopped this is a
+    // no-op; if it hasn't, this prevents a leaked dispatch queue + VZ
+    // process lingering past the handle's lifetime.
+    _ = blockingStop(queue: handle.queue, holder: handle.holder)
+    Unmanaged<VzVmHandle>.fromOpaque(opaque).release()
+}
+
+private func borrowVz(
+    _ vm: UnsafeMutablePointer<HbVzVm>?,
+    _ outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> VzVmHandle? {
+    guard let vm else {
+        writeError(outErr, "null VzVm handle")
+        return nil
+    }
+    let opaque = UnsafeMutableRawPointer(vm)
+    return Unmanaged<VzVmHandle>.fromOpaque(opaque).takeUnretainedValue()
+}

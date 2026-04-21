@@ -39,11 +39,12 @@ fi
 # must be left alone — macOS will SIGKILL build scripts whose entitlements
 # don't match the context they run in.
 #
-# Cargo emits the actual binary under .../deps/hephaestus-<hash> and then
-# hard-links it to .../debug/hephaestus, so we have to match the hashed
+# Cargo emits the actual binary under .../deps/<crate>-<hash> and then
+# hard-links it to .../debug/<binary-name>, so we have to match the hashed
 # form in deps/ — that's the one the linker produces. Build scripts live at
 # .../build/<crate>-<hash>/build-script-build; proc-macro dylibs are named
-# lib*.dylib.
+# lib*.dylib. Cargo normalizes '-' to '_' in the deps/ filename for
+# multi-word crate names, so match both `hephaestus-*` and `hephaestus_*`.
 base="$(basename "$out")"
 if [[ "$out" == *"/build/"*"/build-script-"* ]]; then
     exit 0
@@ -51,7 +52,7 @@ fi
 if [[ "$base" == lib*.dylib ]]; then
     exit 0
 fi
-if [[ "$base" != "hephaestus" && "$base" != hephaestus-* ]]; then
+if [[ "$base" != "hephaestus" && "$base" != hephaestus-* && "$base" != hephaestus_* ]]; then
     exit 0
 fi
 

@@ -4,9 +4,9 @@
 //! the FFI crate directly.
 
 pub use hephaestus_bridge::{
-    Compression, Spec, StdioSink, Vm, VmError, allocate_ip_octet, build_rootfs_from_tar, vz_boot,
-    vz_exec, vz_exec_snapshot_restore, vz_exec_snapshot_save, vz_sh, vz_snapshot_restore,
-    vz_snapshot_save,
+    Compression, Spec, StdioSink, Vm, VmError, VzSpec, VzVm, allocate_ip_octet,
+    build_rootfs_from_tar, vz_boot, vz_exec, vz_exec_snapshot_restore, vz_exec_snapshot_save, vz_sh,
+    vz_snapshot_restore, vz_snapshot_save,
 };
 
 pub fn ping() -> &'static str {

@@ -85,6 +85,15 @@ pub struct HbVm {
     _private: [u8; 0],
 }
 
+/// Opaque handle to a Swift-owned long-running direct-VZ VM. Obtain via
+/// `hb_vz_long_new`; free via `hb_vz_long_free`. Distinct from `HbVm`
+/// (containerization path) because the Swift-side backing types differ.
+#[repr(C)]
+#[derive(Debug)]
+pub struct HbVzVm {
+    _private: [u8; 0],
+}
+
 // =============================================================================
 // Rust-side declarations of Swift-implemented symbols.
 // These do NOT appear in the generated header — they're only for Rust to call.
@@ -183,6 +192,20 @@ unsafe extern "C" {
         out_restore_nanos: *mut u64,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
+    fn hb_vz_long_new(
+        kernel_path: *const c_char,
+        rootfs_path: *const c_char,
+        initrd_path: *const c_char,
+        log_path: *const c_char,
+        boot_args: *const c_char,
+        cpu_count: u32,
+        memory_mib: u64,
+        out_vm: *mut *mut HbVzVm,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
+    fn hb_vz_long_start(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
+    fn hb_vz_long_stop(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
+    fn hb_vz_long_free(vm: *mut HbVzVm);
 }
 
 // =============================================================================
@@ -391,6 +414,139 @@ impl Drop for Vm {
             }
             // SAFETY: handle was produced by a successful hb_vm_new call.
             unsafe { hb_vm_free(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Builder spec for a long-running direct-VZ VM.
+///
+/// Unlike [`Spec`]/[`Vm`] (containerization-backed, vminitd-orchestrated),
+/// this drives a bare `VZVirtualMachine` the way `vz_boot` and friends do
+/// but exposes start/stop as independent calls so an HTTP client can own
+/// the VM's lifetime. Used by `hephaestus-firecracker`'s `InstanceStart`.
+#[derive(Debug, Default)]
+pub struct VzSpec {
+    pub kernel_path: std::path::PathBuf,
+    pub rootfs_path: std::path::PathBuf,
+    /// Optional initrd/initramfs. `None` boots directly into the rootfs
+    /// init (typical Firecracker setup with an ext4 rootfs).
+    pub initrd_path: Option<std::path::PathBuf>,
+    /// File the guest's serial console is written to for boot diagnostics.
+    pub log_path: std::path::PathBuf,
+    /// Kernel command line. Callers should supply Firecracker's equivalent
+    /// of `DEFAULT_KERNEL_CMDLINE` or whatever the client passed via
+    /// `boot_source.boot_args`.
+    pub boot_args: String,
+    /// `0` → framework default (2).
+    pub cpus: u32,
+    /// `0` → framework default (512).
+    pub memory_mib: u64,
+}
+
+impl VzSpec {
+    pub fn new(kernel: &Path, rootfs: &Path, log: &Path, boot_args: impl Into<String>) -> Self {
+        Self {
+            kernel_path: kernel.into(),
+            rootfs_path: rootfs.into(),
+            log_path: log.into(),
+            boot_args: boot_args.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn initrd(mut self, path: &Path) -> Self {
+        self.initrd_path = Some(path.into());
+        self
+    }
+
+    pub fn cpus(mut self, cpus: u32) -> Self {
+        self.cpus = cpus;
+        self
+    }
+
+    pub fn memory_mib(mut self, memory_mib: u64) -> Self {
+        self.memory_mib = memory_mib;
+        self
+    }
+
+    pub fn build(self) -> Result<VzVm, VmError> {
+        VzVm::new(self)
+    }
+}
+
+/// Owned handle to a Swift-side long-running direct-VZ VM.
+///
+/// Drop best-effort stops the VM and releases the handle, matching
+/// [`Vm`]'s shape. `Send` is safe for the same reason as `Vm`: the
+/// Swift-side `VzVmHandle` serializes all `VZVirtualMachine` access on a
+/// per-handle dispatch queue; moving the Rust handle pointer across
+/// threads never races the VM object.
+#[derive(Debug)]
+pub struct VzVm {
+    handle: *mut HbVzVm,
+}
+
+// SAFETY: see VzVm doc comment.
+unsafe impl Send for VzVm {}
+
+impl VzVm {
+    fn new(spec: VzSpec) -> Result<Self, VmError> {
+        let kernel_c = CString::new(path_to_str(&spec.kernel_path, "kernel")?)?;
+        let rootfs_c = CString::new(path_to_str(&spec.rootfs_path, "rootfs")?)?;
+        let log_c = CString::new(path_to_str(&spec.log_path, "log")?)?;
+        let boot_args_c = CString::new(spec.boot_args)?;
+        let initrd_c = spec
+            .initrd_path
+            .as_deref()
+            .map(|p| CString::new(path_to_str(p, "initrd").unwrap_or("")))
+            .transpose()?;
+        let initrd_ptr = initrd_c
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c.as_ptr());
+
+        let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
+        let mut out_err: *mut c_char = std::ptr::null_mut();
+        let status = unsafe {
+            hb_vz_long_new(
+                kernel_c.as_ptr(),
+                rootfs_c.as_ptr(),
+                initrd_ptr,
+                log_c.as_ptr(),
+                boot_args_c.as_ptr(),
+                spec.cpus,
+                spec.memory_mib,
+                &mut out_vm,
+                &mut out_err,
+            )
+        };
+        status.into_result(out_err)?;
+        debug_assert!(!out_vm.is_null());
+        Ok(VzVm { handle: out_vm })
+    }
+
+    /// Boot the VM. Returns once the kernel has started; the guest then
+    /// runs independently until `stop` or `drop`.
+    pub fn start(&self) -> Result<(), VmError> {
+        let mut out_err: *mut c_char = std::ptr::null_mut();
+        let status = unsafe { hb_vz_long_start(self.handle, &mut out_err) };
+        status.into_result(out_err)
+    }
+
+    /// Request graceful stop, then force-stop. Idempotent.
+    pub fn stop(&self) -> Result<(), VmError> {
+        let mut out_err: *mut c_char = std::ptr::null_mut();
+        let status = unsafe { hb_vz_long_stop(self.handle, &mut out_err) };
+        status.into_result(out_err)
+    }
+}
+
+impl Drop for VzVm {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // hb_vz_long_free calls blockingStop internally, so no need to
+            // call stop() first from here.
+            unsafe { hb_vz_long_free(self.handle) };
             self.handle = std::ptr::null_mut();
         }
     }
