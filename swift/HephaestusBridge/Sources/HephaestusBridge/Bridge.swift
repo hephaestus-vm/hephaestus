@@ -7,6 +7,7 @@ import Containerization
 import ContainerizationArchive
 import ContainerizationEXT4
 import ContainerizationError
+import ContainerizationExtras
 import Dispatch
 import Foundation
 
@@ -270,6 +271,22 @@ public func hb_vm_new(
             c.process.stdout = stdoutWriter
             c.process.stderr = stderrWriter
             c.bootLog = BootLog.file(path: bootLogURL)
+            if cfg.enable_networking {
+                // Use VZ's built-in NAT (VZNATNetworkDeviceAttachment) via
+                // NATInterface. This only requires com.apple.security.virtualization
+                // — unlike VmnetNetwork which needs the restricted
+                // com.apple.vm.networking entitlement (incompatible with
+                // ad-hoc signing). VZ's NAT subnet is 192.168.64.0/24, so we
+                // statically assign the guest .2 and point its default route
+                // at .1. Concurrent VMs would collide on .2; V1 runs one VM
+                // at a time.
+                let subnet = try CIDRv4("192.168.64.2/24")
+                let gateway = try IPv4Address("192.168.64.1")
+                c.interfaces = [
+                    NATInterface(ipv4Address: subnet, ipv4Gateway: gateway)
+                ]
+                c.dns = DNS(nameservers: [gateway.description])
+            }
         }
 
         let handle = VmHandle(container: container)

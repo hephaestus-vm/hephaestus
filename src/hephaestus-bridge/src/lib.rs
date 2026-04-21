@@ -53,6 +53,10 @@ pub struct HbVmConfig {
     pub on_stdout: HbWriteCallback,
     pub on_stderr: HbWriteCallback,
     pub stdio_userdata: *mut c_void,
+    /// When true, attach a NAT-backed network interface so the guest has
+    /// outbound IPv4 connectivity. Uses VZ's built-in NAT which only
+    /// requires the virtualization entitlement.
+    pub enable_networking: bool,
 }
 
 /// Return status for fallible FFI calls.
@@ -126,6 +130,7 @@ pub struct Spec {
     pub memory_mib: u64,
     pub argv: Vec<String>,
     pub cwd: Option<String>,
+    pub networking: bool,
 }
 
 impl Spec {
@@ -160,6 +165,11 @@ impl Spec {
 
     pub fn memory_mib(mut self, memory_mib: u64) -> Self {
         self.memory_mib = memory_mib;
+        self
+    }
+
+    pub fn networking(mut self, enabled: bool) -> Self {
+        self.networking = enabled;
         self
     }
 
@@ -228,6 +238,7 @@ impl Vm {
             on_stdout: Some(trampoline_stdout),
             on_stderr: Some(trampoline_stderr),
             stdio_userdata: stdio_state.userdata(),
+            enable_networking: spec.networking,
         };
 
         let mut out_vm: *mut HbVm = std::ptr::null_mut();

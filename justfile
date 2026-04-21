@@ -77,6 +77,10 @@ hello: build
 shell: build
     scripts/run-vm.sh /bin/sh -c 'uname -a; cat /etc/os-release; ls /'
 
+# Preset: boot with networking on + try an outbound wget against example.com.
+network-check: build
+    HEPHAESTUS_NETWORK=1 scripts/run-vm.sh /bin/sh -c 'ip addr; ip route; wget -q -O- http://example.com | head -c 200'
+
 # Tail the kernel boot log from the last VM run (default id=dev).
 bootlog id='dev':
     #!/usr/bin/env bash

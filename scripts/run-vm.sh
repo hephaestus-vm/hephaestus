@@ -31,8 +31,14 @@ rootfs=$(stat -f '%z %N' "${snaps[@]}" | sort -nr | head -1 | cut -d' ' -f2-)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bin="${script_dir}/../build/cargo_target/debug/hephaestus"
 
+extra_flags=()
+if [[ "${HEPHAESTUS_NETWORK:-0}" == "1" ]]; then
+    extra_flags+=(--network)
+fi
+
 exec "$bin" run --id dev \
     --kernel "$kernel" \
     --initfs "$initfs" \
     --rootfs "$rootfs" \
+    "${extra_flags[@]}" \
     -- "$@"
