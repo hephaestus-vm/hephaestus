@@ -4,6 +4,13 @@ rustflags = [
   "-Ccodegen-units=1",
 ]
 
+# On macOS we wrap the linker so every binary is ad-hoc codesigned with
+# hephaestus.entitlements (com.apple.security.virtualization etc.) as part
+# of the normal `cargo build`. Without this, any Virtualization.framework
+# call fails with VZErrorDomain code 2.
+[target.aarch64-apple-darwin]
+linker = "scripts/link-and-sign.sh"
+
 [net]
 git-fetch-with-cli = true
 

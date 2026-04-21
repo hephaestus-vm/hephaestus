@@ -4,6 +4,8 @@
 
 import CHephaestusBridge
 import Containerization
+import ContainerizationError
+import Dispatch
 import Foundation
 
 // =============================================================================
@@ -23,19 +25,103 @@ public func hb_ping() -> UnsafePointer<CChar> {
 }
 
 // =============================================================================
-// VM construction — M1 exit criteria: construct and drop without leaks.
-//
-// We wrap the constructed LinuxContainer in a Swift class so we can retain
-// multiple strong references (the container, the VMM, the kernel) under one
-// opaque pointer. Rust owns one retain; hb_vm_free releases it.
+// Error / status helpers.
 // =============================================================================
 
-/// Status codes must stay in lockstep with the Rust `HbStatus` enum.
 private enum Status {
     static let ok: Int32 = 0
     static let invalidArgument: Int32 = 1
     static let swiftError: Int32 = 2
 }
+
+/// Duplicate a Swift String onto the C heap as a NUL-terminated CChar array.
+/// Callers (Rust) release via `hb_string_free`.
+private func cstrdup(_ s: String) -> UnsafeMutablePointer<CChar> {
+    let bytes = Array(s.utf8) + [0]
+    let buf = UnsafeMutablePointer<CChar>.allocate(capacity: bytes.count)
+    bytes.withUnsafeBufferPointer { src in
+        buf.withMemoryRebound(to: UInt8.self, capacity: bytes.count) { dst in
+            dst.update(from: src.baseAddress!, count: bytes.count)
+        }
+    }
+    return buf
+}
+
+private func writeError(
+    _ outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
+    _ message: String
+) {
+    guard let outErr else { return }
+    outErr.pointee = cstrdup(message)
+}
+
+// =============================================================================
+// Async-to-sync bridge: runs an async Swift closure and blocks the caller
+// until it completes, returning its result or throwing its error.
+// =============================================================================
+
+private final class ResultBox<T>: @unchecked Sendable {
+    var value: Result<T, Error>?
+}
+
+private func runSync<T: Sendable>(
+    _ body: @Sendable @escaping () async throws -> T
+) throws -> T {
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = ResultBox<T>()
+    Task.detached {
+        do {
+            box.value = .success(try await body())
+        } catch {
+            box.value = .failure(error)
+        }
+        semaphore.signal()
+    }
+    semaphore.wait()
+    return try box.value!.get()
+}
+
+// =============================================================================
+// CallbackWriter: implements Containerization's `Writer` protocol by
+// forwarding each chunk to a C callback pointer supplied by Rust.
+// =============================================================================
+
+private final class CallbackWriter: Writer, @unchecked Sendable {
+    let callback:
+        @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, UInt) -> Void
+    let userdata: UnsafeMutableRawPointer?
+
+    init(
+        callback: @escaping @convention(c) (
+            UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, UInt
+        ) -> Void,
+        userdata: UnsafeMutableRawPointer?
+    ) {
+        self.callback = callback
+        self.userdata = userdata
+    }
+
+    func write(_ data: Data) throws {
+        guard !data.isEmpty else { return }
+        data.withUnsafeBytes { buf in
+            guard let base = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return
+            }
+            callback(userdata, base, UInt(buf.count))
+        }
+    }
+
+    func close() throws {
+        // No-op: Rust owns the sink's lifetime.
+    }
+}
+
+// =============================================================================
+// VmHandle — the Swift-side object Rust owns via an opaque HbVm pointer.
+//
+// Holds strong refs to the container and everything it transitively needs so
+// nothing is freed while Rust still has the handle.
+// =============================================================================
 
 private final class VmHandle: @unchecked Sendable {
     let container: LinuxContainer
@@ -45,13 +131,18 @@ private final class VmHandle: @unchecked Sendable {
     }
 }
 
+// =============================================================================
+// Construction: hb_vm_new
+// =============================================================================
+
 @_cdecl("hb_vm_new")
 public func hb_vm_new(
     config: UnsafePointer<HbVmConfig>?,
     outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVm>?>?,
     outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
-    guard let config, let outVm, let outErr else {
+    guard let config, let outVm else {
+        writeError(outErr, "hb_vm_new: null required out-param")
         return Status.invalidArgument
     }
 
@@ -59,6 +150,7 @@ public func hb_vm_new(
     guard
         let idCstr = cfg.id,
         let kernelCstr = cfg.kernel_path,
+        let initfsCstr = cfg.initfs_path,
         let rootfsCstr = cfg.rootfs_path
     else {
         writeError(outErr, "HbVmConfig contains a null string field")
@@ -67,12 +159,21 @@ public func hb_vm_new(
 
     let id = String(cString: idCstr)
     let kernelPath = String(cString: kernelCstr)
+    let initfsPath = String(cString: initfsCstr)
     let rootfsPath = String(cString: rootfsCstr)
+    let cwd = cfg.cwd.map { String(cString: $0) }
+    let arguments = collectArgv(cfg.argv)
 
     do {
         let kernel = Kernel(
             path: URL(fileURLWithPath: kernelPath),
             platform: .linuxArm
+        )
+
+        let initfs = Mount.block(
+            format: "ext4",
+            source: initfsPath,
+            destination: "/"
         )
 
         let rootfs = Mount.block(
@@ -81,38 +182,134 @@ public func hb_vm_new(
             destination: "/"
         )
 
-        // M1 placeholder: the initialFilesystem is required by
-        // VZVirtualMachineManager but only consumed at VM start. We reuse the
-        // rootfs path to satisfy construction; M2 will plumb vminitd's
-        // actual init ramdisk.
-        let initialFs = Mount.block(
-            format: "ext4",
-            source: rootfsPath,
-            destination: "/"
-        )
-
         let vmm = VZVirtualMachineManager(
             kernel: kernel,
-            initialFilesystem: initialFs
+            initialFilesystem: initfs
         )
+
+        let stdoutWriter: Writer? = cfg.on_stdout.map {
+            CallbackWriter(callback: $0, userdata: cfg.stdio_userdata)
+        }
+        let stderrWriter: Writer? = cfg.on_stderr.map {
+            CallbackWriter(callback: $0, userdata: cfg.stdio_userdata)
+        }
 
         let container = try LinuxContainer(
             id,
             rootfs: rootfs,
-            vmm: vmm,
-            configuration: { _ in }
-        )
+            vmm: vmm
+        ) { c in
+            if !arguments.isEmpty {
+                c.process.arguments = arguments
+            }
+            if let cwd {
+                c.process.workingDirectory = cwd
+            }
+            if cfg.cpus > 0 {
+                c.cpus = Int(cfg.cpus)
+            }
+            if cfg.memory_mib > 0 {
+                c.memoryInBytes = cfg.memory_mib * (1 << 20)
+            }
+            c.process.stdout = stdoutWriter
+            c.process.stderr = stderrWriter
+        }
 
         let handle = VmHandle(container: container)
         let opaque = Unmanaged.passRetained(handle).toOpaque()
         outVm.pointee = opaque.assumingMemoryBound(to: HbVm.self)
-        outErr.pointee = nil
+        outErr?.pointee = nil
         return Status.ok
     } catch {
         writeError(outErr, "\(error)")
         return Status.swiftError
     }
 }
+
+private func collectArgv(_ raw: UnsafePointer<UnsafePointer<CChar>?>?) -> [String] {
+    guard let raw else { return [] }
+    var out: [String] = []
+    var i = 0
+    while let ptr = raw[i] {
+        out.append(String(cString: ptr))
+        i += 1
+    }
+    return out
+}
+
+// =============================================================================
+// Lifecycle: hb_vm_create / hb_vm_start / hb_vm_wait / hb_vm_stop
+// =============================================================================
+
+@_cdecl("hb_vm_create")
+public func hb_vm_create(
+    vm: UnsafeMutablePointer<HbVm>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrow(vm, outErr) else { return Status.invalidArgument }
+    do {
+        try runSync { try await handle.container.create() }
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, "\(error)")
+        return Status.swiftError
+    }
+}
+
+@_cdecl("hb_vm_start")
+public func hb_vm_start(
+    vm: UnsafeMutablePointer<HbVm>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrow(vm, outErr) else { return Status.invalidArgument }
+    do {
+        try runSync { try await handle.container.start() }
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, "\(error)")
+        return Status.swiftError
+    }
+}
+
+@_cdecl("hb_vm_wait")
+public func hb_vm_wait(
+    vm: UnsafeMutablePointer<HbVm>?,
+    outExit: UnsafeMutablePointer<Int32>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrow(vm, outErr) else { return Status.invalidArgument }
+    do {
+        let status = try runSync { try await handle.container.wait() }
+        outExit?.pointee = Int32(status.exitCode)
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, "\(error)")
+        return Status.swiftError
+    }
+}
+
+@_cdecl("hb_vm_stop")
+public func hb_vm_stop(
+    vm: UnsafeMutablePointer<HbVm>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrow(vm, outErr) else { return Status.invalidArgument }
+    do {
+        try runSync { try await handle.container.stop() }
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, "\(error)")
+        return Status.swiftError
+    }
+}
+
+// =============================================================================
+// Memory management.
+// =============================================================================
 
 @_cdecl("hb_vm_free")
 public func hb_vm_free(vm: UnsafeMutablePointer<HbVm>?) {
@@ -124,20 +321,18 @@ public func hb_vm_free(vm: UnsafeMutablePointer<HbVm>?) {
 @_cdecl("hb_string_free")
 public func hb_string_free(s: UnsafeMutablePointer<CChar>?) {
     guard let s else { return }
-    // Paired with the allocate() in writeError below.
     s.deallocate()
 }
 
-private func writeError(
-    _ outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>,
-    _ message: String
-) {
-    let bytes = Array(message.utf8) + [0]
-    let buf = UnsafeMutablePointer<CChar>.allocate(capacity: bytes.count)
-    bytes.withUnsafeBufferPointer { src in
-        buf.withMemoryRebound(to: UInt8.self, capacity: bytes.count) { dst in
-            dst.update(from: src.baseAddress!, count: bytes.count)
-        }
+/// Borrow a `VmHandle` from an opaque `*mut HbVm` without consuming the retain.
+private func borrow(
+    _ vm: UnsafeMutablePointer<HbVm>?,
+    _ outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> VmHandle? {
+    guard let vm else {
+        writeError(outErr, "null VM handle")
+        return nil
     }
-    outErr.pointee = buf
+    let opaque = UnsafeMutableRawPointer(vm)
+    return Unmanaged<VmHandle>.fromOpaque(opaque).takeUnretainedValue()
 }
