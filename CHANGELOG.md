@@ -7,6 +7,68 @@ the hephaestus fork are tracked here.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-04-21
+
+Second tagged release. Adds process execution and snapshot-based warm
+starts on the direct-VZ path, without depending on apple/containerization
+or vminitd.
+
+### Added
+
+- `guest/hephaestus-agent` — new out-of-workspace Rust crate cross-
+  compiled to `aarch64-unknown-linux-musl` via `zig cc`. Serves as PID 1
+  out of a 184 KB gzipped-cpio initramfs: mounts `/proc`/`/sys`/`/dev`,
+  mounts `/dev/vda` at `/newroot`, `chroot`s in, listens on vsock port
+  1234, reads a length-prefixed UTF-8 command, `exec`s `/bin/sh -c CMD`,
+  writes the guest's exit code as i32 LE back over the same vsock
+  connection, and calls `reboot(RB_POWER_OFF)` so the host sees a clean
+  `.stopped` state transition.
+- `scripts/build-agent.sh` + `scripts/zig-aarch64-musl-cc.sh` —
+  cross-compile the agent and pack it with `cpio -H newc | gzip` into
+  `build/agent.cpio.gz`.
+- `hephaestus vz-exec --cmd CMD --kernel K --rootfs R` — boot the agent
+  initramfs, ship the command over vsock (not kernel cmdline — that's
+  the key shift from v0.1.0), collect stdout on host stdout and the
+  exit code on host exit. Cold wall-clock ≈ 300-500 ms.
+- `hephaestus vz-warm save --save PATH …` — pre-warm a VM with the
+  agent accepting connections, snapshot it. Pair with
+  `hephaestus vz-warm run --save PATH --cmd CMD …` to restore + deliver
+  a fresh command to the already-booted agent. Same save file drives
+  many commands because the command isn't baked into the snapshot.
+  Restore + resume ≈ 200 ms; wall ≈ 340 ms per command.
+- `just vz-exec 'CMD'` / `just vz-warm-save` / `just vz-warm-run 'CMD'`
+  recipes that auto-discover the kernel + rootfs from apple/container's
+  cache and APFS-CoW-clone them per invocation.
+
+### Internals
+
+- Agent's `accept()` loops over probe connections so the host can
+  connect-without-writing as a readiness check before snapshotting
+  without burning the one-shot command slot.
+- Snapshot-compatible VM config uses URL-based
+  `VZFileSerialPortAttachment` (FileHandle attachments don't serialize
+  across save/restore) and persists the `VZGenericMachineIdentifier` in
+  a sibling `.machineid` file so restore rebuilds a structurally
+  identical config.
+- New `ExecSession` holds VM config + Pipe + log handle together so
+  serial-streaming resources outlive the config-builder's return — fixed
+  a real ARC bug where the Pipe was being deallocated before the VM
+  could write anything.
+- Vsock wire protocol between host (Swift) and guest (Rust): u32 LE
+  length + UTF-8 command → i32 LE exit code → close. Trivial enough that
+  both sides fit in ~40 lines each.
+- `.cargo/config.toml` in `guest/hephaestus-agent` wires zig as the
+  cross-linker and forces `-C link-self-contained=no` to avoid `_start`
+  symbol collisions between rustc's bundled musl CRT and zig's.
+
+### Requirements added
+
+- `zig ≥ 0.15` in `PATH` (cross-linker for the guest agent). Install via
+  `brew install zig` or `zvm`.
+- `rustup` with the `aarch64-unknown-linux-musl` target. The main host
+  workspace still builds fine with Homebrew `cargo` — only the guest
+  agent needs the rustup toolchain.
+
 ## [0.1.0] - 2026-04-21
 
 Initial tagged release. A macOS / Apple Silicon fork of Firecracker
