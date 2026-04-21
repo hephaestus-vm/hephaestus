@@ -38,8 +38,38 @@ fi
 if [[ "${HEPHAESTUS_TTY:-0}" == "1" ]]; then
     extra_flags+=(--tty)
 fi
+if [[ -n "${HEPHAESTUS_IP:-}" ]]; then
+    extra_flags+=(--ip "$HEPHAESTUS_IP")
+fi
 
-exec "$bin" run --id dev \
+id="${HEPHAESTUS_ID:-dev}"
+
+# Each VM gets its own rootfs clone so concurrent `run`s don't fight over
+# the same read-write block device. APFS `cp -c` is a CoW snapshot and is
+# effectively free for a sparse file (~10 ms), so we re-create it on every
+# run rather than maintaining a cache; this also means every run sees a
+# clean rootfs, which is usually what a CI-ish caller wants.
+if [[ "${HEPHAESTUS_ROOTFS_SHARED:-0}" != "1" ]]; then
+    clone_dir="${TMPDIR:-/tmp}/hephaestus/rootfs"
+    mkdir -p "$clone_dir"
+    clone="$clone_dir/$id.ext4"
+    rm -f "$clone"
+    cp -c "$rootfs" "$clone"
+    rootfs="$clone"
+fi
+
+# Similar story for the initfs — apple/container's cache is shared state
+# that VZ would lock; a per-id clone keeps parallel runs isolated.
+if [[ "${HEPHAESTUS_INITFS_SHARED:-0}" != "1" ]]; then
+    initfs_dir="${TMPDIR:-/tmp}/hephaestus/initfs"
+    mkdir -p "$initfs_dir"
+    initfs_clone="$initfs_dir/$id.ext4"
+    rm -f "$initfs_clone"
+    cp -c "$initfs" "$initfs_clone"
+    initfs="$initfs_clone"
+fi
+
+exec "$bin" run --id "$id" \
     --kernel "$kernel" \
     --initfs "$initfs" \
     --rootfs "$rootfs" \

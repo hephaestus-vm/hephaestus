@@ -81,6 +81,22 @@ shell: build
 network-check: build
     HEPHAESTUS_NETWORK=1 scripts/run-vm.sh /bin/sh -c 'ip addr; ip route; wget -q -O- http://example.com | head -c 200'
 
+# Smoke test: run two network-enabled VMs with distinct ids concurrently and
+# confirm they land on different IPs in 192.168.64.0/24. Each fetches its
+# externally-visible IP so you can see both return independently.
+parallel-net-check: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run_one() {
+        local id="$1"
+        HEPHAESTUS_NETWORK=1 HEPHAESTUS_ID="$id" scripts/run-vm.sh /bin/sh -c \
+            "echo [$id] eth0=\$(ip -4 addr show dev eth0 | awk '/inet / {print \$2}'); wget -q -O- http://example.com | head -c 80"
+    }
+    ( run_one alpha ) &
+    ( run_one beta ) &
+    wait
+    echo "both VMs completed"
+
 # Drop into an interactive /bin/sh inside the guest with networking on.
 # Use Ctrl-D or `exit` to leave.
 sh: build

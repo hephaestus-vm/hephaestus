@@ -119,16 +119,30 @@ The original Firecracker workspace crates (`vmm`, `jailer`, `utils`,
 from the macOS workspace build in `Cargo.toml`. They're retained for
 upstream cherry-picks.
 
-## Known gaps
+## Status / known gaps
 
-V1 deliberately defers these to keep scope bounded:
+### What's wired up
 
-- **No guest networking.** `LinuxContainer.Configuration` isn't populated
-  with a `VmnetNetwork` interface, so guests have no outbound reachability.
-- **No stdin.** Stdout/stderr stream out; stdin isn't wired.
-- **No snapshot/restore.** `apple/containerization` doesn't expose
-  `VZVirtualMachine.saveMachineStateTo:`; V2 plans to drop below the
-  framework and call it directly.
+- **Guest networking** via VZ's built-in NAT (`VZNATNetworkDeviceAttachment`).
+  Fixed `192.168.64.0/24` subnet; gateway `.1`. Per-VM last octet is
+  hashed deterministically from the VM id (`allocate_ip_octet`); override
+  with `--ip N`. No port-forwarding host→guest yet.
+- **Interactive pty** via `--tty` (LinuxContainer path) or `hephaestus vz-sh`
+  (direct VZ path).
+- **Snapshot save/restore** on the direct-VZ path via
+  `hephaestus vz-snapshot save/restore`. Restore+resume ≈ 200 ms on a
+  512 MiB VM. Does not yet integrate with the full container
+  orchestration path (`hephaestus run`).
+
+### Still missing
+
+- **No stdin** on the `hephaestus run` path. Stdout/stderr stream out;
+  stdin isn't wired. Use `--tty` for interactive.
+- **No port-forwarding host→guest.** The guest can reach outbound but
+  nothing on the host can connect *in* without a separate proxy.
+- **Snapshot + container integration.** `hephaestus run` doesn't save
+  or restore — that's future work that requires a vminitd-equivalent on
+  the direct-VZ path.
 - **No Firecracker HTTP API.** The `firecracker` bin crate is excluded
   from the macOS build pending a backend-trait refactor.
 - **No jailer.** The upstream `jailer` crate is Linux-only (cgroups +
@@ -138,6 +152,15 @@ V1 deliberately defers these to keep scope bounded:
   blocking for V1's scope.
 - **No x86_64 guests.** Apple Virtualization.framework is aarch64-only on
   Apple Silicon; x86_64 code paths were removed rather than stubbed.
+
+### Operational notes
+
+- **Per-VM rootfs cloning.** `scripts/run-vm.sh` `cp -c`'s both the initfs
+  and the container rootfs under `$TMPDIR/hephaestus/` keyed on VM id,
+  because a single ext4 file can't be attached read-write to two
+  concurrent VMs. APFS CoW makes this effectively free. Set
+  `HEPHAESTUS_ROOTFS_SHARED=1` / `HEPHAESTUS_INITFS_SHARED=1` to opt out
+  (e.g., when you want changes to persist back to the source file).
 
 ## Relationship to upstream Firecracker
 

@@ -301,11 +301,10 @@ public func hb_vm_new(
                 // NATInterface. This only requires com.apple.security.virtualization
                 // — unlike VmnetNetwork which needs the restricted
                 // com.apple.vm.networking entitlement (incompatible with
-                // ad-hoc signing). VZ's NAT subnet is 192.168.64.0/24, so we
-                // statically assign the guest .2 and point its default route
-                // at .1. Concurrent VMs would collide on .2; V1 runs one VM
-                // at a time.
-                let subnet = try CIDRv4("192.168.64.2/24")
+                // ad-hoc signing). VZ's NAT subnet is fixed at 192.168.64.0/24;
+                // the last octet is supplied by the caller (hashed from the
+                // VM id by default) so concurrent VMs don't collide.
+                let subnet = try CIDRv4("192.168.64.\(cfg.network_ip_octet)/24")
                 let gateway = try IPv4Address("192.168.64.1")
                 c.interfaces = [
                     NATInterface(ipv4Address: subnet, ipv4Gateway: gateway)

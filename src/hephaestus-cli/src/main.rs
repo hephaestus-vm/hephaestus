@@ -88,7 +88,7 @@ usage: hephaestus run \\
     --initfs <path-to-ext4> \\
     --rootfs <path-to-ext4> \\
     [--cpus N] [--memory-mib N] [--cwd <path>] \\
-    [--network] [--tty] \\
+    [--network [--ip OCTET]] [--tty] \\
     -- <argv...>";
 
 #[derive(Debug)]
@@ -102,6 +102,8 @@ struct RunOptions {
     cwd: Option<String>,
     argv: Vec<String>,
     network: bool,
+    /// Last octet in VZ's 192.168.64.0/24 NAT. None → derive from id.
+    ip_octet: Option<u8>,
     tty: bool,
 }
 
@@ -116,6 +118,7 @@ fn parse_run_args(args: &mut impl Iterator<Item = String>) -> Result<RunOptions,
         cwd: None,
         argv: Vec::new(),
         network: false,
+        ip_octet: None,
         tty: false,
     };
     let mut past_double_dash = false;
@@ -146,6 +149,17 @@ fn parse_run_args(args: &mut impl Iterator<Item = String>) -> Result<RunOptions,
             }
             "--cwd" => opts.cwd = Some(require_value(args, "--cwd")?),
             "--network" => opts.network = true,
+            "--ip" => {
+                let raw = require_value(args, "--ip")?;
+                // Accept either `N` or `192.168.64.N`; we only care about
+                // the last octet since VZ's NAT subnet is fixed.
+                let last = raw.rsplit('.').next().unwrap_or(raw.as_str());
+                let n: u8 = last.parse().map_err(|e| format!("invalid --ip: {e}"))?;
+                if !(2..=254).contains(&n) {
+                    return Err(format!("--ip {n} out of range [2, 254]"));
+                }
+                opts.ip_octet = Some(n);
+            }
             "--tty" => opts.tty = true,
             other => return Err(format!("unknown flag `{other}`")),
         }
@@ -193,6 +207,16 @@ fn run(opts: RunOptions) -> ExitCode {
         spec = spec.cwd(cwd);
     }
     spec = spec.networking(opts.network).tty(opts.tty);
+    if let Some(octet) = opts.ip_octet {
+        spec = spec.ip_octet(octet);
+    }
+    // Surface the effective IP so users can predict/override it.
+    if opts.network {
+        let octet = opts
+            .ip_octet
+            .unwrap_or_else(|| hephaestus_vmm::allocate_ip_octet(&opts.id));
+        eprintln!("hephaestus: guest IP 192.168.64.{octet}/24 (id={})", opts.id);
+    }
 
     let stdio = TerminalSink::default();
     let vm = match spec.build(stdio) {

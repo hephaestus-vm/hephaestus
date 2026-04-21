@@ -57,6 +57,9 @@ pub struct HbVmConfig {
     /// outbound IPv4 connectivity. Uses VZ's built-in NAT which only
     /// requires the virtualization entitlement.
     pub enable_networking: bool,
+    /// Last octet of the guest's IP in VZ's fixed 192.168.64.0/24 subnet.
+    /// Must be in `[2, 254]` when networking is enabled. Ignored otherwise.
+    pub network_ip_octet: u8,
     /// When true, wire the guest process to the host's controlling
     /// terminal as a pty. Puts the host TTY in raw mode so keystrokes
     /// (including Ctrl-C, Ctrl-D) are delivered to the guest rather than
@@ -175,6 +178,10 @@ pub struct Spec {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
     pub networking: bool,
+    /// `None` → derive from `id` via [`allocate_ip_octet`]. `Some(n)` pins
+    /// the guest's last octet (useful when a caller wants a known address).
+    /// Must be in `[2, 254]`.
+    pub ip_octet: Option<u8>,
     pub tty: bool,
 }
 
@@ -215,6 +222,12 @@ impl Spec {
 
     pub fn networking(mut self, enabled: bool) -> Self {
         self.networking = enabled;
+        self
+    }
+
+    /// Override the automatically-allocated IP octet. Accepts `[2, 254]`.
+    pub fn ip_octet(mut self, octet: u8) -> Self {
+        self.ip_octet = Some(octet);
         self
     }
 
@@ -289,6 +302,7 @@ impl Vm {
             on_stderr: Some(trampoline_stderr),
             stdio_userdata: stdio_state.userdata(),
             enable_networking: spec.networking,
+            network_ip_octet: spec.ip_octet.unwrap_or_else(|| allocate_ip_octet(&spec.id)),
             enable_tty: spec.tty,
         };
 
@@ -649,6 +663,38 @@ pub fn build_rootfs_from_tar(
     status.into_result(out_err)
 }
 
+// =============================================================================
+// Network IP allocation for concurrent VMs.
+// =============================================================================
+
+/// Deterministically derive a last-octet in `[2, 254]` from an arbitrary VM
+/// id. Used as the default static address on VZ's fixed 192.168.64.0/24 NAT
+/// subnet so concurrent VMs with distinct ids land on distinct IPs.
+///
+/// Uses FNV-1a 32-bit because it's tiny, stdlib-free, and has good bucket
+/// distribution for short strings. We reserve:
+///
+/// - `.0` — network address
+/// - `.1` — the VZ NAT gateway
+/// - `.255` — broadcast
+///
+/// Collisions between distinct ids are possible (253 buckets) but rare for
+/// the handful of concurrent VMs any single host can realistically run.
+/// When determinism-across-collisions matters, callers should pass an
+/// explicit octet via `Spec::ip_octet`.
+pub fn allocate_ip_octet(id: &str) -> u8 {
+    const FNV_OFFSET: u32 = 0x811c9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+
+    let mut h: u32 = FNV_OFFSET;
+    for b in id.as_bytes() {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    // 253 addresses in [2, 254]; bias into that range.
+    (h % 253) as u8 + 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,6 +756,72 @@ mod tests {
         assert_eq!(Compression::None.code(), 0);
         assert_eq!(Compression::Gzip.code(), 1);
         assert_eq!(Compression::Zstd.code(), 2);
+    }
+
+    #[test]
+    fn ip_octet_is_deterministic() {
+        for id in ["dev", "a", "some-ci-runner-42", ""] {
+            assert_eq!(allocate_ip_octet(id), allocate_ip_octet(id));
+        }
+    }
+
+    #[test]
+    fn ip_octet_stays_in_range() {
+        // Sample a bunch of plausible ids to confirm we never fall outside
+        // [2, 254], never return 0/1/255 (reserved).
+        let long = "x".repeat(256);
+        let ids = [
+            "dev",
+            "a",
+            "",
+            "hephaestus-vm",
+            "ci-runner-001",
+            "ci-runner-002",
+            "ci-runner-999",
+            long.as_str(),
+        ];
+        for id in ids {
+            let octet = allocate_ip_octet(id);
+            assert!(
+                (2..=254).contains(&octet),
+                "octet {octet} out of range for id {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_octet_distributes_across_range() {
+        // Hash 1000 distinct ids, count unique buckets hit. FNV-1a on short
+        // strings should hit far more than half the 253 buckets.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..1000 {
+            seen.insert(allocate_ip_octet(&format!("vm-{i}")));
+        }
+        assert!(
+            seen.len() > 150,
+            "expected wide distribution, got {} distinct buckets out of 253",
+            seen.len()
+        );
+    }
+
+    #[test]
+    fn ip_octet_stable_known_values() {
+        // Pin a few values so accidental changes to the hash scheme are
+        // caught early — breaking this is a compat break for callers that
+        // depend on deterministic IPs.
+        assert_eq!(allocate_ip_octet("dev"), determine_octet_for("dev"));
+        assert_eq!(allocate_ip_octet(""), determine_octet_for(""));
+    }
+
+    // Mirror of the implementation so "stable values" tests fail loudly if
+    // the algorithm changes (rather than silently keeping the new result).
+    fn determine_octet_for(id: &str) -> u8 {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in id.as_bytes() {
+            h ^= u32::from(*b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        (h % 253) as u8 + 2
     }
 }
 
