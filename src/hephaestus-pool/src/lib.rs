@@ -30,9 +30,31 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use hephaestus_vmm::{
-    VzVm, vz_exec_snapshot_restore, vz_exec_snapshot_save, vz_pool_restore_long, vz_snapshot_save,
-    vz_stock_pool_restore_long,
+    HbRestoreTimings, VzVm, vz_exec_snapshot_restore, vz_exec_snapshot_save, vz_pool_restore_long,
+    vz_snapshot_save, vz_stock_pool_restore_long,
 };
+
+/// Per-phase wall-clock breakdown for a pool restore, from the moment
+/// `restore_into_vm` is entered to the moment the VM is Running. Sum
+/// roughly equals the total; tiny gaps (a few µs) are FFI marshalling
+/// plus the brief time between Swift-side stopwatch reads.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PoolRestoreBreakdown {
+    /// `cp -c` of the pristine rootfs to the per-slot clone.
+    pub clone_nanos: u64,
+    /// Swift VZ phases (see [`HbRestoreTimings`]).
+    pub vz: HbRestoreTimings,
+}
+
+impl PoolRestoreBreakdown {
+    pub fn total_nanos(&self) -> u64 {
+        self.clone_nanos
+            + self.vz.config_nanos
+            + self.vz.construct_nanos
+            + self.vz.restore_nanos
+            + self.vz.resume_nanos
+    }
+}
 
 /// Mirror Swift `hb_vz_exec_snapshot_save`'s 0-means-default fallback.
 /// Surfaced here so `PoolMeta` always records concrete values.
@@ -440,8 +462,11 @@ impl Pool {
         &self,
         slot: &ClaimedSlot,
         log: Option<&Path>,
-    ) -> Result<(VzVm, u64), PoolError> {
+    ) -> Result<(VzVm, PoolRestoreBreakdown), PoolError> {
+        let clone_start = std::time::Instant::now();
         clone_file(&self.meta.pristine, &slot.rootfs)?;
+        let clone_nanos = clone_start.elapsed().as_nanos() as u64;
+
         let result = match self.meta.flavor {
             PoolFlavor::Agent => {
                 let initramfs = self.meta.initramfs.as_deref().ok_or_else(|| {
@@ -467,7 +492,7 @@ impl Pool {
             ),
         };
         match result {
-            Ok(pair) => Ok(pair),
+            Ok((vm, vz)) => Ok((vm, PoolRestoreBreakdown { clone_nanos, vz })),
             Err(err) => {
                 // Restore failed → tear down the rootfs we just cloned so
                 // the slot is left "ready", not "stuck mid-claim".

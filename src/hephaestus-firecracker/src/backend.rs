@@ -301,11 +301,18 @@ impl VmmBackend for VzBackend {
             .canonicalize();
             match pool.try_claim_matching_slot(&spec) {
                 Ok(Some(slot)) => match pool.restore_into_vm(&slot, Some(&log)) {
-                    Ok((vm, restore_nanos)) => {
+                    Ok((vm, breakdown)) => {
+                        let ms = |ns: u64| ns as f64 / 1_000_000.0;
                         eprintln!(
-                            "hephaestus-firecracker: pool hit slot={} restore={}ms",
+                            "hephaestus-firecracker: pool hit slot={} total={:.1}ms \
+                             (clone={:.1} config={:.1} construct={:.1} restore={:.1} resume={:.1})",
                             slot.index,
-                            restore_nanos / 1_000_000
+                            ms(breakdown.total_nanos()),
+                            ms(breakdown.clone_nanos),
+                            ms(breakdown.vz.config_nanos),
+                            ms(breakdown.vz.construct_nanos),
+                            ms(breakdown.vz.restore_nanos),
+                            ms(breakdown.vz.resume_nanos),
                         );
                         self.vm = Some(vm);
                         self.pool_slot = Some(slot);
@@ -446,7 +453,7 @@ impl VmmBackend for VzBackend {
         let log = PathBuf::from(format!("/tmp/hephaestus-firecracker-{}.log", self.id));
 
         let initrd = boot.initrd_path.as_ref().map(PathBuf::from);
-        let (vm, restore_nanos) = vz_long_restore(
+        let (vm, timings) = vz_long_restore(
             &kernel,
             &rootfs,
             initrd.as_deref(),
@@ -459,10 +466,20 @@ impl VmmBackend for VzBackend {
         )
         .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
 
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        let total = timings.config_nanos
+            + timings.construct_nanos
+            + timings.restore_nanos
+            + timings.resume_nanos;
         eprintln!(
-            "hephaestus-firecracker: snapshot/load restored in {}ms (resume={})",
-            restore_nanos / 1_000_000,
-            params.resume_vm
+            "hephaestus-firecracker: snapshot/load total={:.1}ms \
+             (config={:.1} construct={:.1} restore={:.1} resume={:.1}) resume={}",
+            ms(total),
+            ms(timings.config_nanos),
+            ms(timings.construct_nanos),
+            ms(timings.restore_nanos),
+            ms(timings.resume_nanos),
+            params.resume_vm,
         );
 
         self.vm = Some(vm);

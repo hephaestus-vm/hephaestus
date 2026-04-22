@@ -11,7 +11,7 @@ header = """
 parse_deps = false
 
 [export]
-include = ["HbVmConfig", "HbStatus", "HbVm", "HbVzVm"]
+include = ["HbVmConfig", "HbStatus", "HbVm", "HbVzVm", "HbRestoreTimings"]
 prefix = ""
 
 [defines]

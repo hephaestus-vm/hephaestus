@@ -94,6 +94,25 @@ pub struct HbVzVm {
     _private: [u8; 0],
 }
 
+/// Per-phase wall-clock timings for a VZ restore call. Filled in by the
+/// Swift side on every `hb_vz_*_restore*` entry point so callers can
+/// break down where warm-start latency actually goes instead of seeing a
+/// single opaque total. All fields are nanoseconds. A phase that didn't
+/// run (e.g. `resume` when `resume=false` on `hb_vz_long_restore`) is 0.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HbRestoreTimings {
+    /// Config object construction (path canonicalization, attachment
+    /// setup, `VZGenericMachineIdentifier` load/create).
+    pub config_nanos: u64,
+    /// `VZVirtualMachine(configuration:queue:)`.
+    pub construct_nanos: u64,
+    /// `VZVirtualMachine.restoreMachineStateFrom:` — the actual blob load.
+    pub restore_nanos: u64,
+    /// `VZVirtualMachine.resume()`.
+    pub resume_nanos: u64,
+}
+
 // =============================================================================
 // Rust-side declarations of Swift-implemented symbols.
 // These do NOT appear in the generated header — they're only for Rust to call.
@@ -217,7 +236,7 @@ unsafe extern "C" {
         cpu_count: u32,
         memory_mib: u64,
         out_vm: *mut *mut HbVzVm,
-        out_restore_nanos: *mut u64,
+        out_timings: *mut HbRestoreTimings,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
     fn hb_vz_stock_pool_restore_long(
@@ -228,7 +247,7 @@ unsafe extern "C" {
         cpu_count: u32,
         memory_mib: u64,
         out_vm: *mut *mut HbVzVm,
-        out_restore_nanos: *mut u64,
+        out_timings: *mut HbRestoreTimings,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
     fn hb_vz_long_save(
@@ -247,7 +266,7 @@ unsafe extern "C" {
         memory_mib: u64,
         resume: bool,
         out_vm: *mut *mut HbVzVm,
-        out_restore_nanos: *mut u64,
+        out_timings: *mut HbRestoreTimings,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
 }
@@ -945,7 +964,7 @@ pub fn vz_pool_restore_long(
     log: Option<&Path>,
     cpu_count: u32,
     memory_mib: u64,
-) -> Result<(VzVm, u64), VmError> {
+) -> Result<(VzVm, HbRestoreTimings), VmError> {
     let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
     let initramfs_c = CString::new(path_to_str(initramfs, "initramfs")?)?;
     let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
@@ -957,7 +976,7 @@ pub fn vz_pool_restore_long(
 
     let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
     let mut out_err: *mut c_char = std::ptr::null_mut();
-    let mut restore_nanos: u64 = 0;
+    let mut timings = HbRestoreTimings::default();
     let status = unsafe {
         hb_vz_pool_restore_long(
             kernel_c.as_ptr(),
@@ -968,13 +987,13 @@ pub fn vz_pool_restore_long(
             cpu_count,
             memory_mib,
             &mut out_vm,
-            &mut restore_nanos,
+            &mut timings,
             &mut out_err,
         )
     };
     status.into_result(out_err)?;
     debug_assert!(!out_vm.is_null());
-    Ok((VzVm { handle: out_vm }, restore_nanos))
+    Ok((VzVm { handle: out_vm }, timings))
 }
 
 /// Restore a snapshot taken via [`VzVm::save_state`] into a fresh
@@ -997,7 +1016,7 @@ pub fn vz_long_restore(
     cpu_count: u32,
     memory_mib: u64,
     resume: bool,
-) -> Result<(VzVm, u64), VmError> {
+) -> Result<(VzVm, HbRestoreTimings), VmError> {
     let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
     let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
     let log_c = CString::new(path_to_str(log, "log")?)?;
@@ -1010,7 +1029,7 @@ pub fn vz_long_restore(
 
     let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
     let mut out_err: *mut c_char = std::ptr::null_mut();
-    let mut restore_nanos: u64 = 0;
+    let mut timings = HbRestoreTimings::default();
     let status = unsafe {
         hb_vz_long_restore(
             kernel_c.as_ptr(),
@@ -1023,13 +1042,13 @@ pub fn vz_long_restore(
             memory_mib,
             resume,
             &mut out_vm,
-            &mut restore_nanos,
+            &mut timings,
             &mut out_err,
         )
     };
     status.into_result(out_err)?;
     debug_assert!(!out_vm.is_null());
-    Ok((VzVm { handle: out_vm }, restore_nanos))
+    Ok((VzVm { handle: out_vm }, timings))
 }
 
 /// Stock-init counterpart of [`vz_pool_restore_long`]. Restores a snapshot
@@ -1044,7 +1063,7 @@ pub fn vz_stock_pool_restore_long(
     log: Option<&Path>,
     cpu_count: u32,
     memory_mib: u64,
-) -> Result<(VzVm, u64), VmError> {
+) -> Result<(VzVm, HbRestoreTimings), VmError> {
     let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
     let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
     let save_c = CString::new(path_to_str(save, "save")?)?;
@@ -1055,7 +1074,7 @@ pub fn vz_stock_pool_restore_long(
 
     let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
     let mut out_err: *mut c_char = std::ptr::null_mut();
-    let mut restore_nanos: u64 = 0;
+    let mut timings = HbRestoreTimings::default();
     let status = unsafe {
         hb_vz_stock_pool_restore_long(
             kernel_c.as_ptr(),
@@ -1065,13 +1084,13 @@ pub fn vz_stock_pool_restore_long(
             cpu_count,
             memory_mib,
             &mut out_vm,
-            &mut restore_nanos,
+            &mut timings,
             &mut out_err,
         )
     };
     status.into_result(out_err)?;
     debug_assert!(!out_vm.is_null());
-    Ok((VzVm { handle: out_vm }, restore_nanos))
+    Ok((VzVm { handle: out_vm }, timings))
 }
 
 /// Pause a booted VM and save its full state to disk. Builds a fresh

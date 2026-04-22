@@ -1385,7 +1385,7 @@ public func hb_vz_pool_restore_long(
     cpuCount: UInt32,
     memoryMib: UInt64,
     outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
-    outRestoreNanos: UnsafeMutablePointer<UInt64>?,
+    outTimings: UnsafeMutablePointer<HbRestoreTimings>?,
     outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
     guard let kernelPath, let initramfsPath, let rootfsPath, let savePath, let outVm else {
@@ -1401,6 +1401,7 @@ public func hb_vz_pool_restore_long(
     let machineId = machineIdURL(forSavePath: save)
 
     do {
+        let configStart = DispatchTime.now()
         let session = try ExecSession.makeSnapshotable(
             kernel: kernel,
             initramfs: initramfs,
@@ -1410,14 +1411,17 @@ public func hb_vz_pool_restore_long(
             cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
             memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20)
         )
+        let configElapsed = DispatchTime.now().uptimeNanoseconds - configStart.uptimeNanoseconds
         // makeSnapshotable's session has no readabilityHandler / log handle
         // to keep alive; the URL-based serial attachment owns its file.
 
         let queue = DispatchQueue(label: "com.hephaestus.vz-pool-restore-\(UUID().uuidString)")
         let holder = VMHolder()
+        let constructStart = DispatchTime.now()
         queue.sync {
             holder.vm = VZVirtualMachine(configuration: session.config, queue: queue)
         }
+        let constructElapsed = DispatchTime.now().uptimeNanoseconds - constructStart.uptimeNanoseconds
         guard holder.vm != nil else {
             writeError(outErr, "failed to construct VZVirtualMachine")
             return Status.swiftError
@@ -1425,9 +1429,18 @@ public func hb_vz_pool_restore_long(
 
         let restoreStart = DispatchTime.now()
         try blockingRestore(queue: queue, holder: holder, from: save)
-        try blockingResume(queue: queue, holder: holder)
         let restoreElapsed = DispatchTime.now().uptimeNanoseconds - restoreStart.uptimeNanoseconds
-        outRestoreNanos?.pointee = restoreElapsed
+        let resumeStart = DispatchTime.now()
+        try blockingResume(queue: queue, holder: holder)
+        let resumeElapsed = DispatchTime.now().uptimeNanoseconds - resumeStart.uptimeNanoseconds
+        if let outTimings {
+            outTimings.pointee = HbRestoreTimings(
+                config_nanos: configElapsed,
+                construct_nanos: constructElapsed,
+                restore_nanos: restoreElapsed,
+                resume_nanos: resumeElapsed
+            )
+        }
 
         // The agent inside is sitting at accept() on vsock 1234 forever —
         // we never connect, never send a command. Client treats this VM
@@ -1471,7 +1484,7 @@ public func hb_vz_stock_pool_restore_long(
     cpuCount: UInt32,
     memoryMib: UInt64,
     outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
-    outRestoreNanos: UnsafeMutablePointer<UInt64>?,
+    outTimings: UnsafeMutablePointer<HbRestoreTimings>?,
     outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
     guard let kernelPath, let rootfsPath, let savePath, let outVm else {
@@ -1489,6 +1502,7 @@ public func hb_vz_stock_pool_restore_long(
     let machineId = machineIdURL(forSavePath: save)
 
     do {
+        let configStart = DispatchTime.now()
         let config = try buildConfig(
             kernel: kernel,
             rootfs: rootfs,
@@ -1498,12 +1512,15 @@ public func hb_vz_stock_pool_restore_long(
             memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
             commandLine: "console=hvc0 root=/dev/vda rw init=/bin/sh panic=1"
         )
+        let configElapsed = DispatchTime.now().uptimeNanoseconds - configStart.uptimeNanoseconds
 
         let queue = DispatchQueue(label: "com.hephaestus.vz-stock-pool-restore-\(UUID().uuidString)")
         let holder = VMHolder()
+        let constructStart = DispatchTime.now()
         queue.sync {
             holder.vm = VZVirtualMachine(configuration: config, queue: queue)
         }
+        let constructElapsed = DispatchTime.now().uptimeNanoseconds - constructStart.uptimeNanoseconds
         guard holder.vm != nil else {
             writeError(outErr, "failed to construct VZVirtualMachine")
             return Status.swiftError
@@ -1511,9 +1528,18 @@ public func hb_vz_stock_pool_restore_long(
 
         let restoreStart = DispatchTime.now()
         try blockingRestore(queue: queue, holder: holder, from: save)
-        try blockingResume(queue: queue, holder: holder)
         let restoreElapsed = DispatchTime.now().uptimeNanoseconds - restoreStart.uptimeNanoseconds
-        outRestoreNanos?.pointee = restoreElapsed
+        let resumeStart = DispatchTime.now()
+        try blockingResume(queue: queue, holder: holder)
+        let resumeElapsed = DispatchTime.now().uptimeNanoseconds - resumeStart.uptimeNanoseconds
+        if let outTimings {
+            outTimings.pointee = HbRestoreTimings(
+                config_nanos: configElapsed,
+                construct_nanos: constructElapsed,
+                restore_nanos: restoreElapsed,
+                resume_nanos: resumeElapsed
+            )
+        }
 
         let handle = VzVmHandle(
             queue: queue,
@@ -1603,7 +1629,7 @@ public func hb_vz_long_restore(
     memoryMib: UInt64,
     resume: Bool,
     outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
-    outRestoreNanos: UnsafeMutablePointer<UInt64>?,
+    outTimings: UnsafeMutablePointer<HbRestoreTimings>?,
     outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
     guard let kernelPath, let rootfsPath, let logPath, let bootArgs, let savePath, let outVm
@@ -1621,6 +1647,7 @@ public func hb_vz_long_restore(
     let machineId = machineIdURL(forSavePath: save)
 
     do {
+        let configStart = DispatchTime.now()
         let config = try buildLongRunningConfig(
             kernel: kernel,
             rootfs: rootfs,
@@ -1631,12 +1658,15 @@ public func hb_vz_long_restore(
             memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
             commandLine: commandLine
         )
+        let configElapsed = DispatchTime.now().uptimeNanoseconds - configStart.uptimeNanoseconds
 
         let queue = DispatchQueue(label: "com.hephaestus.vz-long-restore-\(UUID().uuidString)")
         let holder = VMHolder()
+        let constructStart = DispatchTime.now()
         queue.sync {
             holder.vm = VZVirtualMachine(configuration: config, queue: queue)
         }
+        let constructElapsed = DispatchTime.now().uptimeNanoseconds - constructStart.uptimeNanoseconds
         guard holder.vm != nil else {
             writeError(outErr, "failed to construct VZVirtualMachine")
             return Status.swiftError
@@ -1644,11 +1674,21 @@ public func hb_vz_long_restore(
 
         let restoreStart = DispatchTime.now()
         try blockingRestore(queue: queue, holder: holder, from: save)
-        if resume {
-            try blockingResume(queue: queue, holder: holder)
-        }
         let restoreElapsed = DispatchTime.now().uptimeNanoseconds - restoreStart.uptimeNanoseconds
-        outRestoreNanos?.pointee = restoreElapsed
+        var resumeElapsed: UInt64 = 0
+        if resume {
+            let resumeStart = DispatchTime.now()
+            try blockingResume(queue: queue, holder: holder)
+            resumeElapsed = DispatchTime.now().uptimeNanoseconds - resumeStart.uptimeNanoseconds
+        }
+        if let outTimings {
+            outTimings.pointee = HbRestoreTimings(
+                config_nanos: configElapsed,
+                construct_nanos: constructElapsed,
+                restore_nanos: restoreElapsed,
+                resume_nanos: resumeElapsed
+            )
+        }
 
         let handle = VzVmHandle(
             queue: queue,
