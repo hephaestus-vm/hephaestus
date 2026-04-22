@@ -13,9 +13,24 @@ use hephaestus_fc_api::vmm_config::logger::LoggerConfig;
 use hephaestus_fc_api::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 use hephaestus_fc_api::vmm_config::metrics::MetricsConfig;
 use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
+use hephaestus_fc_api::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotConfig, MemBackendType, SnapshotType,
+};
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
 use hephaestus_pool::{ClaimedSlot, Pool, PoolMatchSpec};
-use hephaestus_vmm::{VzSpec, VzVm};
+use hephaestus_vmm::{VzSpec, VzVm, vz_long_restore};
+
+/// How the currently-running VM was started. Used to gate
+/// `PUT /snapshot/create`: only cold-boot VMs are saveable, since their
+/// config (kernel, rootfs, cmdline, no vsock) is reproducible by the
+/// loader. Pool-restored VMs were built from a different config flavor
+/// and would fail VZ's "configuration mismatch" on later restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOrigin {
+    ColdBoot,
+    Pool,
+    SnapshotLoad,
+}
 
 #[derive(Debug)]
 pub struct VzBackend {
@@ -31,6 +46,9 @@ pub struct VzBackend {
     vm: Option<VzVm>,
     pool_slot: Option<ClaimedSlot>,
     pool: Option<Pool>,
+    /// Set once start_micro_vm or load_snapshot succeeds. None
+    /// pre-boot. Gates create_snapshot.
+    origin: Option<RunOrigin>,
 }
 
 impl VzBackend {
@@ -45,6 +63,7 @@ impl VzBackend {
             vm: None,
             pool_slot: None,
             pool: None,
+            origin: None,
         }
     }
 
@@ -291,6 +310,7 @@ impl VmmBackend for VzBackend {
                         self.vm = Some(vm);
                         self.pool_slot = Some(slot);
                         self.state = VmState::Running;
+                        self.origin = Some(RunOrigin::Pool);
                         return Ok(());
                     }
                     Err(err) => {
@@ -326,6 +346,132 @@ impl VmmBackend for VzBackend {
 
         self.vm = Some(vm);
         self.state = VmState::Running;
+        self.origin = Some(RunOrigin::ColdBoot);
+        Ok(())
+    }
+
+    fn create_snapshot(
+        &mut self,
+        params: CreateSnapshotParams,
+    ) -> Result<(), VmmBackendError> {
+        if !matches!(self.state, VmState::Paused) {
+            return Err(VmmBackendError::InvalidState(
+                "snapshot/create requires the VM to be Paused (PATCH /vm first)".into(),
+            ));
+        }
+        if !matches!(params.snapshot_type, SnapshotType::Full) {
+            return Err(VmmBackendError::NotSupported(
+                "snapshot_type=Diff (VZ has no incremental save)".into(),
+            ));
+        }
+        // Pool-restored VMs were built from a config flavor (vsock,
+        // initramfs, agent cmdline) that this process's snapshot/load
+        // path can't reproduce — VZ would reject the restore. Caller
+        // can stop the pool VM and cold-boot a new one to enable saves.
+        match self.origin {
+            Some(RunOrigin::ColdBoot | RunOrigin::SnapshotLoad) => {}
+            Some(RunOrigin::Pool) => {
+                return Err(VmmBackendError::NotSupported(
+                    "snapshot/create on a pool-restored VM (cold-boot to snapshot)".into(),
+                ));
+            }
+            None => {
+                return Err(VmmBackendError::InvalidState(
+                    "no VM running".into(),
+                ));
+            }
+        }
+
+        let vm = self.vm.as_ref().ok_or_else(|| {
+            VmmBackendError::Internal("Paused state without a VM handle".into())
+        })?;
+        vm.save_state(&params.snapshot_path)
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
+
+        // A+stub: touch an empty file at mem_file_path so clients that
+        // os.Stat(mem_file_path) post-save don't error. The real blob
+        // (state + memory together) is at snapshot_path. See the
+        // module-level note in fc-api/.../snapshot.rs.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&params.mem_file_path)
+            .map_err(|err| {
+                VmmBackendError::InvalidConfig(format!(
+                    "cannot touch mem_file_path {}: {err}",
+                    params.mem_file_path.display()
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn load_snapshot(
+        &mut self,
+        params: LoadSnapshotConfig,
+    ) -> Result<(), VmmBackendError> {
+        self.require_preboot()?;
+
+        if params.enable_diff_snapshots || params.track_dirty_pages {
+            return Err(VmmBackendError::NotSupported(
+                "diff/dirty-page tracking (VZ has no equivalent)".into(),
+            ));
+        }
+        if let Some(backend) = params.mem_backend.as_ref() {
+            if !matches!(backend.backend_type, MemBackendType::File) {
+                return Err(VmmBackendError::NotSupported(
+                    "mem_backend.backend_type=Uffd (Linux-only)".into(),
+                ));
+            }
+        }
+
+        let boot = self.boot_source.as_ref().ok_or_else(|| {
+            VmmBackendError::InvalidState(
+                "snapshot/load requires PUT /boot-source first".into(),
+            )
+        })?;
+        let rootfs = self.root_drive.clone().ok_or_else(|| {
+            VmmBackendError::InvalidState(
+                "snapshot/load requires PUT /drives/{id} first".into(),
+            )
+        })?;
+        let kernel = PathBuf::from(&boot.kernel_image_path);
+        let boot_args = boot
+            .boot_args
+            .clone()
+            .unwrap_or_else(|| DEFAULT_KERNEL_CMDLINE.to_string());
+        let cpu = u32::from(self.machine_config.vcpu_count);
+        let memory = u64::try_from(self.machine_config.mem_size_mib)
+            .map_err(|err| VmmBackendError::InvalidConfig(err.to_string()))?;
+        let log = PathBuf::from(format!("/tmp/hephaestus-firecracker-{}.log", self.id));
+
+        let initrd = boot.initrd_path.as_ref().map(PathBuf::from);
+        let (vm, restore_nanos) = vz_long_restore(
+            &kernel,
+            &rootfs,
+            initrd.as_deref(),
+            &log,
+            &boot_args,
+            &params.snapshot_path,
+            cpu,
+            memory,
+            params.resume_vm,
+        )
+        .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
+
+        eprintln!(
+            "hephaestus-firecracker: snapshot/load restored in {}ms (resume={})",
+            restore_nanos / 1_000_000,
+            params.resume_vm
+        );
+
+        self.vm = Some(vm);
+        self.state = if params.resume_vm {
+            VmState::Running
+        } else {
+            VmState::Paused
+        };
+        self.origin = Some(RunOrigin::SnapshotLoad);
         Ok(())
     }
 

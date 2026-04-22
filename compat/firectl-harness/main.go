@@ -50,6 +50,8 @@ func main() {
 		vcpu     = flag.Int64("vcpu", 1, "vcpu count for PUT /machine-config")
 		mem      = flag.Int64("mem", 256, "initial memory MiB for PUT /machine-config")
 		memPatch = flag.Int64("mem-patch", 512, "memory MiB for the PATCH /machine-config bump")
+		snapSave = flag.String("snapshot-save", "", "after boot+pause, PUT /snapshot/create writing state to this path (and a stub at .mem)")
+		snapLoad = flag.String("snapshot-load", "", "instead of InstanceStart, PUT /snapshot/load from this state path with resume_vm=true")
 	)
 	flag.Parse()
 
@@ -172,13 +174,30 @@ func main() {
 		return
 	}
 
-	h.run("PUT /actions InstanceStart", func() error {
-		action := "InstanceStart"
-		_, err := ops.CreateSyncAction(operations.NewCreateSyncActionParams().WithInfo(&models.InstanceActionInfo{
-			ActionType: &action,
-		}))
-		return err
-	})
+	if *snapLoad != "" {
+		// Snapshot-load mode: replaces InstanceStart entirely. The VM is
+		// expected to be in `Running` state immediately after the call
+		// (resume_vm=true), so the assertions below match the cold-boot
+		// path's expectations without re-running InstanceStart.
+		h.run("PUT /snapshot/load", func() error {
+			snap := abs(*snapLoad)
+			memStub := snap + ".mem"
+			_, err := ops.LoadSnapshot(operations.NewLoadSnapshotParams().WithBody(&models.SnapshotLoadParams{
+				SnapshotPath: &snap,
+				MemFilePath:  &memStub,
+				ResumeVM:     true,
+			}))
+			return err
+		})
+	} else {
+		h.run("PUT /actions InstanceStart", func() error {
+			action := "InstanceStart"
+			_, err := ops.CreateSyncAction(operations.NewCreateSyncActionParams().WithInfo(&models.InstanceActionInfo{
+				ActionType: &action,
+			}))
+			return err
+		})
+	}
 
 	h.run("GET / (post-boot, expect Running)", func() error {
 		out, err := ops.DescribeInstance(operations.NewDescribeInstanceParams())
@@ -193,7 +212,7 @@ func main() {
 		return nil
 	})
 
-	if *pause {
+	if *pause || *snapSave != "" {
 		time.Sleep(200 * time.Millisecond)
 		h.run("PATCH /vm Paused", func() error {
 			s := "Paused"
@@ -212,11 +231,35 @@ func main() {
 			}
 			return nil
 		})
-		h.run("PATCH /vm Resumed", func() error {
-			s := "Resumed"
-			_, err := ops.PatchVM(operations.NewPatchVMParams().WithBody(&models.VM{State: &s}))
-			return err
-		})
+		if *snapSave != "" {
+			h.run("PUT /snapshot/create", func() error {
+				snap := abs(*snapSave)
+				mem := snap + ".mem"
+				snapType := "Full"
+				_, err := ops.CreateSnapshot(operations.NewCreateSnapshotParams().WithBody(&models.SnapshotCreateParams{
+					SnapshotPath: &snap,
+					MemFilePath:  &mem,
+					SnapshotType: snapType,
+				}))
+				if err != nil {
+					return err
+				}
+				if _, statErr := os.Stat(snap); statErr != nil {
+					return fmt.Errorf("snapshot blob missing at %s: %w", snap, statErr)
+				}
+				if _, statErr := os.Stat(mem); statErr != nil {
+					return fmt.Errorf("mem stub missing at %s: %w", mem, statErr)
+				}
+				fmt.Printf("    blob=%s mem-stub=%s\n", snap, mem)
+				return nil
+			})
+		} else {
+			h.run("PATCH /vm Resumed", func() error {
+				s := "Resumed"
+				_, err := ops.PatchVM(operations.NewPatchVMParams().WithBody(&models.VM{State: &s}))
+				return err
+			})
+		}
 	}
 
 	h.summary()

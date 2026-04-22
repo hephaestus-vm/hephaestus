@@ -298,6 +298,52 @@ fc-compat-pool: build build-agent fc-harness-build
         -log "$log" -pause \
         -vcpu 2 -mem 512 -mem-patch 512
 
+# End-to-end snapshot round-trip: server A boots a VM cold, pauses it,
+# saves via PUT /snapshot/create. Server B (fresh process) loads the
+# saved blob via PUT /snapshot/load with resume_vm=true and verifies
+# the restored VM is Running.
+fc-compat-snapshot: build fc-harness-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cdir="$HOME/Library/Application Support/com.apple.container"
+    kernel="$(ls "$cdir"/kernels/vmlinux-* 2>/dev/null | head -1 || true)"
+    snaps=("$cdir"/snapshots/*/snapshot)
+    if [[ -z "$kernel" ]] || [[ ! -e "${snaps[0]:-}" ]]; then
+        echo "no artifacts; run: just artifacts" >&2; exit 1
+    fi
+    rootfs_src=$(stat -f '%z %N' "${snaps[@]}" | sort -nr | head -1 | cut -d' ' -f2-)
+    rootfs="${TMPDIR:-/tmp}/hephaestus/fc-snap-rootfs.ext4"
+    mkdir -p "$(dirname "$rootfs")"
+    cp -c "$rootfs_src" "$rootfs"
+    snap="${TMPDIR:-/tmp}/hephaestus/fc-snap.bin"
+    rm -f "$snap" "$snap.machineid" "$snap.mem"
+    sock_a="${TMPDIR:-/tmp}/hephaestus-fc-snap-a.socket"
+    sock_b="${TMPDIR:-/tmp}/hephaestus-fc-snap-b.socket"
+    log_a="${TMPDIR:-/tmp}/hephaestus/fc-snap-a.log"
+    log_b="${TMPDIR:-/tmp}/hephaestus/fc-snap-b.log"
+    rm -f "$sock_a" "$sock_b" "$log_a" "$log_b"
+
+    # Phase 1: cold boot, pause, snapshot.
+    {{bin}}-firecracker --api-sock "$sock_a" --id fc-snap-a &
+    server_a=$!
+    trap 'kill $server_a $server_b 2>/dev/null || true' EXIT
+    for _ in $(seq 1 20); do [[ -S "$sock_a" ]] && break; sleep 0.1; done
+    compat/firectl-harness/firectl-harness \
+        -sock "$sock_a" -kernel "$kernel" -rootfs "$rootfs" \
+        -log "$log_a" -snapshot-save "$snap" \
+        -vcpu 2 -mem 512 -mem-patch 512
+    kill $server_a 2>/dev/null || true
+    wait $server_a 2>/dev/null || true
+
+    # Phase 2: fresh server, load snapshot, verify Running.
+    {{bin}}-firecracker --api-sock "$sock_b" --id fc-snap-b &
+    server_b=$!
+    for _ in $(seq 1 20); do [[ -S "$sock_b" ]] && break; sleep 0.1; done
+    compat/firectl-harness/firectl-harness \
+        -sock "$sock_b" -kernel "$kernel" -rootfs "$rootfs" \
+        -log "$log_b" -snapshot-load "$snap" -pause \
+        -vcpu 2 -mem 512 -mem-patch 512
+
 # Stock-init pool variant of fc-compat-pool. Snapshots the rootfs's own
 # /bin/sh as PID 1 (no hephaestus-agent, no vsock, no initramfs) so
 # restored VMs are behaviorally indistinguishable from cold-boot for the

@@ -21,6 +21,9 @@ pub mod metrics;
 pub mod machine_config;
 /// Network interface wire struct (`PUT /network-interfaces/{id}`).
 pub mod net;
+/// Snapshot create/load wire structs (`PUT /snapshot/create`,
+/// `PUT /snapshot/load`).
+pub mod snapshot;
 /// VM state update wire struct (`PATCH /vm`).
 pub mod vm;
 

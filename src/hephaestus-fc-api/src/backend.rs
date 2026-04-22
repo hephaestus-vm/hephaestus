@@ -22,6 +22,7 @@ use crate::vmm_config::logger::LoggerConfig;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 use crate::vmm_config::metrics::MetricsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
+use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotConfig};
 
 /// Errors a backend method can surface to the HTTP layer.
 ///
@@ -127,5 +128,26 @@ pub trait VmmBackend {
     /// `PATCH /vm` with `state: Resumed`.
     fn resume(&mut self) -> Result<(), VmmBackendError> {
         Err(VmmBackendError::NotSupported("resume".into()))
+    }
+
+    /// `PUT /snapshot/create`. Per Firecracker semantics the VM must be
+    /// `Paused` before calling. Default impl is `NotSupported` so
+    /// backends opt in.
+    fn create_snapshot(
+        &mut self,
+        _params: CreateSnapshotParams,
+    ) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("snapshot/create".into()))
+    }
+
+    /// `PUT /snapshot/load`. Pre-boot only. Replaces the cold-boot path:
+    /// after `load_snapshot` returns Ok, the VM is either `Running` or
+    /// `Paused` depending on `params.resume_vm`. Backend should reject
+    /// if pre-boot config (kernel, rootfs, vcpu, mem) hasn't been set.
+    fn load_snapshot(
+        &mut self,
+        _params: LoadSnapshotConfig,
+    ) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("snapshot/load".into()))
     }
 }

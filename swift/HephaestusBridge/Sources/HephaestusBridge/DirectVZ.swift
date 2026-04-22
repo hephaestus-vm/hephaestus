@@ -1531,3 +1531,138 @@ public func hb_vz_stock_pool_restore_long(
         return Status.swiftError
     }
 }
+
+// =============================================================================
+// FFI: hb_vz_long_save — save the state of a long-running VzVm handle
+// to disk. Pairs with hb_vz_long_restore. The VM must already be Paused
+// (VZ's saveMachineStateTo: requires it); the caller arranges that via
+// hb_vz_long_pause first. This FFI does not pause/resume on the
+// caller's behalf — staying out of the state machine keeps the
+// PUT /snapshot/create contract clean.
+//
+// Also writes the platform machine identifier next to the save file
+// (`<save>.machineid`) so a restore in a fresh process can recreate
+// the same VZGenericMachineIdentifier.
+// =============================================================================
+
+@_cdecl("hb_vz_long_save")
+public func hb_vz_long_save(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    savePath: UnsafePointer<CChar>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrowVz(vm, outErr) else { return Status.invalidArgument }
+    guard let savePath else {
+        writeError(outErr, "null savePath")
+        return Status.invalidArgument
+    }
+    let save = URL(fileURLWithPath: String(cString: savePath))
+
+    // Persist the machine-id sidecar so a future restore in a different
+    // process can rebuild a config with the same VZGenericMachineIdentifier.
+    let outIdURL = machineIdURL(forSavePath: save)
+    if outIdURL != handle.machineIdURL,
+       let data = try? Data(contentsOf: handle.machineIdURL) {
+        try? data.write(to: outIdURL)
+    }
+
+    do {
+        try blockingSave(queue: handle.queue, holder: handle.holder, to: save)
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}
+
+// =============================================================================
+// FFI: hb_vz_long_restore — restore a snapshot taken by hb_vz_long_save
+// into a fresh long-running VzVm handle.
+//
+// Caller supplies the same kernel/rootfs/cmdline/cpu/mem the original
+// VM was created with (via PUT /machine-config + PUT /boot-source +
+// PUT /drives, exactly the upstream `PUT /snapshot/load` flow). Config
+// must mirror `buildLongRunningConfig` since that's what produced the
+// VM that was saved.
+//
+// `resume` controls whether the restored VM resumes immediately (true)
+// or stays paused (false). Either way the caller gets a handle they
+// can pause/resume/stop/free.
+// =============================================================================
+
+@_cdecl("hb_vz_long_restore")
+public func hb_vz_long_restore(
+    kernelPath: UnsafePointer<CChar>?,
+    rootfsPath: UnsafePointer<CChar>?,
+    initrdPath: UnsafePointer<CChar>?,
+    logPath: UnsafePointer<CChar>?,
+    bootArgs: UnsafePointer<CChar>?,
+    savePath: UnsafePointer<CChar>?,
+    cpuCount: UInt32,
+    memoryMib: UInt64,
+    resume: Bool,
+    outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
+    outRestoreNanos: UnsafeMutablePointer<UInt64>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let kernelPath, let rootfsPath, let logPath, let bootArgs, let savePath, let outVm
+    else {
+        writeError(outErr, "null path/out argument")
+        return Status.invalidArgument
+    }
+
+    let kernel = URL(fileURLWithPath: String(cString: kernelPath))
+    let rootfs = URL(fileURLWithPath: String(cString: rootfsPath))
+    let log = URL(fileURLWithPath: String(cString: logPath))
+    let initrd: URL? = initrdPath.map { URL(fileURLWithPath: String(cString: $0)) }
+    let commandLine = String(cString: bootArgs)
+    let save = URL(fileURLWithPath: String(cString: savePath))
+    let machineId = machineIdURL(forSavePath: save)
+
+    do {
+        let config = try buildLongRunningConfig(
+            kernel: kernel,
+            rootfs: rootfs,
+            initrd: initrd,
+            logURL: log,
+            machineIdURL: machineId,
+            cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
+            memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
+            commandLine: commandLine
+        )
+
+        let queue = DispatchQueue(label: "com.hephaestus.vz-long-restore-\(UUID().uuidString)")
+        let holder = VMHolder()
+        queue.sync {
+            holder.vm = VZVirtualMachine(configuration: config, queue: queue)
+        }
+        guard holder.vm != nil else {
+            writeError(outErr, "failed to construct VZVirtualMachine")
+            return Status.swiftError
+        }
+
+        let restoreStart = DispatchTime.now()
+        try blockingRestore(queue: queue, holder: holder, from: save)
+        if resume {
+            try blockingResume(queue: queue, holder: holder)
+        }
+        let restoreElapsed = DispatchTime.now().uptimeNanoseconds - restoreStart.uptimeNanoseconds
+        outRestoreNanos?.pointee = restoreElapsed
+
+        let handle = VzVmHandle(
+            queue: queue,
+            holder: holder,
+            config: config,
+            logURL: log,
+            machineIdURL: machineId
+        )
+        let opaque = Unmanaged.passRetained(handle).toOpaque()
+        outVm.pointee = opaque.assumingMemoryBound(to: HbVzVm.self)
+        outErr?.pointee = nil
+        return Status.ok
+    } catch {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}

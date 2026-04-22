@@ -231,6 +231,25 @@ unsafe extern "C" {
         out_restore_nanos: *mut u64,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
+    fn hb_vz_long_save(
+        vm: *mut HbVzVm,
+        save_path: *const c_char,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
+    fn hb_vz_long_restore(
+        kernel_path: *const c_char,
+        rootfs_path: *const c_char,
+        initrd_path: *const c_char,
+        log_path: *const c_char,
+        boot_args: *const c_char,
+        save_path: *const c_char,
+        cpu_count: u32,
+        memory_mib: u64,
+        resume: bool,
+        out_vm: *mut *mut HbVzVm,
+        out_restore_nanos: *mut u64,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
 }
 
 // =============================================================================
@@ -576,6 +595,20 @@ impl VzVm {
     pub fn stop(&self) -> Result<(), VmError> {
         let mut out_err: *mut c_char = std::ptr::null_mut();
         let status = unsafe { hb_vz_long_stop(self.handle, &mut out_err) };
+        status.into_result(out_err)
+    }
+
+    /// Save the VM's full state to `save_path`. The VM must already be
+    /// paused (VZ requires it); call [`Self::pause`] first. Stays paused
+    /// after save — caller decides whether to resume or stop.
+    ///
+    /// Also writes the platform machine identifier alongside the save
+    /// (`<save>.machineid`) so [`vz_long_restore`] in a fresh process
+    /// can reuse it.
+    pub fn save_state(&self, save_path: &Path) -> Result<(), VmError> {
+        let save_c = CString::new(path_to_str(save_path, "save")?)?;
+        let mut out_err: *mut c_char = std::ptr::null_mut();
+        let status = unsafe { hb_vz_long_save(self.handle, save_c.as_ptr(), &mut out_err) };
         status.into_result(out_err)
     }
 }
@@ -934,6 +967,61 @@ pub fn vz_pool_restore_long(
             log_ptr,
             cpu_count,
             memory_mib,
+            &mut out_vm,
+            &mut restore_nanos,
+            &mut out_err,
+        )
+    };
+    status.into_result(out_err)?;
+    debug_assert!(!out_vm.is_null());
+    Ok((VzVm { handle: out_vm }, restore_nanos))
+}
+
+/// Restore a snapshot taken via [`VzVm::save_state`] into a fresh
+/// long-running [`VzVm`] handle. Caller supplies the same kernel,
+/// rootfs, cmdline, vcpu, and memory the original VM was created with
+/// (i.e. the values that came in via `PUT /machine-config` +
+/// `PUT /boot-source` + `PUT /drives`).
+///
+/// `resume` controls whether the restored VM resumes immediately
+/// (`true`, matching `LoadSnapshotConfig.resume_vm: true`) or stays
+/// paused (`false`).
+#[allow(clippy::too_many_arguments)]
+pub fn vz_long_restore(
+    kernel: &Path,
+    rootfs: &Path,
+    initrd: Option<&Path>,
+    log: &Path,
+    boot_args: &str,
+    save: &Path,
+    cpu_count: u32,
+    memory_mib: u64,
+    resume: bool,
+) -> Result<(VzVm, u64), VmError> {
+    let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
+    let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
+    let log_c = CString::new(path_to_str(log, "log")?)?;
+    let boot_args_c = CString::new(boot_args)?;
+    let save_c = CString::new(path_to_str(save, "save")?)?;
+    let initrd_c = initrd
+        .map(|p| CString::new(path_to_str(p, "initrd").unwrap_or("")))
+        .transpose()?;
+    let initrd_ptr = initrd_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+
+    let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
+    let mut out_err: *mut c_char = std::ptr::null_mut();
+    let mut restore_nanos: u64 = 0;
+    let status = unsafe {
+        hb_vz_long_restore(
+            kernel_c.as_ptr(),
+            rootfs_c.as_ptr(),
+            initrd_ptr,
+            log_c.as_ptr(),
+            boot_args_c.as_ptr(),
+            save_c.as_ptr(),
+            cpu_count,
+            memory_mib,
+            resume,
             &mut out_vm,
             &mut restore_nanos,
             &mut out_err,
