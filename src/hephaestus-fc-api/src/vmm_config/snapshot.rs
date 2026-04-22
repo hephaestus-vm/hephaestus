@@ -1,4 +1,4 @@
-// upstream: src/vmm/src/vmm_config/snapshot.rs
+// upstream: vendor/firecracker/vmm/src/vmm_config/snapshot.rs
 //
 // Wire structs for `PUT /snapshot/create` and `PUT /snapshot/load`.
 // Trimmed from upstream to drop the Linux-only `MemBackendType::Uffd`

@@ -1,12 +1,21 @@
+hephaestus
+Copyright 2025-2026 Ahmed Adan and contributors.
+SPDX-License-Identifier: Apache-2.0
+
+This product includes software derived from Firecracker
+(https://github.com/firecracker-microvm/firecracker). The
+`src/hephaestus-fc-api` crate copies and adapts wire-type
+definitions from Firecracker's `src/vmm/src/vmm_config/*`. Per-file
+`// upstream:` pointers in `src/hephaestus-fc-api/src/vmm_config/`
+cite the exact upstream source paths (now under
+`vendor/firecracker/` in this tree).
+
+--
+
 Firecracker
 Copyright 2017-2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 SPDX-License-Identifier: Apache-2.0
 
 Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
-Use of this source code is governed by a BSD-style license that can be
-found in the THIRD-PARTY file.
-
-The Firecracker release bundle includes libseccomp which is available
-under the LGPLv2.1 license. This is used in the Firecracker build process
-to produce cBPF bytecode that is shipped alongside Firecracker for use by
-the Linux kernel.
+Use of this source code is governed by a BSD-style license; see the
+upstream Firecracker repository for the canonical text.

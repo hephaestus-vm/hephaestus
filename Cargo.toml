@@ -1,16 +1,10 @@
 [workspace]
-# hephaestus: macOS/Apple-Silicon fork. We enumerate members rather than using
-# `src/*` because Firecracker's original vmm/jailer/utils/etc. are Linux-only
-# and won't build on macOS. Those directories remain on disk for reference and
-# upstream cherry-picks, but are excluded from the workspace until a V2 pass
-# reintroduces them behind a `target_os = "linux"` cfg.
+# hephaestus is a macOS/Apple-Silicon fork of Firecracker. Only the
+# hephaestus-native crates build here; the upstream Firecracker tree
+# lives under `vendor/firecracker/` as reference material for the
+# copy-and-sync wire-type pattern in `hephaestus-fc-api` and is
+# excluded from the workspace.
 members = [
-    # OS-agnostic upstream crates we still use
-    "src/acpi-tables",
-    "src/clippy-tracing",
-    "src/log-instrument",
-    "src/log-instrument-macros",
-    # hephaestus-native crates
     "src/hephaestus-bridge",
     "src/hephaestus-cli",
     "src/hephaestus-fc-api",
@@ -19,19 +13,7 @@ members = [
     "src/hephaestus-vmm",
 ]
 exclude = [
-    # Upstream Firecracker crates. Excluded on macOS because their dependency
-    # tree (KVM, vhost, memfd, userfaultfd, and micro_http's epoll/eventfd
-    # server loop) is Linux-only. Pure-Rust API surface (vmm_config/*,
-    # VmmAction data types) is re-homed under src/hephaestus-fc-api with a
-    # pointer back to the upstream source.
-    "src/cpu-template-helper",
-    "src/firecracker",
-    "src/jailer",
-    "src/rebase-snap",
-    "src/seccompiler",
-    "src/snapshot-editor",
-    "src/utils",
-    "src/vmm",
+    "vendor/firecracker",
 ]
 default-members = [
     "src/hephaestus-cli",

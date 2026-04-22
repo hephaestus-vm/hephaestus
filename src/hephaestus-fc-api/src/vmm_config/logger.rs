@@ -1,4 +1,4 @@
-// upstream: src/vmm/src/logger/logging.rs (`LoggerConfig`, `LevelFilter`)
+// upstream: vendor/firecracker/vmm/src/logger/logging.rs (`LoggerConfig`, `LevelFilter`)
 //
 // Just the wire struct. Upstream parses `level` as a `LevelFilter` enum
 // with case-insensitive backwards-compat deserialization (Warning/WARN/

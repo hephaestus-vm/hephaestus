@@ -8,6 +8,18 @@
 //! cbindgen-generated C header that SwiftPM imports through the
 //! `CHephaestusBridge` module map target. Both sides must therefore see
 //! identical memory layouts for these types.
+//!
+//! # Safety
+//!
+//! Every `unsafe` block in this crate is calling a Swift `@_cdecl` function
+//! whose contract is documented on the matching `extern "C"` declaration
+//! in this file. All callers here pass `CString`-derived pointers (valid
+//! for reads until the `CString` drops at end of scope) and `&mut`
+//! out-pointers (valid for writes for the duration of the call). The
+//! Swift side copies any bytes it needs before returning. Documenting
+//! each site with a copy of that invariant would be noise, so we allow
+//! `clippy::undocumented_unsafe_blocks` crate-wide.
+#![allow(clippy::undocumented_unsafe_blocks)]
 
 use std::ffi::{CStr, CString, NulError};
 use std::os::raw::{c_char, c_void};
@@ -284,7 +296,9 @@ pub fn ping() -> &'static str {
     let ptr = unsafe { hb_ping() };
     assert!(!ptr.is_null(), "hb_ping returned null");
     // SAFETY: Swift guarantees NUL termination for the returned static string.
-    unsafe { CStr::from_ptr(ptr) }.to_str().expect("bridge returned invalid UTF-8")
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .expect("bridge returned invalid UTF-8")
 }
 
 /// Builder-style spec for a VM. Consume with [`Spec::build`].
@@ -399,12 +413,18 @@ impl Vm {
         let rootfs_c = CString::new(path_to_str(&spec.rootfs_path, "rootfs")?)?;
         let cwd_c = spec.cwd.as_deref().map(CString::new).transpose()?;
         // argv → CStrings → pointer array with NULL sentinel.
-        let argv_cstrings: Vec<CString> =
-            spec.argv.iter().map(|s| CString::new(s.as_str())).collect::<Result<_, _>>()?;
+        let argv_cstrings: Vec<CString> = spec
+            .argv
+            .iter()
+            .map(|s| CString::new(s.as_str()))
+            .collect::<Result<_, _>>()?;
         let mut argv_ptrs: Vec<*const c_char> = argv_cstrings.iter().map(|s| s.as_ptr()).collect();
         argv_ptrs.push(std::ptr::null());
-        let argv_raw: *const *const c_char =
-            if spec.argv.is_empty() { std::ptr::null() } else { argv_ptrs.as_ptr() };
+        let argv_raw: *const *const c_char = if spec.argv.is_empty() {
+            std::ptr::null()
+        } else {
+            argv_ptrs.as_ptr()
+        };
 
         // Build the C-side stdio trampoline: Box the sink so it has a stable
         // pointer, then hand the raw pointer to Swift as `stdio_userdata`.
@@ -432,7 +452,10 @@ impl Vm {
         let status = unsafe { hb_vm_new(&config, &mut out_vm, &mut out_err) };
         status.into_result(out_err)?;
         debug_assert!(!out_vm.is_null());
-        Ok(Vm { handle: out_vm, _stdio: stdio_state })
+        Ok(Vm {
+            handle: out_vm,
+            _stdio: stdio_state,
+        })
     }
 
     /// Boot the VM and wait for the guest agent handshake.
@@ -564,9 +587,7 @@ impl VzVm {
             .as_deref()
             .map(|p| CString::new(path_to_str(p, "initrd").unwrap_or("")))
             .transpose()?;
-        let initrd_ptr = initrd_c
-            .as_ref()
-            .map_or(std::ptr::null(), |c| c.as_ptr());
+        let initrd_ptr = initrd_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
         let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
         let mut out_err: *mut c_char = std::ptr::null_mut();
@@ -654,11 +675,13 @@ impl StdioState {
     fn new(sink: Box<dyn StdioSink>) -> Self {
         // Double-box so the fat-pointer DST has a thin stable address.
         let boxed = Box::new(sink);
-        Self { sink: Box::into_raw(boxed) }
+        Self {
+            sink: Box::into_raw(boxed),
+        }
     }
 
     fn userdata(&self) -> *mut c_void {
-        self.sink as *mut c_void
+        self.sink.cast::<c_void>()
     }
 }
 
@@ -677,12 +700,16 @@ impl Drop for StdioState {
 unsafe extern "C" fn trampoline_stdout(userdata: *mut c_void, data: *const u8, len: usize) {
     // SAFETY: caller (Swift) guarantees userdata came from StdioState::userdata
     // and data..data+len is readable for the duration of this call.
-    unsafe { trampoline(userdata, data, len, /* stderr = */ false) };
+    unsafe {
+        trampoline(userdata, data, len, /* stderr = */ false)
+    };
 }
 
 unsafe extern "C" fn trampoline_stderr(userdata: *mut c_void, data: *const u8, len: usize) {
     // SAFETY: same as trampoline_stdout.
-    unsafe { trampoline(userdata, data, len, /* stderr = */ true) };
+    unsafe {
+        trampoline(userdata, data, len, /* stderr = */ true)
+    };
 }
 
 unsafe fn trampoline(userdata: *mut c_void, data: *const u8, len: usize, stderr: bool) {
@@ -690,7 +717,7 @@ unsafe fn trampoline(userdata: *mut c_void, data: *const u8, len: usize, stderr:
         return;
     }
     // SAFETY: userdata was set from StdioState::userdata and outlives the VM.
-    let sink: &Box<dyn StdioSink> = unsafe { &*(userdata as *const Box<dyn StdioSink>) };
+    let sink: &dyn StdioSink = unsafe { &**userdata.cast::<Box<dyn StdioSink>>() };
     // SAFETY: Swift guarantees data..data+len is readable for the call duration.
     let slice = unsafe { std::slice::from_raw_parts(data, len) };
     if stderr {
@@ -727,7 +754,10 @@ impl HbStatus {
     fn into_result(self, err_ptr: *mut c_char) -> Result<(), VmError> {
         match self {
             HbStatus::Ok => {
-                debug_assert!(err_ptr.is_null(), "Ok status must not produce an error string");
+                debug_assert!(
+                    err_ptr.is_null(),
+                    "Ok status must not produce an error string"
+                );
                 Ok(())
             }
             HbStatus::InvalidArgument | HbStatus::SwiftError => {
@@ -743,7 +773,8 @@ impl HbStatus {
 }
 
 fn path_to_str<'a>(p: &'a Path, label: &str) -> Result<&'a str, VmError> {
-    p.to_str().ok_or_else(|| VmError::InvalidArgument(format!("{label} path is not UTF-8")))
+    p.to_str()
+        .ok_or_else(|| VmError::InvalidArgument(format!("{label} path is not UTF-8")))
 }
 
 // =============================================================================
@@ -830,6 +861,7 @@ pub fn vz_boot(
 /// The command is delivered *after* VM start via vsock (not via kernel
 /// cmdline) so the same booted VM can later be snapshotted and restored
 /// with a different command — the command isn't baked into the save.
+#[allow(clippy::too_many_arguments)] // mirrors the FFI shape; refactor doesn't help
 pub fn vz_exec(
     kernel: &Path,
     initramfs: &Path,
@@ -908,6 +940,7 @@ pub fn vz_exec_snapshot_save(
 /// Restore a pre-warmed VM, send it `command` over vsock, return the
 /// guest's exit code. Also returns how long the restore + resume pair
 /// took, in nanoseconds — the warm-start latency metric.
+#[allow(clippy::too_many_arguments)] // mirrors the FFI shape; refactor doesn't help
 pub fn vz_exec_snapshot_restore(
     kernel: &Path,
     initramfs: &Path,
@@ -1249,6 +1282,21 @@ pub fn allocate_ip_octet(id: &str) -> u8 {
     (h % 253) as u8 + 2
 }
 
+/// Take ownership of a Swift-heap-allocated error string and free it.
+fn take_swift_string(ptr: *mut c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: Swift allocated this via strdup-equivalent; we copy the bytes
+    // before freeing through hb_string_free so the original allocator
+    // reclaims the allocation.
+    let s = unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { hb_string_free(ptr) };
+    Some(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1282,21 +1330,16 @@ mod tests {
     fn auto_detect_missing_path_errors() {
         let tmp = std::env::temp_dir().join("hephaestus-test-does-not-exist-xyz");
         let _ = std::fs::remove_file(&tmp);
-        assert!(Compression::auto_detect(&tmp).is_err());
+        Compression::auto_detect(&tmp).unwrap_err();
     }
 
     #[test]
     fn spec_builder_sets_fields() {
-        let spec = Spec::new(
-            "id",
-            Path::new("/k"),
-            Path::new("/i"),
-            Path::new("/r"),
-        )
-        .argv(["a", "b"])
-        .cwd("/workdir")
-        .cpus(4)
-        .memory_mib(1024);
+        let spec = Spec::new("id", Path::new("/k"), Path::new("/i"), Path::new("/r"))
+            .argv(["a", "b"])
+            .cwd("/workdir")
+            .cpus(4)
+            .memory_mib(1024);
         assert_eq!(spec.id, "id");
         assert_eq!(spec.argv, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(spec.cwd.as_deref(), Some("/workdir"));
@@ -1377,17 +1420,4 @@ mod tests {
         }
         (h % 253) as u8 + 2
     }
-}
-
-/// Take ownership of a Swift-heap-allocated error string and free it.
-fn take_swift_string(ptr: *mut c_char) -> Option<String> {
-    if ptr.is_null() {
-        return None;
-    }
-    // SAFETY: Swift allocated this via strdup-equivalent; we copy the bytes
-    // before freeing through hb_string_free so the original allocator
-    // reclaims the allocation.
-    let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
-    unsafe { hb_string_free(ptr) };
-    Some(s)
 }

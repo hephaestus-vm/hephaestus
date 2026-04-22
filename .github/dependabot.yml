@@ -1,40 +1,27 @@
 version: 2
 updates:
-  - package-ecosystem: "cargo"
+  - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
-    allow:
-      - dependency-type: "all"
+      interval: weekly
+    open-pull-requests-limit: 5
     groups:
-      rust-vmm:
-        patterns:
-          - "vmm-sys-util"
-          - "kvm-bindings"
-          - "kvm-ioctls"
-          - "vm-memory"
-          - "vhost"
-          - "linux-loader"
-          - "vm-allocator"
-          - "event-manager"
-          - "vm-superio"
-      firecracker:
+      dev-dependencies:
+        dependency-type: development
+      rust-updates:
         patterns:
           - "*"
-        exclude-patterns:
-          - "vmm-sys-util"
-          - "kvm-bindings"
-          - "kvm-ioctls"
-          - "vm-memory"
-          - "vhost"
-          - "linux-loader"
-          - "vm-allocator"
-          - "event-manager"
-          - "vm-superio"
-  - package-ecosystem: "rust-toolchain"
+        dependency-type: production
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: monthly
 
+  - package-ecosystem: gomod
+    directory: "/compat/firectl-harness"
+    schedule:
+      interval: monthly

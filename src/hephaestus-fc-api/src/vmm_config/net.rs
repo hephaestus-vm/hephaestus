@@ -1,4 +1,4 @@
-// upstream: src/vmm/src/vmm_config/net.rs (NetworkInterfaceConfig)
+// upstream: vendor/firecracker/vmm/src/vmm_config/net.rs (NetworkInterfaceConfig)
 //           src/vmm/src/utils/net/mac.rs (MacAddr)
 //
 // Kept: `NetworkInterfaceConfig` wire struct and a MAC parser with identical

@@ -243,11 +243,9 @@ fn parse_run_args(args: &mut impl Iterator<Item = String>) -> Result<RunOptions,
     Ok(opts)
 }
 
-fn require_value(
-    args: &mut impl Iterator<Item = String>,
-    flag: &str,
-) -> Result<String, String> {
-    args.next().ok_or_else(|| format!("missing value for {flag}"))
+fn require_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+    args.next()
+        .ok_or_else(|| format!("missing value for {flag}"))
 }
 
 fn run(opts: RunOptions) -> ExitCode {
@@ -273,7 +271,10 @@ fn run(opts: RunOptions) -> ExitCode {
         let octet = opts
             .ip_octet
             .unwrap_or_else(|| hephaestus_vmm::allocate_ip_octet(&opts.id));
-        eprintln!("hephaestus: guest IP 192.168.64.{octet}/24 (id={})", opts.id);
+        eprintln!(
+            "hephaestus: guest IP 192.168.64.{octet}/24 (id={})",
+            opts.id
+        );
     }
 
     let stdio = TerminalSink::default();
@@ -364,7 +365,10 @@ fn parse_rootfs_args(args: &mut impl Iterator<Item = String>) -> Result<RootfsOp
         return Err("missing --output".into());
     }
     if !opts.tar.exists() {
-        return Err(format!("--from-tar path does not exist: {}", opts.tar.display()));
+        return Err(format!(
+            "--from-tar path does not exist: {}",
+            opts.tar.display()
+        ));
     }
     Ok(opts)
 }
@@ -484,9 +488,21 @@ fn vz_boot_cmd(opts: VzBootOptions) -> ExitCode {
         opts.kernel.display(),
         opts.rootfs.display(),
         opts.log.display(),
-        if opts.cpus == 0 { "default".into() } else { opts.cpus.to_string() },
-        if opts.memory_mib == 0 { "default".into() } else { opts.memory_mib.to_string() },
-        if opts.run_seconds == 0 { "default".into() } else { opts.run_seconds.to_string() },
+        if opts.cpus == 0 {
+            "default".into()
+        } else {
+            opts.cpus.to_string()
+        },
+        if opts.memory_mib == 0 {
+            "default".into()
+        } else {
+            opts.memory_mib.to_string()
+        },
+        if opts.run_seconds == 0 {
+            "default".into()
+        } else {
+            opts.run_seconds.to_string()
+        },
     );
     let start = std::time::Instant::now();
     match vz_boot(
@@ -499,7 +515,10 @@ fn vz_boot_cmd(opts: VzBootOptions) -> ExitCode {
     ) {
         Ok(()) => {
             eprintln!("hephaestus: vz-boot completed in {:?}", start.elapsed());
-            eprintln!("hephaestus: inspect the guest serial log at {}", opts.log.display());
+            eprintln!(
+                "hephaestus: inspect the guest serial log at {}",
+                opts.log.display()
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -600,8 +619,16 @@ fn vz_exec_cmd(opts: VzExecOptions) -> ExitCode {
         "hephaestus: vz-exec cmd={:?} (initramfs={}, cpus={}, mem={} MiB)",
         opts.command,
         opts.initramfs.display(),
-        if opts.cpus == 0 { "default".into() } else { opts.cpus.to_string() },
-        if opts.memory_mib == 0 { "default".into() } else { opts.memory_mib.to_string() },
+        if opts.cpus == 0 {
+            "default".into()
+        } else {
+            opts.cpus.to_string()
+        },
+        if opts.memory_mib == 0 {
+            "default".into()
+        } else {
+            opts.memory_mib.to_string()
+        },
     );
     let start = std::time::Instant::now();
     match vz_exec(
@@ -741,7 +768,10 @@ struct PoolRunOptions {
 }
 
 fn parse_pool_run(args: &mut impl Iterator<Item = String>) -> Result<PoolRunOptions, String> {
-    let mut o = PoolRunOptions { dir: PathBuf::new(), command: String::new() };
+    let mut o = PoolRunOptions {
+        dir: PathBuf::new(),
+        command: String::new(),
+    };
     while let Some(a) = args.next() {
         match a.as_str() {
             "--dir" => o.dir = require_value(args, "--dir")?.into(),
@@ -785,7 +815,11 @@ fn pool_init_cmd(o: PoolInitOptions) -> ExitCode {
         flavor
     );
     let start = std::time::Instant::now();
-    let initramfs = if o.stock_init { None } else { Some(o.initramfs.as_path()) };
+    let initramfs = if o.stock_init {
+        None
+    } else {
+        Some(o.initramfs.as_path())
+    };
     match pool::Pool::init(pool::PoolInit {
         dir: &o.dir,
         kernel: &o.kernel,
@@ -823,7 +857,10 @@ fn pool_run_cmd(o: PoolRunOptions) -> ExitCode {
     let slot = match pool.try_claim_slot() {
         Ok(Some(slot)) => slot,
         Ok(None) => {
-            eprintln!("hephaestus: pool run: all {} slots are busy", pool.meta.slots);
+            eprintln!(
+                "hephaestus: pool run: all {} slots are busy",
+                pool.meta.slots
+            );
             // Exit code 75 is `EX_TEMPFAIL` from sysexits.h — a
             // well-known "transient failure, try again" signal.
             return ExitCode::from(75);
@@ -865,13 +902,22 @@ fn pool_stats_cmd(dir: &Path) -> ExitCode {
     match pool.stats() {
         Ok(slots) => {
             let busy = slots.iter().filter(|s| s.busy).count();
-            println!("pool: {}  total: {}  busy: {busy}  free: {}",
-                pool.dir.display(), pool.meta.slots, pool.meta.slots as usize - busy);
+            println!(
+                "pool: {}  total: {}  busy: {busy}  free: {}",
+                pool.dir.display(),
+                pool.meta.slots,
+                pool.meta.slots as usize - busy
+            );
             for s in slots {
-                println!("  slot-{}: {}{}",
+                println!(
+                    "  slot-{}: {}{}",
                     s.index,
                     if s.busy { "BUSY" } else { "free" },
-                    if s.has_rootfs { "  (lingering rootfs)" } else { "" }
+                    if s.has_rootfs {
+                        "  (lingering rootfs)"
+                    } else {
+                        ""
+                    }
                 );
             }
             ExitCode::SUCCESS

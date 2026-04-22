@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release binaries
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+        # build.rs in hephaestus-bridge runs scripts/link-and-sign.sh
+        # as the linker wrapper, so the ad-hoc signing + entitlement
+        # happen inside `cargo build` — nothing extra to do here.
+
+      - name: Package binaries
+        id: pkg
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          triple="aarch64-apple-darwin"
+          outdir="release/hephaestus-${tag}-${triple}"
+          mkdir -p "$outdir"
+          cp build/cargo_target/release/hephaestus "$outdir/"
+          cp build/cargo_target/release/hephaestus-firecracker "$outdir/"
+          cp LICENSE NOTICE README.md CHANGELOG.md "$outdir/"
+          tarball="hephaestus-${tag}-${triple}.tar.gz"
+          tar -czf "$tarball" -C release "hephaestus-${tag}-${triple}"
+          shasum -a 256 "$tarball" > "${tarball}.sha256"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "sha=${tarball}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # Extract the changelog section for this tag so the release
+          # body isn't empty. Grabs lines between `## [tag]` and the
+          # next `## ` header.
+          awk -v tag="$tag" '
+            $0 ~ "^## \\[" tag { flag=1; next }
+            flag && /^## / { exit }
+            flag
+          ' CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "Release notes for $tag not found in CHANGELOG.md" >&2
+            exit 1
+          fi
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes-file release_notes.md \
+            "${{ steps.pkg.outputs.tarball }}" \
+            "${{ steps.pkg.outputs.sha }}"

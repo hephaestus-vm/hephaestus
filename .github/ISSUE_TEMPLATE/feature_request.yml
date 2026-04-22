@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest something new or an enhancement to existing behavior
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: "What's the problem you're trying to solve?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: "If you have a concrete idea, describe it. Otherwise, leave blank and we'll iterate in the thread."
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: "What other approaches did you think about?"
+
+  - type: dropdown
+    id: help
+    attributes:
+      label: Are you willing to help implement this?
+      options:
+        - "Yes, happy to send a PR"
+        - "Yes, with guidance"
+        - "No, just requesting"
+    validations:
+      required: true

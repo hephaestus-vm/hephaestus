@@ -155,8 +155,12 @@ impl PoolMatchSpec {
     /// path that fails to canonicalize (missing file, permission denied)
     /// — the pool match will then just miss, which is the right outcome.
     pub fn canonicalize(mut self) -> Self {
-        if let Ok(p) = self.kernel.canonicalize() { self.kernel = p; }
-        if let Ok(p) = self.rootfs.canonicalize() { self.rootfs = p; }
+        if let Ok(p) = self.kernel.canonicalize() {
+            self.kernel = p;
+        }
+        if let Ok(p) = self.rootfs.canonicalize() {
+            self.rootfs = p;
+        }
         self
     }
 }
@@ -230,7 +234,11 @@ impl Pool {
         // VM was actually warmed with. Without this, the HTTP backend's
         // strict `(cpu, mem)` match check rejects every request from a
         // client that asked for the same defaults the user implied.
-        let cpus = if args.cpus == 0 { DEFAULT_CPUS } else { args.cpus };
+        let cpus = if args.cpus == 0 {
+            DEFAULT_CPUS
+        } else {
+            args.cpus
+        };
         let memory_mib = if args.memory_mib == 0 {
             DEFAULT_MEMORY_MIB
         } else {
@@ -249,7 +257,13 @@ impl Pool {
             PoolFlavor::Agent => {
                 let initramfs = args.initramfs.expect("checked above");
                 vz_exec_snapshot_save(
-                    args.kernel, initramfs, &pristine, &save, None, cpus, memory_mib,
+                    args.kernel,
+                    initramfs,
+                    &pristine,
+                    &save,
+                    None,
+                    cpus,
+                    memory_mib,
                 )
                 .map_err(PoolError::VmSave)?;
             }
@@ -276,8 +290,7 @@ impl Pool {
         for i in 0..args.slots {
             let slot = dir.join(format!("slot-{i}"));
             fs::create_dir(&slot).map_err(|e| PoolError::Io("create slot dir", e))?;
-            File::create(slot.join("lock"))
-                .map_err(|e| PoolError::Io("create slot lock", e))?;
+            File::create(slot.join("lock")).map_err(|e| PoolError::Io("create slot lock", e))?;
         }
 
         let meta = PoolMeta {
@@ -302,7 +315,9 @@ impl Pool {
 
     /// Load an existing pool from disk.
     pub fn open(dir: &Path) -> Result<Self, PoolError> {
-        let dir = dir.canonicalize().map_err(|e| PoolError::Io("canonicalize pool dir", e))?;
+        let dir = dir
+            .canonicalize()
+            .map_err(|e| PoolError::Io("canonicalize pool dir", e))?;
         let meta_path = dir.join("meta");
         if !meta_path.exists() {
             return Err(PoolError::NotAPool(dir));
@@ -389,7 +404,11 @@ impl Pool {
                 },
                 Err(e) => return Err(PoolError::Io("open slot lock for stats", e)),
             };
-            out.push(SlotState { index: i, busy, has_rootfs });
+            out.push(SlotState {
+                index: i,
+                busy,
+                has_rootfs,
+            });
         }
         Ok(out)
     }
@@ -443,7 +462,9 @@ impl Pool {
         // the slot returns to "ready" when the lock releases.
         let _ = fs::remove_file(&slot.rootfs);
 
-        result.map(|(code, _nanos)| code).map_err(PoolError::VmRestore)
+        result
+            .map(|(code, _nanos)| code)
+            .map_err(PoolError::VmRestore)
     }
 
     /// Restore the pool snapshot into a long-running [`VzVm`] handle and
@@ -465,13 +486,14 @@ impl Pool {
     ) -> Result<(VzVm, PoolRestoreBreakdown), PoolError> {
         let clone_start = std::time::Instant::now();
         clone_file(&self.meta.pristine, &slot.rootfs)?;
-        let clone_nanos = clone_start.elapsed().as_nanos() as u64;
+        let clone_nanos = u64::try_from(clone_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
         let result = match self.meta.flavor {
             PoolFlavor::Agent => {
-                let initramfs = self.meta.initramfs.as_deref().ok_or_else(|| {
-                    PoolError::BadMeta("Agent flavor missing initramfs".into())
-                })?;
+                let initramfs =
+                    self.meta.initramfs.as_deref().ok_or_else(|| {
+                        PoolError::BadMeta("Agent flavor missing initramfs".into())
+                    })?;
                 vz_pool_restore_long(
                     &self.meta.kernel,
                     initramfs,
@@ -753,7 +775,10 @@ mod tests {
         };
         meta.write(&d.join("meta")).unwrap();
         let body = fs::read_to_string(d.join("meta")).unwrap();
-        assert!(!body.contains("initramfs="), "stock-init meta must skip initramfs= line, got: {body}");
+        assert!(
+            !body.contains("initramfs="),
+            "stock-init meta must skip initramfs= line, got: {body}"
+        );
         let back = PoolMeta::read(&d.join("meta")).unwrap();
         assert_eq!(back.initramfs, None);
         assert_eq!(back.flavor, PoolFlavor::StockInit);
@@ -931,13 +956,17 @@ memory_mib=128
         let pool = make_fake_pool(&d, 1);
         let base = spec_for(&pool);
 
-        let mut s = base.clone(); s.kernel = PathBuf::from("/different/kernel");
+        let mut s = base.clone();
+        s.kernel = PathBuf::from("/different/kernel");
         assert!(!pool.matches(&s), "kernel mismatch should miss");
-        let mut s = base.clone(); s.rootfs = PathBuf::from("/different/rootfs");
+        let mut s = base.clone();
+        s.rootfs = PathBuf::from("/different/rootfs");
         assert!(!pool.matches(&s), "rootfs mismatch should miss");
-        let mut s = base.clone(); s.vcpu_count = pool.meta.cpus + 1;
+        let mut s = base.clone();
+        s.vcpu_count = pool.meta.cpus + 1;
         assert!(!pool.matches(&s), "vcpu mismatch should miss");
-        let mut s = base.clone(); s.memory_mib = pool.meta.memory_mib + 1;
+        let mut s = base.clone();
+        s.memory_mib = pool.meta.memory_mib + 1;
         assert!(!pool.matches(&s), "memory mismatch should miss");
         fs::remove_dir_all(&d).unwrap();
     }
@@ -973,8 +1002,10 @@ memory_mib=128
         fs::write(&claim.rootfs, b"pretend this is an ext4").unwrap();
         assert!(claim.rootfs.exists());
         drop(claim);
-        assert!(!pool.dir.join("slot-0/rootfs.ext4").exists(),
-            "ClaimedSlot::drop should remove the rootfs clone");
+        assert!(
+            !pool.dir.join("slot-0/rootfs.ext4").exists(),
+            "ClaimedSlot::drop should remove the rootfs clone"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 }

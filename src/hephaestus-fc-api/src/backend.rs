@@ -53,28 +53,17 @@ pub trait VmmBackend {
     fn instance_info(&self) -> InstanceInfo;
 
     /// `PUT /boot-source`
-    fn configure_boot_source(
-        &mut self,
-        cfg: BootSourceConfig,
-    ) -> Result<(), VmmBackendError>;
+    fn configure_boot_source(&mut self, cfg: BootSourceConfig) -> Result<(), VmmBackendError>;
 
     /// `PUT /drives/{id}`
-    fn insert_block_device(
-        &mut self,
-        cfg: BlockDeviceConfig,
-    ) -> Result<(), VmmBackendError>;
+    fn insert_block_device(&mut self, cfg: BlockDeviceConfig) -> Result<(), VmmBackendError>;
 
     /// `PATCH /drives/{id}`
-    fn update_block_device(
-        &mut self,
-        cfg: BlockDeviceUpdateConfig,
-    ) -> Result<(), VmmBackendError>;
+    fn update_block_device(&mut self, cfg: BlockDeviceUpdateConfig) -> Result<(), VmmBackendError>;
 
     /// `PUT /network-interfaces/{id}`
-    fn insert_network_device(
-        &mut self,
-        cfg: NetworkInterfaceConfig,
-    ) -> Result<(), VmmBackendError>;
+    fn insert_network_device(&mut self, cfg: NetworkInterfaceConfig)
+    -> Result<(), VmmBackendError>;
 
     /// `PATCH /network-interfaces/{id}`. Upstream uses this primarily for
     /// rate-limiter updates; macOS VZ doesn't enforce rate limits, so the
@@ -106,16 +95,10 @@ pub trait VmmBackend {
     fn get_machine_config(&self) -> MachineConfig;
 
     /// `PUT /machine-config`
-    fn put_machine_config(
-        &mut self,
-        cfg: MachineConfig,
-    ) -> Result<(), VmmBackendError>;
+    fn put_machine_config(&mut self, cfg: MachineConfig) -> Result<(), VmmBackendError>;
 
     /// `PATCH /machine-config`
-    fn patch_machine_config(
-        &mut self,
-        update: MachineConfigUpdate,
-    ) -> Result<(), VmmBackendError>;
+    fn patch_machine_config(&mut self, update: MachineConfigUpdate) -> Result<(), VmmBackendError>;
 
     /// `PUT /actions` with `InstanceStart` — boot the microVM.
     fn start_micro_vm(&mut self) -> Result<(), VmmBackendError>;
@@ -133,10 +116,7 @@ pub trait VmmBackend {
     /// `PUT /snapshot/create`. Per Firecracker semantics the VM must be
     /// `Paused` before calling. Default impl is `NotSupported` so
     /// backends opt in.
-    fn create_snapshot(
-        &mut self,
-        _params: CreateSnapshotParams,
-    ) -> Result<(), VmmBackendError> {
+    fn create_snapshot(&mut self, _params: CreateSnapshotParams) -> Result<(), VmmBackendError> {
         Err(VmmBackendError::NotSupported("snapshot/create".into()))
     }
 
@@ -144,10 +124,7 @@ pub trait VmmBackend {
     /// after `load_snapshot` returns Ok, the VM is either `Running` or
     /// `Paused` depending on `params.resume_vm`. Backend should reject
     /// if pre-boot config (kernel, rootfs, vcpu, mem) hasn't been set.
-    fn load_snapshot(
-        &mut self,
-        _params: LoadSnapshotConfig,
-    ) -> Result<(), VmmBackendError> {
+    fn load_snapshot(&mut self, _params: LoadSnapshotConfig) -> Result<(), VmmBackendError> {
         Err(VmmBackendError::NotSupported("snapshot/load".into()))
     }
 }

@@ -1,4 +1,4 @@
-// upstream: src/vmm/src/vmm_config/boot_source.rs
+// upstream: vendor/firecracker/vmm/src/vmm_config/boot_source.rs
 //
 // Kept: `DEFAULT_KERNEL_CMDLINE`, `BootSourceConfig` (wire struct),
 // `BootSourceConfigError` (wire error variants relevant to the HTTP API).

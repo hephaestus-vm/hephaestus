@@ -1,7 +1,7 @@
 //! Firecracker HTTP API wire types and backend trait.
 //!
 //! This crate holds the pure-serde data types that make up the Firecracker
-//! HTTP API surface, copied from upstream `src/vmm/src/vmm_config/*` so the
+//! HTTP API surface, copied from upstream `vendor/firecracker/vmm/src/vmm_config/*` so the
 //! macOS port can consume them without the Linux-only VMM tree (`kvm-*`,
 //! `vhost`, `memfd`, `userfaultfd`, `micro_http`'s epoll server loop, etc).
 //!
@@ -19,13 +19,15 @@
 
 pub mod backend;
 /// Wire structs for the Firecracker HTTP API, copied from upstream
-/// `src/vmm/src/vmm_config/*`. See the note at the top of each submodule
+/// `vendor/firecracker/vmm/src/vmm_config/*`. See the note at the top of each submodule
 /// for a pointer back to the upstream file.
 pub mod vmm_config;
 
 pub use backend::{VmmBackend, VmmBackendError};
 pub use vmm_config::boot_source::{BootSourceConfig, DEFAULT_KERNEL_CMDLINE};
-pub use vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, CacheType, FileEngineType};
+pub use vmm_config::drive::{
+    BlockDeviceConfig, BlockDeviceUpdateConfig, CacheType, FileEngineType,
+};
 pub use vmm_config::instance_info::{InstanceInfo, VmState};
 pub use vmm_config::logger::LoggerConfig;
 pub use vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};

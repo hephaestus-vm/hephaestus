@@ -64,12 +64,10 @@ async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Respon
             Ok(cfg) => to_response(backend.lock().await.put_machine_config(cfg)),
             Err(resp) => resp,
         },
-        (Method::PATCH, "/machine-config") => {
-            match parse_body::<MachineConfigUpdate>(req).await {
-                Ok(update) => to_response(backend.lock().await.patch_machine_config(update)),
-                Err(resp) => resp,
-            }
-        }
+        (Method::PATCH, "/machine-config") => match parse_body::<MachineConfigUpdate>(req).await {
+            Ok(update) => to_response(backend.lock().await.patch_machine_config(update)),
+            Err(resp) => resp,
+        },
         (Method::PUT, "/boot-source") => match parse_body::<BootSourceConfig>(req).await {
             Ok(cfg) => to_response(backend.lock().await.configure_boot_source(cfg)),
             Err(resp) => resp,

@@ -1,4 +1,4 @@
-// upstream: src/vmm/src/vmm_config/instance_info.rs
+// upstream: vendor/firecracker/vmm/src/vmm_config/instance_info.rs
 //
 // Copied verbatim. Pure serde, no Linux deps.
 

@@ -1,4 +1,4 @@
-// upstream: src/vmm/src/vmm_config/machine_config.rs
+// upstream: vendor/firecracker/vmm/src/vmm_config/machine_config.rs
 //
 // Kept: `MachineConfig` and `MachineConfigUpdate` wire structs. Dropped:
 // `HugePageConfig::mmap_flags` (uses `libc::MAP_HUGETLB`, Linux-only) and

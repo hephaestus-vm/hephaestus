@@ -1,4 +1,4 @@
-// upstream: src/vmm/src/vmm_config/snapshot.rs (`Vm` + `VmState`)
+// upstream: vendor/firecracker/vmm/src/vmm_config/snapshot.rs (`Vm` + `VmState`)
 //
 // PATCH /vm body: `{"state": "Paused"}` / `{"state": "Resumed"}`. Renamed
 // the Rust types to `UpdatedVm` + `VmUpdatedState` to avoid a collision

@@ -1,4 +1,4 @@
-// upstream: src/vmm/src/vmm_config/metrics.rs
+// upstream: vendor/firecracker/vmm/src/vmm_config/metrics.rs
 //
 // Wire shape only. Upstream's `Metrics::init` opens the path and starts a
 // periodic flush loop publishing ~30 fields of KVM/vhost/vsock counters;

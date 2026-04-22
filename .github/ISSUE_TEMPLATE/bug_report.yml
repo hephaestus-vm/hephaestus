@@ -1,0 +1,67 @@
+name: Bug report
+description: Something isn't working as documented
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: hephaestus version / commit
+      description: "Output of `hephaestus --version` or the commit SHA you're running against."
+      placeholder: "v0.3.0-alpha.1 (or 97be8cb)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: macos
+    attributes:
+      label: macOS version
+      options:
+        - "26 (Tahoe)"
+        - "27"
+        - "other — please note in the repro"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: binary
+    attributes:
+      label: Which binary?
+      options:
+        - "hephaestus (CLI)"
+        - "hephaestus-firecracker (HTTP daemon)"
+        - "both"
+        - "compat harness"
+        - "build tooling only"
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproducer
+      description: "Minimal steps that reproduce the issue — commands, socket requests, and any fixtures needed."
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: "Include relevant logs, stderr output, or HTTP responses."
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional notes
+      description: "Anything else you think is relevant."

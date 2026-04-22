@@ -97,10 +97,7 @@ impl VmmBackend for VzBackend {
         }
     }
 
-    fn configure_boot_source(
-        &mut self,
-        cfg: BootSourceConfig,
-    ) -> Result<(), VmmBackendError> {
+    fn configure_boot_source(&mut self, cfg: BootSourceConfig) -> Result<(), VmmBackendError> {
         self.require_preboot()?;
         if !std::path::Path::new(&cfg.kernel_image_path).exists() {
             return Err(VmmBackendError::InvalidConfig(format!(
@@ -112,10 +109,7 @@ impl VmmBackend for VzBackend {
         Ok(())
     }
 
-    fn insert_block_device(
-        &mut self,
-        cfg: BlockDeviceConfig,
-    ) -> Result<(), VmmBackendError> {
+    fn insert_block_device(&mut self, cfg: BlockDeviceConfig) -> Result<(), VmmBackendError> {
         self.require_preboot()?;
         if !cfg.is_root_device {
             return Err(VmmBackendError::NotSupported(
@@ -136,10 +130,7 @@ impl VmmBackend for VzBackend {
         Ok(())
     }
 
-    fn update_block_device(
-        &mut self,
-        cfg: BlockDeviceUpdateConfig,
-    ) -> Result<(), VmmBackendError> {
+    fn update_block_device(&mut self, cfg: BlockDeviceUpdateConfig) -> Result<(), VmmBackendError> {
         // Pre-boot-only because VZ doesn't support hot-swapping a
         // block-device attachment the way virtio-blk + io_uring does on
         // Linux. Clients that rely on post-boot patch will need to stop
@@ -199,7 +190,8 @@ impl VmmBackend for VzBackend {
         // Same shape as configure_logger: open the file, write a single
         // structured init line, return. Real periodic-flush plumbing is
         // deferred (most upstream metrics fields don't map to macOS).
-        let line = "{\"timestamp\":\"init\",\"event\":\"hephaestus-firecracker metrics configured\"}\n";
+        let line =
+            "{\"timestamp\":\"init\",\"event\":\"hephaestus-firecracker metrics configured\"}\n";
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -233,10 +225,7 @@ impl VmmBackend for VzBackend {
         Ok(())
     }
 
-    fn patch_machine_config(
-        &mut self,
-        update: MachineConfigUpdate,
-    ) -> Result<(), VmmBackendError> {
+    fn patch_machine_config(&mut self, update: MachineConfigUpdate) -> Result<(), VmmBackendError> {
         self.require_preboot()?;
         if update.is_empty() {
             return Err(VmmBackendError::InvalidConfig(
@@ -268,12 +257,14 @@ impl VmmBackend for VzBackend {
     fn start_micro_vm(&mut self) -> Result<(), VmmBackendError> {
         self.require_preboot()?;
 
-        let boot = self.boot_source.as_ref().ok_or_else(|| {
-            VmmBackendError::InvalidState("boot-source not configured".into())
-        })?;
-        let rootfs = self.root_drive.clone().ok_or_else(|| {
-            VmmBackendError::InvalidState("root drive not configured".into())
-        })?;
+        let boot = self
+            .boot_source
+            .as_ref()
+            .ok_or_else(|| VmmBackendError::InvalidState("boot-source not configured".into()))?;
+        let rootfs = self
+            .root_drive
+            .clone()
+            .ok_or_else(|| VmmBackendError::InvalidState("root drive not configured".into()))?;
         let kernel = PathBuf::from(&boot.kernel_image_path);
         let boot_args = boot
             .boot_args
@@ -332,9 +323,7 @@ impl VmmBackend for VzBackend {
                     // Either config mismatch or all slots busy — cold-boot.
                 }
                 Err(err) => {
-                    eprintln!(
-                        "hephaestus-firecracker: pool claim error ({err}); cold-booting"
-                    );
+                    eprintln!("hephaestus-firecracker: pool claim error ({err}); cold-booting");
                 }
             }
         }
@@ -357,10 +346,7 @@ impl VmmBackend for VzBackend {
         Ok(())
     }
 
-    fn create_snapshot(
-        &mut self,
-        params: CreateSnapshotParams,
-    ) -> Result<(), VmmBackendError> {
+    fn create_snapshot(&mut self, params: CreateSnapshotParams) -> Result<(), VmmBackendError> {
         if !matches!(self.state, VmState::Paused) {
             return Err(VmmBackendError::InvalidState(
                 "snapshot/create requires the VM to be Paused (PATCH /vm first)".into(),
@@ -383,15 +369,14 @@ impl VmmBackend for VzBackend {
                 ));
             }
             None => {
-                return Err(VmmBackendError::InvalidState(
-                    "no VM running".into(),
-                ));
+                return Err(VmmBackendError::InvalidState("no VM running".into()));
             }
         }
 
-        let vm = self.vm.as_ref().ok_or_else(|| {
-            VmmBackendError::Internal("Paused state without a VM handle".into())
-        })?;
+        let vm = self
+            .vm
+            .as_ref()
+            .ok_or_else(|| VmmBackendError::Internal("Paused state without a VM handle".into()))?;
         vm.save_state(&params.snapshot_path)
             .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
 
@@ -413,10 +398,7 @@ impl VmmBackend for VzBackend {
         Ok(())
     }
 
-    fn load_snapshot(
-        &mut self,
-        params: LoadSnapshotConfig,
-    ) -> Result<(), VmmBackendError> {
+    fn load_snapshot(&mut self, params: LoadSnapshotConfig) -> Result<(), VmmBackendError> {
         self.require_preboot()?;
 
         if params.enable_diff_snapshots || params.track_dirty_pages {
@@ -424,23 +406,19 @@ impl VmmBackend for VzBackend {
                 "diff/dirty-page tracking (VZ has no equivalent)".into(),
             ));
         }
-        if let Some(backend) = params.mem_backend.as_ref() {
-            if !matches!(backend.backend_type, MemBackendType::File) {
-                return Err(VmmBackendError::NotSupported(
-                    "mem_backend.backend_type=Uffd (Linux-only)".into(),
-                ));
-            }
+        if let Some(backend) = params.mem_backend.as_ref()
+            && !matches!(backend.backend_type, MemBackendType::File)
+        {
+            return Err(VmmBackendError::NotSupported(
+                "mem_backend.backend_type=Uffd (Linux-only)".into(),
+            ));
         }
 
         let boot = self.boot_source.as_ref().ok_or_else(|| {
-            VmmBackendError::InvalidState(
-                "snapshot/load requires PUT /boot-source first".into(),
-            )
+            VmmBackendError::InvalidState("snapshot/load requires PUT /boot-source first".into())
         })?;
         let rootfs = self.root_drive.clone().ok_or_else(|| {
-            VmmBackendError::InvalidState(
-                "snapshot/load requires PUT /drives/{id} first".into(),
-            )
+            VmmBackendError::InvalidState("snapshot/load requires PUT /drives/{id} first".into())
         })?;
         let kernel = PathBuf::from(&boot.kernel_image_path);
         let boot_args = boot
@@ -502,9 +480,10 @@ impl VmmBackend for VzBackend {
                 ));
             }
         }
-        let vm = self.vm.as_ref().ok_or_else(|| {
-            VmmBackendError::Internal("running state without a VM handle".into())
-        })?;
+        let vm = self
+            .vm
+            .as_ref()
+            .ok_or_else(|| VmmBackendError::Internal("running state without a VM handle".into()))?;
         vm.pause()
             .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
         self.state = VmState::Paused;
@@ -521,9 +500,10 @@ impl VmmBackend for VzBackend {
                 ));
             }
         }
-        let vm = self.vm.as_ref().ok_or_else(|| {
-            VmmBackendError::Internal("paused state without a VM handle".into())
-        })?;
+        let vm = self
+            .vm
+            .as_ref()
+            .ok_or_else(|| VmmBackendError::Internal("paused state without a VM handle".into()))?;
         vm.resume()
             .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
         self.state = VmState::Running;

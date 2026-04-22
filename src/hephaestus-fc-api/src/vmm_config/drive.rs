@@ -1,4 +1,4 @@
-// upstream: src/vmm/src/vmm_config/drive.rs (BlockDeviceConfig only)
+// upstream: vendor/firecracker/vmm/src/vmm_config/drive.rs (BlockDeviceConfig only)
 //           src/vmm/src/devices/virtio/block/mod.rs (CacheType)
 //           src/vmm/src/devices/virtio/block/virtio/device.rs (FileEngineType)
 //

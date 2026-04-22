@@ -38,7 +38,10 @@ fn main() {
     }
 
     // Re-run if any Swift source or manifest changes.
-    println!("cargo:rerun-if-changed={}", swift_pkg.join("Package.swift").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        swift_pkg.join("Package.swift").display()
+    );
     rerun_for_dir(&swift_pkg.join("Sources"));
 
     // Build the Swift package via xcrun so we pick the Xcode toolchain whose
@@ -123,7 +126,10 @@ fn main() {
     // Swift object; without them linking fails on
     // `__swift_FORCE_LOAD_$_swiftCompatibility56` and friends.
     if let Some(toolchain_lib_dir) = xcode_swift_static_lib_dir() {
-        println!("cargo:rustc-link-search=native={}", toolchain_lib_dir.display());
+        println!(
+            "cargo:rustc-link-search=native={}",
+            toolchain_lib_dir.display()
+        );
         for lib in [
             "swiftCompatibility50",
             "swiftCompatibility51",
@@ -135,7 +141,9 @@ fn main() {
             println!("cargo:rustc-link-lib=static={lib}");
         }
     } else {
-        println!("cargo:warning=hephaestus-bridge: Xcode toolchain not found via xcode-select -p; Swift compatibility shims may fail to link");
+        println!(
+            "cargo:warning=hephaestus-bridge: Xcode toolchain not found via xcode-select -p; Swift compatibility shims may fail to link"
+        );
     }
 }
 
