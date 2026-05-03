@@ -1,4 +1,4 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 6.2
 // HephaestusBridge: Swift FFI shim between the Rust hephaestus-bridge crate
 // and Apple's containerization framework.
 //

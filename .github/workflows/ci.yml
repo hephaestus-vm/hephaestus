@@ -22,6 +22,11 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      # Apple's containerization 0.30.1 requires swift-tools-version 6.2, which
+      # ships in Xcode 26+. macos-15 runners default to Xcode 16 (Swift 6.1).
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
       - uses: dtolnay/rust-toolchain@stable
       # rust-toolchain.toml pins channel = "1.94", which rustup resolves to a
       # different toolchain alias than whatever stable patch the action installs.
@@ -36,6 +41,9 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
@@ -45,6 +53,9 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # build.rs in hephaestus-bridge runs `xcrun swift build` as part
