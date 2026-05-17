@@ -111,27 +111,84 @@ if [[ ! -S "$vsock" ]]; then
 fi
 
 python3 - "$vsock" <<'PY'
-import socket, struct, sys, time
+import socket, struct, sys, threading, time
 path = sys.argv[1]
-cmd = b"__hephaestus_test_mmds_vsock i-hephaestus-vsock-e2e"
+echo_port = 2345
+echo_token = b"hephaestus-generic-vsock-echo"
+cmd = f"__hephaestus_test_vsock_suite i-hephaestus-vsock-e2e {echo_port} {echo_token.decode()}".encode()
+
+def connect_with_retry(port):
+    last = None
+    for _ in range(160):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(path)
+            s.sendall(f"CONNECT {port}\n".encode())
+            s.settimeout(0.05)
+            try:
+                data = s.recv(4, socket.MSG_PEEK)
+                if data.startswith(b"ERR "):
+                    raise RuntimeError(s.recv(256))
+            except TimeoutError:
+                pass
+            finally:
+                s.settimeout(None)
+            return s
+        except Exception as exc:
+            last = exc
+            time.sleep(0.25)
+    raise RuntimeError(f"could not connect to guest port {port}: {last}")
+
+def echo_client(result):
+    last = None
+    for _ in range(80):
+        try:
+            s = connect_with_retry(echo_port)
+            s.sendall(echo_token)
+            data = b""
+            while len(data) < len(echo_token):
+                chunk = s.recv(len(echo_token) - len(data))
+                if not chunk:
+                    raise RuntimeError("short echo read")
+                data += chunk
+            if data.startswith(b"ERR "):
+                raise RuntimeError(data + s.recv(256))
+            if data != echo_token:
+                raise RuntimeError(f"echo mismatch: {data!r}")
+            result.append(None)
+            return
+        except Exception as exc:
+            last = exc
+            time.sleep(0.25)
+    result.append(last)
+
 last = None
 for _ in range(80):
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect(path)
-        s.sendall(b"CONNECT 1234\n" + struct.pack("<I", len(cmd)) + cmd)
+        command = connect_with_retry(1234)
+        command.sendall(struct.pack("<I", len(cmd)) + cmd)
+        echo_result = []
+        echo_thread = threading.Thread(target=echo_client, args=(echo_result,))
+        echo_thread.start()
+
         data = b""
         while len(data) < 4:
-            chunk = s.recv(4 - len(data))
+            chunk = command.recv(4 - len(data))
             if not chunk:
                 raise RuntimeError("short exit-code read")
             data += chunk
         if data.startswith(b"ERR "):
-            raise RuntimeError(data + s.recv(256))
+            raise RuntimeError(data + command.recv(256))
         code = struct.unpack("<i", data)[0]
+        echo_thread.join(timeout=10)
+        if echo_thread.is_alive():
+            raise RuntimeError("generic echo test timed out")
+        if echo_result and echo_result[0] is not None:
+            raise echo_result[0]
         if code != 0:
-            raise RuntimeError(f"guest MMDS vsock test exited {code}")
+            raise RuntimeError(f"guest vsock suite exited {code}")
         print("guest MMDS vsock test exited 0")
+        print("generic guest-port vsock echo test exited 0")
         raise SystemExit(0)
     except Exception as exc:
         last = exc

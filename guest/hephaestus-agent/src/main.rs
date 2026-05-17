@@ -205,6 +205,12 @@ fn run_command(cmd: &str) -> AgentResult<i32> {
             Ok(1)
         });
     }
+    if let Some(args) = cmd.strip_prefix("__hephaestus_test_vsock_suite ") {
+        return test_vsock_suite(args).map(|()| 0).or_else(|err| {
+            eprintln!("hephaestus-agent: vsock suite failed: {err}");
+            Ok(1)
+        });
+    }
 
     let sh = CString::new("/bin/sh").unwrap();
     let flag = CString::new("-c").unwrap();
@@ -255,6 +261,53 @@ fn test_mmds_vsock(needle: &str) -> AgentResult<()> {
         ));
     }
     eprintln!("hephaestus-agent: mmds-vsock test matched {needle:?}");
+    Ok(())
+}
+
+fn test_vsock_suite(args: &str) -> AgentResult<()> {
+    let mut parts = args.splitn(3, ' ');
+    let needle = parts
+        .next()
+        .ok_or_else(|| "missing MMDS response needle".to_string())?;
+    let echo_port = parts
+        .next()
+        .ok_or_else(|| "missing echo port".to_string())?
+        .parse::<u32>()
+        .map_err(|e| format!("invalid echo port: {e}"))?;
+    let token = parts
+        .next()
+        .ok_or_else(|| "missing echo token".to_string())?
+        .as_bytes()
+        .to_vec();
+
+    test_mmds_vsock(needle)?;
+    test_vsock_echo(echo_port, &token)?;
+    Ok(())
+}
+
+fn test_vsock_echo(port: u32, expected: &[u8]) -> AgentResult<()> {
+    let listen_fd = vsock_listen(port)?;
+    eprintln!("hephaestus-agent: generic echo listening on vsock port {port}");
+    let conn_raw = accept(listen_fd.as_raw_fd()).map_err(|e| format!("echo accept: {e}"))?;
+    // SAFETY: `accept` returns a freshly-allocated fd we own exclusively.
+    let mut stream = unsafe { UnixStream::from_raw_fd(conn_raw) };
+    let mut payload = vec![0u8; expected.len()];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|e| format!("echo payload read: {e}"))?;
+    if payload != expected {
+        return Err(format!(
+            "echo payload mismatch: got {payload:?}, expected {expected:?}"
+        ));
+    }
+    stream
+        .write_all(&payload)
+        .map_err(|e| format!("echo payload write: {e}"))?;
+    stream.flush().map_err(|e| format!("echo flush: {e}"))?;
+    eprintln!(
+        "hephaestus-agent: generic echo matched {} bytes on vsock port {port}",
+        payload.len()
+    );
     Ok(())
 }
 

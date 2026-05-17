@@ -164,7 +164,8 @@ migration between hephaestus processes).
   Firecracker's `CONNECT <guest_port>\n` line, then the stream is bridged to
   `VZVirtioSocketDevice.connect(toPort:)`. Port 1234 remains reserved for
   hephaestus-agent by convention. Config-only CI validates the wire shape;
-  full data-path validation needs a guest vsock server.
+  `just fc-compat-vsock-e2e` validates both the agent/MMDS path and a generic
+  guest-port echo server.
 - **`PUT /balloon`, `PATCH /balloon`, `GET /balloon`,
   `GET/PATCH /balloon/statistics`, `PATCH /balloon/hinting/start`,
   `GET /balloon/hinting/status`, `PATCH /balloon/hinting/stop`** —
@@ -207,5 +208,6 @@ wire-shape drift without booting a VM. The booting variants require real
 apple/container kernel + rootfs artifacts and remain local/e2e smokes.
 `fc-compat-vsock-e2e` is headless but boots a real VM: it configures MMDS,
 configures `PUT /vsock`, reaches the guest agent through Firecracker's UDS
-`CONNECT 1234` bridge, and asks the agent to fetch MMDS from guest vsock port
-`16992`.
+`CONNECT 1234` bridge, asks the agent to fetch MMDS from guest vsock port
+`16992`, and validates a generic guest-port echo exchange over the same UDS
+bridge.
