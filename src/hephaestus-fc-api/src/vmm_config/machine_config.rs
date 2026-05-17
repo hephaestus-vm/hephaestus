@@ -5,7 +5,9 @@
 // the `cpu_template` field's strongly-typed `CpuTemplateType` — that enum
 // lives in the Linux VMM's `cpu_config::templates` module. We accept the
 // field on the wire as an opaque `serde_json::Value` so clients still pass
-// `deny_unknown_fields` parsing; the backend ignores it and logs a warning.
+// `deny_unknown_fields` parsing; the backend rejects non-empty values with
+// `NotSupported` because Apple Silicon CPU feature templates are not
+// configurable through VZ.
 
 use std::fmt::Debug;
 
@@ -60,7 +62,7 @@ pub struct MachineConfig {
     #[serde(default)]
     pub smt: bool,
     /// A CPU template that it is used to filter the CPU features exposed to the guest.
-    /// Opaque on macOS — accepted for wire-compat, not honored by the backend.
+    /// Opaque on macOS — accepted for wire-compat parsing, then rejected by the backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_template: Option<Value>,
     /// Enables or disables dirty page tracking. Enabling allows incremental snapshots.
@@ -100,6 +102,7 @@ pub struct MachineConfigUpdate {
     #[serde(default)]
     pub smt: Option<bool>,
     /// A CPU template that it is used to filter the CPU features exposed to the guest.
+    /// Opaque on macOS — accepted for wire-compat parsing, then rejected by the backend.
     #[serde(default)]
     pub cpu_template: Option<Value>,
     /// Enables or disables dirty page tracking. Enabling allows incremental snapshots.

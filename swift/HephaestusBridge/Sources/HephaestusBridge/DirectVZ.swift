@@ -1071,6 +1071,51 @@ private final class ConnectionResultBox: @unchecked Sendable {
     var result: Result<VZVirtioSocketConnection, Error>?
 }
 
+private final class MmdsSocketService: NSObject, VZVirtioSocketListenerDelegate, @unchecked Sendable {
+    let listener = VZVirtioSocketListener()
+    let body: Data
+    private var connections: [VZVirtioSocketConnection] = []
+    private let lock = NSLock()
+
+    init(json: Data) {
+        self.body = json
+        super.init()
+        listener.delegate = self
+    }
+
+    func listener(
+        _ listener: VZVirtioSocketListener,
+        shouldAcceptNewConnection connection: VZVirtioSocketConnection,
+        from socketDevice: VZVirtioSocketDevice
+    ) -> Bool {
+        lock.lock()
+        connections.append(connection)
+        lock.unlock()
+        let fd = connection.fileDescriptor
+        let responseBody = body
+        DispatchQueue.global(qos: .utility).async { [weak self, weak connection] in
+            var scratch = [UInt8](repeating: 0, count: 4096)
+            _ = scratch.withUnsafeMutableBufferPointer { buf in
+                read(fd, buf.baseAddress, buf.count)
+            }
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(responseBody.count)\r\nConnection: close\r\n\r\n"
+            _ = header.withCString { ptr in write(fd, ptr, strlen(ptr)) }
+            responseBody.withUnsafeBytes { raw in
+                if let base = raw.baseAddress {
+                    _ = write(fd, base, raw.count)
+                }
+            }
+            connection?.close()
+            self?.lock.lock()
+            if let c = connection {
+                self?.connections.removeAll { $0 === c }
+            }
+            self?.lock.unlock()
+        }
+        return true
+    }
+}
+
 private func writeAll(fd: Int32, bytes: UnsafeRawBufferPointer) throws {
     var remaining = bytes.count
     var offset = 0
@@ -1128,6 +1173,7 @@ private final class VzVmHandle: @unchecked Sendable {
     let config: VZVirtualMachineConfiguration
     let logURL: URL
     let machineIdURL: URL
+    var socketListeners: [AnyObject] = []
 
     init(
         queue: DispatchQueue,
@@ -1192,6 +1238,7 @@ private func buildLongRunningConfig(
     config.serialPorts = [serial]
 
     config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+    config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
 
     try config.validate()
     if #available(macOS 14.0, *) {
@@ -1311,6 +1358,96 @@ public func hb_vz_long_resume(
         return Status.ok
     } catch {
         writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+}
+
+@_cdecl("hb_vz_long_serve_mmds")
+public func hb_vz_long_serve_mmds(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    port: UInt32,
+    json: UnsafePointer<UInt8>?,
+    jsonLen: Int,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let vm, let json else {
+        writeError(outErr, "null vm/json")
+        return Status.invalidArgument
+    }
+    let handle = Unmanaged<VzVmHandle>.fromOpaque(UnsafeRawPointer(vm)).takeUnretainedValue()
+    let data = Data(bytes: json, count: jsonLen)
+    let sem = DispatchSemaphore(value: 0)
+    let resultBox = ErrorBox()
+    handle.queue.async {
+        guard let vz = handle.holder.vm,
+              let socketDevice = vz.socketDevices.first as? VZVirtioSocketDevice
+        else {
+            resultBox.value = VsockError.noSocketDevice
+            sem.signal()
+            return
+        }
+        let service = MmdsSocketService(json: data)
+        socketDevice.setSocketListener(service.listener, forPort: port)
+        handle.socketListeners.append(service)
+        sem.signal()
+    }
+    sem.wait()
+    if let error = resultBox.value {
+        writeError(outErr, "\(error)")
+        return Status.swiftError
+    }
+    return Status.ok
+}
+
+@_cdecl("hb_vz_long_connect")
+public func hb_vz_long_connect(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    port: UInt32,
+    outFd: UnsafeMutablePointer<Int32>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let vm, let outFd else {
+        writeError(outErr, "null vm/outFd")
+        return Status.invalidArgument
+    }
+    let handle = Unmanaged<VzVmHandle>.fromOpaque(UnsafeRawPointer(vm)).takeUnretainedValue()
+    let sem = DispatchSemaphore(value: 0)
+    let resultBox = ConnectionResultBox()
+    handle.queue.async {
+        guard let vz = handle.holder.vm,
+              let socketDevice = vz.socketDevices.first as? VZVirtioSocketDevice
+        else {
+            resultBox.result = .failure(VsockError.noSocketDevice)
+            sem.signal()
+            return
+        }
+        socketDevice.connect(toPort: port) { result in
+            switch result {
+            case .success(let conn):
+                resultBox.result = .success(conn)
+            case .failure(let err):
+                resultBox.result = .failure(VsockError.connect(err))
+            }
+            sem.signal()
+        }
+    }
+    sem.wait()
+    do {
+        let conn: VZVirtioSocketConnection
+        switch resultBox.result {
+        case .success(let c): conn = c
+        case .failure(let err): throw err
+        case nil: throw VsockError.noSocketDevice
+        }
+        let fd = dup(conn.fileDescriptor)
+        conn.close()
+        if fd < 0 {
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
+        outFd.pointee = fd
+        return Status.ok
+    } catch {
+        writeError(outErr, "\(error)")
         return Status.swiftError
     }
 }

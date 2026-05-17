@@ -62,8 +62,17 @@ jobs:
       # of cargo build; a successful cargo build means swift built too.
       - run: cargo build --workspace
 
-  # TODO: fc-compat job. The firectl-harness currently requires real
-  # kernel + rootfs artifacts that aren't easily provisioned on GHA
-  # runners; tracked as a Phase F task in the public-push plan
-  # (make the harness work with dummy files so wire-shape drift is
-  # caught on every PR).
+  fc-compat-config:
+    name: Firecracker API config-only compat
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: compat/firectl-harness/go.mod
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/fc-compat-config-only.sh

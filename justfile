@@ -234,13 +234,22 @@ rootfs-build tar out size='512': build
 fc-harness-build:
     cd compat/firectl-harness && go build -o firectl-harness .
 
+# CI-safe config-only compat smoke. Creates dummy kernel/rootfs files and
+# passes -skip-boot, so it catches Firecracker API wire-shape drift without
+# requiring apple/container artifacts or constructing a VZ VM.
+fc-compat-config:
+    scripts/fc-compat-config-only.sh
+
 # End-to-end compat smoke: starts hephaestus-firecracker on a fresh socket,
 # replays the firectl request sequence (logger, machine-config, boot-source,
 # drives, InstanceStart, PATCH /vm pause+resume), tears the server down.
-# Pass `boot=0` to stop after pre-boot config and skip the VM start.
+# Pass `boot=0` to run the CI-safe config-only path with dummy artifacts.
 fc-compat boot='1': build fc-harness-build
     #!/usr/bin/env bash
     set -euo pipefail
+    if [[ "{{boot}}" == "0" ]]; then
+        exec scripts/fc-compat-config-only.sh
+    fi
     cdir="$HOME/Library/Application Support/com.apple.container"
     kernel="$(ls "$cdir"/kernels/vmlinux-* 2>/dev/null | head -1 || true)"
     snaps=("$cdir"/snapshots/*/snapshot)
@@ -259,9 +268,14 @@ fc-compat boot='1': build fc-harness-build
     trap 'kill $server 2>/dev/null || true' EXIT
     # Wait for the listener to come up.
     for _ in $(seq 1 20); do [[ -S "$sock" ]] && break; sleep 0.1; done
-    args=(-sock "$sock" -kernel "$kernel" -rootfs "$rootfs" -log "$log")
-    if [[ "{{boot}}" == "0" ]]; then args+=(-skip-boot); else args+=(-pause); fi
-    compat/firectl-harness/firectl-harness "${args[@]}"
+    compat/firectl-harness/firectl-harness \
+        -sock "$sock" -kernel "$kernel" -rootfs "$rootfs" \
+        -log "$log" -pause
+
+# Real-VM headless e2e for PUT /vsock's UDS bridge and guest-visible MMDS.
+# Requires apple/container kernel/rootfs artifacts; not CI-safe.
+fc-compat-vsock-e2e:
+    scripts/fc-compat-vsock-e2e.sh
 
 # Pool-backed compat smoke. Initializes a 1-slot warm pool with the same
 # kernel + rootfs + 2 CPU / 512 MiB tuple the harness asks for, then

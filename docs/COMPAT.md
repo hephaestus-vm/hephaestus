@@ -24,9 +24,9 @@ Legend:
 
 - **Status:** ✓
 - `vcpu_count` and `mem_size_mib` map to Swift defaults when unset
-  (2 / 512 per VZ conventions). `cpu_template` field accepted as
-  opaque `serde_json::Value` and ignored — Apple Silicon CPU feature
-  control isn't client-configurable in VZ.
+  (2 / 512 per VZ conventions). `cpu_template` is accepted by the
+  serde wire layer but rejected with `NotSupported` when present —
+  Apple Silicon CPU feature control isn't client-configurable in VZ.
 - `PATCH` pre-boot only; post-boot returns `InvalidState`.
 
 ### `PUT /boot-source`
@@ -77,26 +77,35 @@ Legend:
 ### `PUT /logger`
 
 - **Status:** ✓
-- Opens `log_path` append-mode and writes a structured init line.
-  Good enough for clients that only check the file exists + grows.
-  Full `log` crate plumbing is deferred — won't break existing
-  clients when it lands.
+- Opens `log_path` append-mode and emits Firecracker-style text records:
+  `<timestamp> [<instance-id>:<thread>[:LEVEL][:origin:line]] <message>`.
+  The backend honors `level`, `show_level`, `show_log_origin`, and a
+  prefix-style `module` filter where practical. Lifecycle events log at
+  info; HTTP access records include `request_id`, method, path, and status
+  and are emitted only when the configured level enables `Debug`.
 
 ### `PUT /metrics`
 
 - **Status:** ⚠︎ Partial
-- Writes an init line to `metrics_path`. Periodic flush of upstream's
-  ~30 metric fields is deferred — most don't map to macOS primitives
-  (KVM exit counters etc.). Won't be byte-for-byte compatible with
-  real Firecracker's metrics log even when we ship the periodic
-  writer.
+- Opens `metrics_path` append-mode and writes newline-delimited JSON.
+  Flushes happen at configure time, after each API request/lifecycle event,
+  and from a 60s background timer (matching Firecracker's default cadence).
+  The shape includes Firecracker-compatible top-level groups such as
+  `api_server`, `get_api_requests`, `put_api_requests`, `patch_api_requests`,
+  `logger`, `vmm`, `vcpu`, and `seccomp`. Linux/KVM-only counters are emitted
+  as numeric zeros; macOS/hephaestus-specific counters live under the
+  `hephaestus` object (`api_requests`, failures, pool hits/misses, snapshot
+  loads). It is intentionally not byte-for-byte identical to Firecracker's
+  full metrics set because most device counters do not exist in VZ.
 
 ### `GET /version`
 
-- **Status:** ✗ (not routed)
-- Deferred. The Go SDK exposes `GetFirecrackerVersion` but `firectl`
-  doesn't issue it during normal startup. Add when something breaks
-  without it.
+- **Status:** ✓
+- Returns Firecracker's wire shape:
+  `{"firecracker_version":"1.16.0-dev"}`. The value is a pinned
+  compatibility target matching the vendored upstream API snapshot,
+  not the hephaestus crate version. Bump it only when the wire structs
+  have been re-synced and the compat harness passes.
 
 ## Snapshots
 
@@ -136,18 +145,31 @@ hephaestus scopes drop-in compat to "save in hephaestus, load in
 hephaestus", which is the realistic use case (fast restart + live
 migration between hephaestus processes).
 
-## Not routed / deferred
+## Partial / unsupported device surfaces
 
-- **`PUT /mmds`, `GET /mmds`, `PATCH /mmds`** — metadata service.
-  Deferred indefinitely; hephaestus guests can get IMDS-style data
-  through simpler means.
-- **`PUT /vsock`** — beyond our agent's fixed port 1234, we don't
-  expose client-configurable vsock.
-- **`PUT /balloon`, `PATCH /balloon`, `PATCH /balloon/statistics`**
-  — VZ doesn't expose a balloon device.
-- **`PUT /entropy`** — no virtio-rng configurable device.
-- **`PUT /cpu-config`, CPU templates** — field accepted as opaque
-  JSON and ignored.
+- **`PUT /mmds`, `GET /mmds`, `PATCH /mmds`, `PUT /mmds/config`** —
+  ⚠︎ Partial. hephaestus stores and returns arbitrary JSON, including a
+  recursive merge-patch-style `PATCH`, so orchestrators can configure
+  metadata without hitting 404s. On direct-VZ long-running VMs, the current
+  MMDS JSON is also served to guest-initiated vsock connections on reserved
+  port `16992` as an HTTP/1.1 JSON response. This is practical guest-visible
+  metadata, not Firecracker's link-local `169.254.169.254` network path; the
+  MMDS config's interface binding/IP/version are stored but not enforced.
+- **`PUT /vsock`** — ⚠︎ Partial. Accepts Firecracker's `guest_cid`,
+  `uds_path`, and deprecated `vsock_id` fields pre-boot. hephaestus stores
+  `guest_cid` for wire compatibility but VZ assigns the actual CID. After
+  the VM starts, hephaestus binds `uds_path`; host clients connect and send
+  Firecracker's `CONNECT <guest_port>\n` line, then the stream is bridged to
+  `VZVirtioSocketDevice.connect(toPort:)`. Port 1234 remains reserved for
+  hephaestus-agent by convention. Config-only CI validates the wire shape;
+  full data-path validation needs a guest vsock server.
+- **`PUT /balloon`, `PATCH /balloon`, `GET /balloon`,
+  `GET/PATCH /balloon/statistics`** — routed but return `NotSupported`;
+  VZ doesn't expose a balloon device.
+- **`PUT /entropy`** — routed but returns `NotSupported`; no
+  configurable virtio-rng device.
+- **`PUT/PATCH /cpu-config`, CPU templates** — routed/rejected with
+  `NotSupported`; Apple Silicon CPU templates are not configurable.
 - **`PATCH /vm` with anything other than Paused/Resumed** — upstream
   has `RestoreVm`/`CreateSnapshot`/etc.; hephaestus uses the
   dedicated `/snapshot/*` endpoints instead.
@@ -160,10 +182,19 @@ same marshaling + strict deserializer that real `firectl` and Kata
 use. Run after every upstream rebase:
 
 ```bash
-just fc-compat            # cold boot (14 SDK calls)
+just fc-compat-config     # CI-safe config-only run with dummy artifacts
+just fc-compat 0          # alias for the config-only path
+just fc-compat            # cold boot with real kernel/rootfs artifacts
+just fc-compat-vsock-e2e  # real-VM /vsock bridge + guest MMDS smoke
 just fc-compat-pool       # warm-pool restore (agent flavor)
 just fc-compat-pool-stock # warm-pool restore (stock-init flavor)
 just fc-compat-snapshot   # save/stop/fresh-process/load round-trip
 ```
 
-All four expected to return 14/14 after any wire-shape change.
+`fc-compat-config` runs in GitHub Actions on every PR and catches
+wire-shape drift without booting a VM. The booting variants require real
+apple/container kernel + rootfs artifacts and remain local/e2e smokes.
+`fc-compat-vsock-e2e` is headless but boots a real VM: it configures MMDS,
+configures `PUT /vsock`, reaches the guest agent through Firecracker's UDS
+`CONNECT 1234` bridge, and asks the agent to fetch MMDS from guest vsock port
+`16992`.

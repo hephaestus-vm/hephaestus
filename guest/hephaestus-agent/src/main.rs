@@ -29,7 +29,7 @@ use std::process::ExitCode;
 use nix::mount::{MsFlags, mount};
 use nix::sys::reboot::{RebootMode, reboot};
 use nix::sys::socket::{
-    AddressFamily, Backlog, SockFlag, SockType, VsockAddr, accept, bind, listen, socket,
+    AddressFamily, Backlog, SockFlag, SockType, VsockAddr, accept, bind, connect, listen, socket,
 };
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, chdir, chroot, execv, fork};
@@ -39,6 +39,8 @@ type AgentResult<T> = Result<T, String>;
 /// Vsock port the agent listens on. Hard-coded because there's only one
 /// agent per VM; the host knows where to connect.
 const COMMAND_PORT: u32 = 1234;
+const MMDS_VSOCK_PORT: u32 = 16_992;
+const VMADDR_CID_HOST: u32 = 2;
 
 fn main() -> ExitCode {
     eprintln!("hephaestus-agent: init starting (pid {})", std::process::id());
@@ -197,6 +199,13 @@ fn write_exit_code(stream: &mut UnixStream, code: i32) -> AgentResult<()> {
 // =============================================================================
 
 fn run_command(cmd: &str) -> AgentResult<i32> {
+    if let Some(needle) = cmd.strip_prefix("__hephaestus_test_mmds_vsock ") {
+        return test_mmds_vsock(needle).map(|()| 0).or_else(|err| {
+            eprintln!("hephaestus-agent: mmds-vsock test failed: {err}");
+            Ok(1)
+        });
+    }
+
     let sh = CString::new("/bin/sh").unwrap();
     let flag = CString::new("-c").unwrap();
     let cmd_c = CString::new(cmd).map_err(|e| format!("cmd has NUL byte: {e}"))?;
@@ -217,6 +226,36 @@ fn run_command(cmd: &str) -> AgentResult<i32> {
             std::process::exit(127);
         }
     }
+}
+
+fn test_mmds_vsock(needle: &str) -> AgentResult<()> {
+    let fd = socket(
+        AddressFamily::Vsock,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )
+    .map_err(|e| format!("mmds vsock socket: {e}"))?;
+    let addr = VsockAddr::new(VMADDR_CID_HOST, MMDS_VSOCK_PORT);
+    connect(fd.as_raw_fd(), &addr).map_err(|e| format!("mmds vsock connect: {e}"))?;
+    // SAFETY: socket returned a fresh fd and connect transferred no ownership.
+    let mut stream = unsafe { UnixStream::from_raw_fd(fd.as_raw_fd()) };
+    // Prevent OwnedFd from closing the descriptor now owned by UnixStream.
+    std::mem::forget(fd);
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: mmds\r\nConnection: close\r\n\r\n")
+        .map_err(|e| format!("mmds request write: {e}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("mmds response read: {e}"))?;
+    if !response.contains(needle) {
+        return Err(format!(
+            "mmds response did not contain {needle:?}: {response:?}"
+        ));
+    }
+    eprintln!("hephaestus-agent: mmds-vsock test matched {needle:?}");
+    Ok(())
 }
 
 // =============================================================================

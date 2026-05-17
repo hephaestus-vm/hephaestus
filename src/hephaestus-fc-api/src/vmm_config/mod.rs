@@ -19,13 +19,20 @@ pub mod logger;
 pub mod machine_config;
 /// Host-side metrics config wire struct (`PUT /metrics`).
 pub mod metrics;
+/// MMDS data/config wire structs (`GET`/`PUT`/`PATCH /mmds`,
+/// `PUT /mmds/config`).
+pub mod mmds;
 /// Network interface wire struct (`PUT /network-interfaces/{id}`).
 pub mod net;
 /// Snapshot create/load wire structs (`PUT /snapshot/create`,
 /// `PUT /snapshot/load`).
 pub mod snapshot;
+/// Firecracker compatibility version response (`GET /version`).
+pub mod version;
 /// VM state update wire struct (`PATCH /vm`).
 pub mod vm;
+/// Vsock device wire struct (`PUT /vsock`).
+pub mod vsock;
 
 /// A public-facing, stateless structure, holding all the data we need to create a TokenBucket
 /// (live) object.

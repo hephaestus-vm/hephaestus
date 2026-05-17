@@ -137,19 +137,21 @@ per-endpoint notes and known deviations.
 | Endpoint                              | hephaestus | Notes                                      |
 | :------------------------------------ | :--------: | :----------------------------------------- |
 | `GET /`                               | ✓          | `InstanceInfo` round-trips through Go SDK   |
-| `GET/PUT/PATCH /machine-config`       | ✓          | `vcpu_count`, `mem_size_mib` honored        |
+| `GET/PUT/PATCH /machine-config`       | ✓          | CPU templates rejected on Apple Silicon     |
 | `PUT /boot-source`                    | ✓          | kernel + boot args + optional initrd       |
 | `PUT/PATCH /drives/{id}`              | ⚠︎         | `PATCH` pre-boot only (VZ can't hot-swap)  |
 | `PUT /network-interfaces/{id}`        | ⚠︎         | Accepted + noop; VZ NAT attached on boot   |
 | `PATCH /network-interfaces/{id}`      | ⚠︎         | Accept-noop (rate-limiter ignored)         |
-| `PUT /logger`                         | ✓          | Writes init line; full logging deferred    |
-| `PUT /metrics`                        | ⚠︎         | Init line only; periodic flush deferred    |
+| `PUT /logger`                         | ✓          | Firecracker-style text logs + debug access |
+| `PUT /metrics`                        | ⚠︎         | Firecracker-style JSON; Linux counters zero |
 | `PUT /actions` (`InstanceStart`)      | ✓          | Cold boot or warm-pool restore             |
 | `PATCH /vm`                           | ✓          | `Paused ↔ Resumed`                         |
 | `PUT /snapshot/create`                | ✓          | A+stub (single blob at `snapshot_path`)    |
 | `PUT /snapshot/load`                  | ✓          | Round-trip across process restart          |
-| `GET /version`                        | ✗          | Deferred — SDK doesn't require it          |
-| MMDS / balloon / entropy / vsock      | ✗          | Deferred — low client demand               |
+| `GET /version`                        | ✓          | Reports pinned Firecracker compat version  |
+| `GET/PUT/PATCH /mmds`, `PUT /mmds/config` | ⚠︎     | Stored JSON; guest vsock port 16992        |
+| `PUT /vsock`                         | ⚠︎         | Host UDS `CONNECT <port>` bridge after boot |
+| balloon / entropy / cpu-config       | ✗          | Routed, return Firecracker-shaped errors   |
 
 ## Performance
 

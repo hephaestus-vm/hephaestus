@@ -14,21 +14,26 @@
 // failure modes a real Go orchestrator would hit.
 //
 // Usage:
-//   ./firectl-harness \
-//     -sock /tmp/hephaestus-firecracker.socket \
-//     -kernel /path/to/vmlinux \
-//     -rootfs /path/to/alpine.ext4 \
-//     [-skip-boot]   # config-only run, no InstanceStart
+//
+//	./firectl-harness \
+//	  -sock /tmp/hephaestus-firecracker.socket \
+//	  -kernel /path/to/vmlinux \
+//	  -rootfs /path/to/alpine.ext4 \
+//	  [-skip-boot]   # config-only run, no InstanceStart
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	httptransport "github.com/go-openapi/runtime/client"
@@ -75,7 +80,7 @@ func main() {
 	client := newUnixClient(*sock)
 	ops := newOperationsClient(client)
 
-	h := &harness{ops: ops}
+	h := &harness{ops: ops, http: client}
 
 	h.run("GET /", func() error {
 		out, err := ops.DescribeInstance(operations.NewDescribeInstanceParams())
@@ -83,6 +88,18 @@ func main() {
 			return err
 		}
 		return assertInstanceInfo(out.GetPayload())
+	})
+
+	h.run("GET /version", func() error {
+		out, err := ops.GetFirecrackerVersion(operations.NewGetFirecrackerVersionParams())
+		if err != nil {
+			return err
+		}
+		if out.GetPayload() == nil || out.GetPayload().FirecrackerVersion == nil {
+			return fmt.Errorf("required field firecracker_version missing")
+		}
+		fmt.Printf("    firecracker_version=%q\n", *out.GetPayload().FirecrackerVersion)
+		return nil
 	})
 
 	h.run("GET /machine-config (default)", func() error {
@@ -98,8 +115,14 @@ func main() {
 	if *logFile != "" {
 		h.run("PUT /logger", func() error {
 			lp := abs(*logFile)
+			level := models.LoggerLevelDebug
+			showLevel := true
+			showOrigin := true
 			_, err := ops.PutLogger(operations.NewPutLoggerParams().WithBody(&models.Logger{
-				LogPath: &lp,
+				LogPath:       &lp,
+				Level:         &level,
+				ShowLevel:     &showLevel,
+				ShowLogOrigin: &showOrigin,
 			}))
 			return err
 		})
@@ -111,6 +134,105 @@ func main() {
 			return err
 		})
 	}
+
+	h.run("PUT /mmds/config", func() error {
+		version := "V2"
+		ipv4 := "169.254.169.254"
+		_, err := ops.PutMmdsConfig(operations.NewPutMmdsConfigParams().WithBody(&models.MmdsConfig{
+			IPV4Address:       &ipv4,
+			NetworkInterfaces: []string{},
+			Version:           &version,
+		}))
+		return err
+	})
+
+	h.run("PUT/PATCH/GET /mmds", func() error {
+		_, err := ops.PutMmds(operations.NewPutMmdsParams().WithBody(map[string]interface{}{
+			"latest": map[string]interface{}{
+				"meta-data": map[string]interface{}{"instance-id": "i-hephaestus"},
+			},
+		}))
+		if err != nil {
+			return err
+		}
+		_, err = ops.PatchMmds(operations.NewPatchMmdsParams().WithBody(map[string]interface{}{
+			"latest": map[string]interface{}{
+				"user-data": "hello",
+			},
+		}))
+		if err != nil {
+			return err
+		}
+		out, err := ops.GetMmds(operations.NewGetMmdsParams())
+		if err != nil {
+			return err
+		}
+		fmt.Printf("    mmds=%v\n", out.GetPayload())
+		return nil
+	})
+
+	h.run("PUT /vsock", func() error {
+		cid := int64(3)
+		uds := filepath.Join(os.TempDir(), "hephaestus-vsock.sock")
+		_, err := ops.PutGuestVsock(operations.NewPutGuestVsockParams().WithBody(&models.Vsock{GuestCid: &cid, UdsPath: &uds}))
+		return err
+	})
+
+	h.run("unsupported device endpoints return errors", func() error {
+		if err := expectErr("PUT /balloon", func() error {
+			amount := int64(64)
+			deflate := true
+			_, err := ops.PutBalloon(operations.NewPutBalloonParams().WithBody(&models.Balloon{AmountMib: &amount, DeflateOnOom: &deflate}))
+			return err
+		}); err != nil {
+			return err
+		}
+		if err := expectErr("PATCH /balloon", func() error {
+			amount := int64(32)
+			_, err := ops.PatchBalloon(operations.NewPatchBalloonParams().WithBody(&models.BalloonUpdate{AmountMib: &amount}))
+			return err
+		}); err != nil {
+			return err
+		}
+		if err := expectErr("GET /balloon", func() error {
+			_, err := ops.DescribeBalloonConfig(operations.NewDescribeBalloonConfigParams())
+			return err
+		}); err != nil {
+			return err
+		}
+		if err := expectErr("GET /balloon/statistics", func() error {
+			_, err := ops.DescribeBalloonStats(operations.NewDescribeBalloonStatsParams())
+			return err
+		}); err != nil {
+			return err
+		}
+		if err := expectErr("PATCH /balloon/statistics", func() error {
+			interval := int64(1)
+			_, err := ops.PatchBalloonStatsInterval(operations.NewPatchBalloonStatsIntervalParams().WithBody(&models.BalloonStatsUpdate{StatsPollingIntervals: &interval}))
+			return err
+		}); err != nil {
+			return err
+		}
+		if err := h.expectHTTPError("PUT /entropy", http.MethodPut, "/entropy", `{"rate_limiter":null}`); err != nil {
+			return err
+		}
+		if err := h.expectHTTPError("PUT /cpu-config", http.MethodPut, "/cpu-config", `{}`); err != nil {
+			return err
+		}
+		return h.expectHTTPError("PATCH /cpu-config", http.MethodPatch, "/cpu-config", `{}`)
+	})
+
+	h.run("PUT /machine-config rejects cpu_template", func() error {
+		return expectErr("PUT /machine-config cpu_template", func() error {
+			t := models.CPUTemplateT2
+			_, err := ops.PutMachineConfiguration(operations.NewPutMachineConfigurationParams().WithBody(&models.MachineConfiguration{
+				VcpuCount:   vcpu,
+				MemSizeMib:  mem,
+				CPUTemplate: models.CPUTemplate(t),
+			}))
+			return err
+		})
+	})
 
 	h.run("PUT /machine-config", func() error {
 		_, err := ops.PutMachineConfiguration(operations.NewPutMachineConfigurationParams().WithBody(&models.MachineConfiguration{
@@ -138,10 +260,10 @@ func main() {
 
 	h.run("PUT /drives/rootfs", func() error {
 		var (
-			id  = "rootfs"
-			ph  = abs(*rootfs)
-			ro  = true
-			rd  = true
+			id = "rootfs"
+			ph = abs(*rootfs)
+			ro = true
+			rd = true
 		)
 		_, err := ops.PutGuestDriveByID(operations.NewPutGuestDriveByIDParams().
 			WithDriveID(id).
@@ -169,6 +291,14 @@ func main() {
 	})
 
 	if *skipBoot {
+		if *logFile != "" {
+			h.run("logger output contains Firecracker-style records", func() error {
+				return assertLogContains(abs(*logFile), []string{"[", ":DEBUG:", "request_id=", "api_server::request"})
+			})
+			h.run("metrics output contains Firecracker-style JSON", func() error {
+				return assertMetricsJSON(abs(*logFile + ".metrics"))
+			})
+		}
 		fmt.Println("\n-skip-boot set; configuration-only run complete")
 		h.summary()
 		return
@@ -262,11 +392,21 @@ func main() {
 		}
 	}
 
+	if *logFile != "" {
+		h.run("logger output contains Firecracker-style records", func() error {
+			return assertLogContains(abs(*logFile), []string{"[", ":DEBUG:", "request_id=", "api_server::request"})
+		})
+		h.run("metrics output contains Firecracker-style JSON", func() error {
+			return assertMetricsJSON(abs(*logFile + ".metrics"))
+		})
+	}
+
 	h.summary()
 }
 
 type harness struct {
 	ops    *operations.Client
+	http   *http.Client
 	passed int
 	failed int
 }
@@ -287,6 +427,33 @@ func (h *harness) summary() {
 	if h.failed > 0 {
 		os.Exit(1)
 	}
+}
+
+func expectErr(name string, fn func() error) error {
+	if err := fn(); err == nil {
+		return fmt.Errorf("%s unexpectedly succeeded", name)
+	}
+	fmt.Printf("    %s -> error\n", name)
+	return nil
+}
+
+func (h *harness) expectHTTPError(name, method, path, body string) error {
+	req, err := http.NewRequest(method, "http://localhost"+path, bytes.NewBufferString(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("content-type", "application/json")
+	resp, err := h.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	payload, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 400 {
+		return fmt.Errorf("%s unexpectedly returned %d: %s", name, resp.StatusCode, string(payload))
+	}
+	fmt.Printf("    %s -> %d\n", name, resp.StatusCode)
+	return nil
 }
 
 // newUnixClient returns an http.Client whose transport dials the given
@@ -325,6 +492,43 @@ func assertInstanceInfo(info *models.InstanceInfo) error {
 	}
 	fmt.Printf("    id=%q state=%q app=%q version=%q\n",
 		*info.ID, *info.State, *info.AppName, *info.VmmVersion)
+	return nil
+}
+
+func assertLogContains(path string, needles []string) error {
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	text := string(payload)
+	for _, needle := range needles {
+		if !strings.Contains(text, needle) {
+			return fmt.Errorf("log %s missing %q; content: %s", path, needle, text)
+		}
+	}
+	fmt.Printf("    log=%s bytes=%d\n", path, len(payload))
+	return nil
+}
+
+func assertMetricsJSON(path string) error {
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(strings.TrimSpace(string(payload)), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		return fmt.Errorf("metrics file %s is empty", path)
+	}
+	var record map[string]interface{}
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &record); err != nil {
+		return err
+	}
+	for _, key := range []string{"utc_timestamp_ms", "api_server", "get_api_requests", "put_api_requests", "logger", "vmm", "hephaestus"} {
+		if _, ok := record[key]; !ok {
+			return fmt.Errorf("metrics %s missing key %q", path, key)
+		}
+	}
+	fmt.Printf("    metrics=%s lines=%d bytes=%d\n", path, len(lines), len(payload))
 	return nil
 }
 

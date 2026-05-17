@@ -10,10 +10,9 @@
 //! (QEMU-over-HVF? another direct-VZ impl?) slots in the same way.
 //!
 //! Scope for v0.3 is minimal: one VM per `hephaestus-firecracker` process
-//! (matches upstream's contract), and only the subset of endpoints that
-//! `firectl` and Kata exercise on a cold boot. Update / balloon / mmds /
-//! snapshot / entropy live behind `VmmBackendError::NotSupported` until we
-//! have a client asking for them.
+//! (matches upstream's contract). Unsupported macOS-incompatible device
+//! endpoints are routed and return `VmmBackendError::NotSupported` so clients
+//! get Firecracker-shaped errors instead of 404s.
 
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
@@ -21,8 +20,11 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::logger::LoggerConfig;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 use crate::vmm_config::metrics::MetricsConfig;
+use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotConfig};
+use crate::vmm_config::vsock::VsockConfig;
+use serde_json::Value;
 
 /// Errors a backend method can surface to the HTTP layer.
 ///
@@ -89,6 +91,31 @@ pub trait VmmBackend {
     /// file exists and has content" are satisfied.
     fn configure_metrics(&mut self, _cfg: MetricsConfig) -> Result<(), VmmBackendError> {
         Err(VmmBackendError::NotSupported("metrics".into()))
+    }
+
+    /// `GET /mmds`
+    fn get_mmds(&self) -> Value {
+        Value::Object(Default::default())
+    }
+
+    /// `PUT /mmds`
+    fn put_mmds(&mut self, _data: Value) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("mmds".into()))
+    }
+
+    /// `PATCH /mmds`
+    fn patch_mmds(&mut self, _data: Value) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("mmds".into()))
+    }
+
+    /// `PUT /mmds/config`
+    fn configure_mmds(&mut self, _cfg: MmdsConfig) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("mmds/config".into()))
+    }
+
+    /// `PUT /vsock`
+    fn configure_vsock(&mut self, _cfg: VsockConfig) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("vsock".into()))
     }
 
     /// `GET /machine-config`

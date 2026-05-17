@@ -9,6 +9,7 @@
 //! PUT/PATCH is 204 No Content; GET returns 200 with JSON.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
@@ -25,14 +26,20 @@ use hephaestus_fc_api::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateC
 use hephaestus_fc_api::vmm_config::logger::LoggerConfig;
 use hephaestus_fc_api::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 use hephaestus_fc_api::vmm_config::metrics::MetricsConfig;
+use hephaestus_fc_api::vmm_config::mmds::MmdsConfig;
 use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
 use hephaestus_fc_api::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotConfig};
+use hephaestus_fc_api::vmm_config::version::FirecrackerVersion;
 use hephaestus_fc_api::vmm_config::vm::{UpdatedVm, VmUpdatedState};
+use hephaestus_fc_api::vmm_config::vsock::VsockConfig;
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
+use serde_json::Value;
 
 use crate::backend::VzBackend;
 
 type BoxBody = Full<Bytes>;
+
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub async fn serve_connection(
     stream: UnixStream,
@@ -48,14 +55,16 @@ pub async fn serve_connection(
 }
 
 async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Response<BoxBody> {
+    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
-    match (method, path.as_str()) {
+    let response = match (method.clone(), path.as_str()) {
         (Method::GET, "/") => {
             let info = backend.lock().await.instance_info();
             json_response(StatusCode::OK, &info)
         }
+        (Method::GET, "/version") => json_response(StatusCode::OK, &FirecrackerVersion::default()),
         (Method::GET, "/machine-config") => {
             let cfg = backend.lock().await.get_machine_config();
             json_response(StatusCode::OK, &cfg)
@@ -145,6 +154,22 @@ async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Respon
             Ok(cfg) => to_response(backend.lock().await.configure_metrics(cfg)),
             Err(resp) => resp,
         },
+        (Method::GET, "/mmds") => {
+            let data = backend.lock().await.get_mmds();
+            json_response(StatusCode::OK, &data)
+        }
+        (Method::PUT, "/mmds") => match parse_body::<Value>(req).await {
+            Ok(data) => to_response(backend.lock().await.put_mmds(data)),
+            Err(resp) => resp,
+        },
+        (Method::PATCH, "/mmds") => match parse_body::<Value>(req).await {
+            Ok(data) => to_response(backend.lock().await.patch_mmds(data)),
+            Err(resp) => resp,
+        },
+        (Method::PUT, "/mmds/config") => match parse_body::<MmdsConfig>(req).await {
+            Ok(cfg) => to_response(backend.lock().await.configure_mmds(cfg)),
+            Err(resp) => resp,
+        },
         (Method::PUT, "/snapshot/create") => match parse_body::<CreateSnapshotParams>(req).await {
             Ok(params) => to_response(backend.lock().await.create_snapshot(params)),
             Err(resp) => resp,
@@ -163,11 +188,41 @@ async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Respon
             ),
             Err(resp) => resp,
         },
+        (Method::PUT | Method::PATCH, "/cpu-config") => match parse_body::<Value>(req).await {
+            Ok(_) => unsupported("cpu-config"),
+            Err(resp) => resp,
+        },
+        (Method::PUT | Method::PATCH, "/balloon") => match parse_body::<Value>(req).await {
+            Ok(_) => unsupported("balloon"),
+            Err(resp) => resp,
+        },
+        (Method::GET, "/balloon") => unsupported("balloon"),
+        (Method::GET, "/balloon/statistics") => unsupported("balloon/statistics"),
+        (Method::PATCH, "/balloon/statistics") => match parse_body::<Value>(req).await {
+            Ok(_) => unsupported("balloon/statistics"),
+            Err(resp) => resp,
+        },
+        (Method::PUT, "/entropy") => match parse_body::<Value>(req).await {
+            Ok(_) => unsupported("entropy"),
+            Err(resp) => resp,
+        },
+        (Method::PUT, "/vsock") => match parse_body::<VsockConfig>(req).await {
+            Ok(cfg) => to_response(backend.lock().await.configure_vsock(cfg)),
+            Err(resp) => resp,
+        },
         (_, p) => fault(
             StatusCode::NOT_FOUND,
             &format!("no handler for {} {}", req.method(), p),
         ),
-    }
+    };
+
+    backend.lock().await.observe_request(
+        request_id,
+        method.as_str(),
+        &path,
+        response.status().as_u16(),
+    );
+    response
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -201,6 +256,10 @@ async fn parse_body<T: serde::de::DeserializeOwned>(
             &format!("failed to parse JSON body: {err}"),
         )
     })
+}
+
+fn unsupported(feature: &str) -> Response<BoxBody> {
+    to_response(Err(VmmBackendError::NotSupported(feature.to_string())))
 }
 
 fn to_response(result: Result<(), VmmBackendError>) -> Response<BoxBody> {

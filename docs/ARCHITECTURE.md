@@ -80,7 +80,10 @@ out-param pattern.
 
 Opaque types on the C boundary: `HbVm` (containerization path),
 `HbVzVm` (direct-VZ long-running VM handle), `HbRestoreTimings` (per-
-phase restore instrumentation — see [perf.md](perf.md)). See
+phase restore instrumentation — see [perf.md](perf.md)). The long-running
+handle also exposes `hb_vz_long_connect`, which dup(2)s a host-side fd for
+`VZVirtioSocketDevice.connect(toPort:)`; `hephaestus-firecracker` uses that
+for Firecracker-style `PUT /vsock` UDS bridging. See
 `src/hephaestus-bridge/src/lib.rs` top for the full list.
 
 ## `VzBackend` state machine
@@ -121,6 +124,17 @@ pools (no command channel). `pool init --stock-init` selects it.
 Both flavors are restored via `Pool::restore_into_vm` which dispatches
 on `PoolMeta.flavor` and returns a unified `(VzVm,
 PoolRestoreBreakdown)`. The HTTP backend doesn't care which path it got.
+
+## Guest-visible MMDS
+
+The Firecracker control-plane MMDS endpoints store JSON in `VzBackend`.
+For direct-VZ VMs, hephaestus exposes that JSON inside the guest through a
+reserved virtio-vsock service on port `16992` (port `1234` stays reserved for
+`hephaestus-agent`). The Swift bridge installs a `VZVirtioSocketListener` via
+`hb_vz_long_serve_mmds`; each guest connection gets an HTTP/1.1 JSON response
+with the current MMDS document. This does **not** emulate Firecracker's
+link-local IP path (`169.254.169.254`) yet; it is the macOS/VZ transport for
+metadata until a network-level shim exists.
 
 ## Match key
 

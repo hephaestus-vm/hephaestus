@@ -85,6 +85,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let backend = Arc::new(Mutex::new(backend));
+    {
+        let backend = backend.clone();
+        tokio::task::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                backend.lock().await.flush_metrics();
+            }
+        });
+    }
 
     loop {
         let (stream, _) = listener.accept().await?;

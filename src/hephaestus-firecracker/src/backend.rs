@@ -4,7 +4,11 @@
 //! the accumulated pre-boot config and, once booted, an owned [`VzVm`]
 //! handle. Dropping the backend stops the VM via `VzVm::Drop`.
 
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use hephaestus_fc_api::vmm_config::boot_source::{BootSourceConfig, DEFAULT_KERNEL_CMDLINE};
 use hephaestus_fc_api::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
@@ -12,13 +16,20 @@ use hephaestus_fc_api::vmm_config::instance_info::{InstanceInfo, VmState};
 use hephaestus_fc_api::vmm_config::logger::LoggerConfig;
 use hephaestus_fc_api::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 use hephaestus_fc_api::vmm_config::metrics::MetricsConfig;
+use hephaestus_fc_api::vmm_config::mmds::MmdsConfig;
 use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
 use hephaestus_fc_api::vmm_config::snapshot::{
     CreateSnapshotParams, LoadSnapshotConfig, MemBackendType, SnapshotType,
 };
+use hephaestus_fc_api::vmm_config::vsock::VsockConfig;
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
 use hephaestus_pool::{ClaimedSlot, Pool, PoolMatchSpec};
-use hephaestus_vmm::{VzSpec, VzVm, vz_long_restore};
+use hephaestus_vmm::{VzSpec, VzVm, connect_vsock_handle, vz_long_restore};
+use serde_json::Value;
+
+/// Guest-initiated vsock port for hephaestus' practical MMDS transport.
+/// Port 1234 is reserved for hephaestus-agent command injection.
+pub const MMDS_VSOCK_PORT: u32 = 16_992;
 
 /// How the currently-running VM was started. Used to gate
 /// `PUT /snapshot/create`: only cold-boot VMs are saveable, since their
@@ -32,6 +43,101 @@ enum RunOrigin {
     SnapshotLoad,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+    Off,
+}
+
+impl LogLevel {
+    fn parse(value: &str) -> Result<Self, VmmBackendError> {
+        match value.to_ascii_lowercase().as_str() {
+            "error" => Ok(Self::Error),
+            "warn" | "warning" => Ok(Self::Warn),
+            "info" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            "trace" => Ok(Self::Trace),
+            "off" => Ok(Self::Off),
+            other => Err(VmmBackendError::InvalidConfig(format!(
+                "invalid logger level {other:?}"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "ERROR",
+            Self::Warn => "WARN",
+            Self::Info => "INFO",
+            Self::Debug => "DEBUG",
+            Self::Trace => "TRACE",
+            Self::Off => "OFF",
+        }
+    }
+
+    fn enabled(self, record: Self) -> bool {
+        !matches!(self, Self::Off) && record <= self
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LoggerState {
+    path: Option<PathBuf>,
+    level: LogLevel,
+    show_level: bool,
+    show_log_origin: bool,
+    module: Option<String>,
+}
+
+impl Default for LoggerState {
+    fn default() -> Self {
+        Self {
+            path: None,
+            level: LogLevel::Info,
+            show_level: false,
+            show_log_origin: false,
+            module: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MetricsState {
+    path: Option<PathBuf>,
+    started_at: Instant,
+    flush_count: u64,
+    api_requests: u64,
+    api_request_fails: u64,
+    get_requests: u64,
+    put_requests: u64,
+    patch_requests: u64,
+    pool_hits: u64,
+    pool_misses: u64,
+    snapshot_loads: u64,
+}
+
+impl Default for MetricsState {
+    fn default() -> Self {
+        Self {
+            path: None,
+            started_at: Instant::now(),
+            flush_count: 0,
+            api_requests: 0,
+            api_request_fails: 0,
+            get_requests: 0,
+            put_requests: 0,
+            patch_requests: 0,
+            pool_hits: 0,
+            pool_misses: 0,
+            snapshot_loads: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct VzBackend {
     id: String,
@@ -40,6 +146,11 @@ pub struct VzBackend {
     root_drive: Option<PathBuf>,
     iface: Option<NetworkInterfaceConfig>,
     machine_config: MachineConfig,
+    mmds: Value,
+    mmds_config: MmdsConfig,
+    vsock: Option<VsockConfig>,
+    logger: LoggerState,
+    metrics: MetricsState,
     /// Drop order matters: `vm` is dropped before `pool_slot` so the
     /// VM tears down before the slot's `Drop` deletes the rootfs the VM
     /// was reading from.
@@ -60,6 +171,11 @@ impl VzBackend {
             root_drive: None,
             iface: None,
             machine_config: MachineConfig::default(),
+            mmds: Value::Object(Default::default()),
+            mmds_config: MmdsConfig::default(),
+            vsock: None,
+            logger: LoggerState::default(),
+            metrics: MetricsState::default(),
             vm: None,
             pool_slot: None,
             pool: None,
@@ -83,6 +199,203 @@ impl VzBackend {
             Err(VmmBackendError::InvalidState(
                 "operation not supported post-boot".into(),
             ))
+        }
+    }
+
+    pub fn observe_request(&mut self, request_id: u64, method: &str, path: &str, status: u16) {
+        self.metrics.api_requests = self.metrics.api_requests.saturating_add(1);
+        if status >= 400 {
+            self.metrics.api_request_fails = self.metrics.api_request_fails.saturating_add(1);
+        }
+        match method {
+            "GET" => self.metrics.get_requests = self.metrics.get_requests.saturating_add(1),
+            "PUT" => self.metrics.put_requests = self.metrics.put_requests.saturating_add(1),
+            "PATCH" => self.metrics.patch_requests = self.metrics.patch_requests.saturating_add(1),
+            _ => {}
+        }
+        if self.logger.level.enabled(LogLevel::Debug) {
+            self.write_log(
+                LogLevel::Debug,
+                "api_server::request",
+                None,
+                &format!("request_id={request_id} method={method} path={path} status={status}"),
+            );
+        }
+        self.flush_metrics();
+    }
+
+    pub fn flush_metrics(&mut self) {
+        let Some(path) = self.metrics.path.clone() else {
+            return;
+        };
+        self.metrics.flush_count = self.metrics.flush_count.saturating_add(1);
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let uptime_us = self.metrics.started_at.elapsed().as_micros();
+        let payload = serde_json::json!({
+            "utc_timestamp_ms": timestamp_ms,
+            "api_server": {
+                "process_startup_time_us": uptime_us,
+                "sync_response_fails": self.metrics.api_request_fails,
+            },
+            "get_api_requests": {
+                "instance_info_count": self.metrics.get_requests,
+                "machine_cfg_count": 0,
+                "mmds_count": 0,
+                "vmm_version_count": 0,
+            },
+            "put_api_requests": {
+                "actions_count": 0,
+                "boot_source_count": 0,
+                "drive_count": 0,
+                "logger_count": 0,
+                "machine_cfg_count": 0,
+                "metrics_count": 0,
+                "mmds_count": 0,
+                "net_count": 0,
+                "snapshot_create_count": 0,
+                "snapshot_load_count": self.metrics.snapshot_loads,
+            },
+            "patch_api_requests": {
+                "drive_count": 0,
+                "machine_cfg_count": 0,
+                "mmds_count": 0,
+                "net_count": 0,
+                "vm_count": 0,
+            },
+            "logger": {
+                "missed_log_count": 0,
+                "missed_metrics_count": 0,
+                "flush_count": self.metrics.flush_count,
+            },
+            "vmm": {
+                "panic_count": 0,
+            },
+            "vcpu": {
+                "exit_io_in": 0,
+                "exit_io_out": 0,
+                "failures": 0,
+            },
+            "seccomp": {
+                "num_faults": 0,
+            },
+            "hephaestus": {
+                "api_requests": self.metrics.api_requests,
+                "api_request_fails": self.metrics.api_request_fails,
+                "pool_hits": self.metrics.pool_hits,
+                "pool_misses": self.metrics.pool_misses,
+                "snapshot_loads": self.metrics.snapshot_loads,
+            },
+        });
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{payload}");
+        }
+    }
+
+    fn log_info(&self, origin: &'static str, message: &str) {
+        self.write_log(LogLevel::Info, origin, None, message);
+    }
+
+    fn refresh_mmds_vsock_service(&self) -> Result<(), VmmBackendError> {
+        let Some(vm) = self.vm.as_ref() else {
+            return Ok(());
+        };
+        let json = serde_json::to_vec(&self.mmds)
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
+        vm.serve_mmds_vsock(MMDS_VSOCK_PORT, &json)
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))
+    }
+
+    fn start_vsock_bridge(&self) -> Result<(), VmmBackendError> {
+        self.refresh_mmds_vsock_service()?;
+        let Some(cfg) = self.vsock.clone() else {
+            return Ok(());
+        };
+        let handle_addr = self
+            .vm
+            .as_ref()
+            .ok_or_else(|| VmmBackendError::Internal("vsock bridge without VM".into()))?
+            .handle_addr();
+        let _ = std::fs::remove_file(&cfg.uds_path);
+        let listener = UnixListener::bind(&cfg.uds_path).map_err(|err| {
+            VmmBackendError::InvalidConfig(format!(
+                "cannot bind vsock uds_path {}: {err}",
+                cfg.uds_path.display()
+            ))
+        })?;
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut host) = stream else { continue };
+                std::thread::spawn(move || {
+                    let Some(line) = read_connect_line(&mut host) else {
+                        let _ = host.write_all(b"ERR invalid CONNECT line\n");
+                        return;
+                    };
+                    let Some(port) = parse_connect_line(&line) else {
+                        let _ = host.write_all(b"ERR invalid CONNECT line\n");
+                        return;
+                    };
+                    let Ok(mut guest) = connect_vsock_handle(handle_addr, port) else {
+                        let _ = host.write_all(b"ERR connect failed\n");
+                        return;
+                    };
+                    let Ok(mut host_to_guest) = host.try_clone() else {
+                        return;
+                    };
+                    let Ok(mut guest_to_host) = guest.try_clone() else {
+                        return;
+                    };
+                    let a =
+                        std::thread::spawn(move || std::io::copy(&mut host_to_guest, &mut guest));
+                    let b =
+                        std::thread::spawn(move || std::io::copy(&mut guest_to_host, &mut host));
+                    let _ = a.join();
+                    let _ = b.join();
+                });
+            }
+        });
+        Ok(())
+    }
+
+    fn write_log(&self, level: LogLevel, origin: &str, line: Option<u32>, message: &str) {
+        if !self.logger.level.enabled(level) {
+            return;
+        }
+        if let Some(module) = self.logger.module.as_ref()
+            && !origin.starts_with(module)
+        {
+            return;
+        }
+        let Some(path) = self.logger.path.as_ref() else {
+            return;
+        };
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| format!("{}.{:06}", d.as_secs(), d.subsec_micros()))
+            .unwrap_or_else(|_| "0.000000".to_string());
+        let thread = std::thread::current().name().unwrap_or("-").to_string();
+        let level_suffix = if self.logger.show_level {
+            format!(":{}", level.as_str())
+        } else {
+            String::new()
+        };
+        let origin_suffix = if self.logger.show_log_origin {
+            format!(
+                ":{}:{}",
+                origin,
+                line.map_or_else(|| "?".to_string(), |n| n.to_string())
+            )
+        } else {
+            String::new()
+        };
+        let record = format!(
+            "{timestamp} [{}:{thread}{level_suffix}{origin_suffix}] {message}\n",
+            self.id
+        );
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = file.write_all(record.as_bytes());
         }
     }
 }
@@ -162,47 +475,96 @@ impl VmmBackend for VzBackend {
     }
 
     fn configure_logger(&mut self, cfg: LoggerConfig) -> Result<(), VmmBackendError> {
-        // Accept pre- or post-boot: Firecracker allows PUT /logger at any
-        // time. Honor log_path best-effort by appending a single
-        // structured line announcing the config; future work can stream
-        // server events through proper `log` crate plumbing.
-        if let Some(path) = cfg.log_path.as_ref() {
-            let line = format!(
-                "{{\"timestamp\":\"init\",\"level\":\"{}\",\"msg\":\"hephaestus-firecracker logger configured\"}}\n",
-                cfg.level.as_deref().unwrap_or("Info"),
-            );
-            std::fs::OpenOptions::new()
+        // Accept pre- or post-boot, like Firecracker. Logger updates are
+        // patch-like: omitted fields retain their prior values.
+        if let Some(path) = cfg.log_path {
+            OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)
-                .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()))
+                .open(&path)
                 .map_err(|err| {
                     VmmBackendError::InvalidConfig(format!(
                         "cannot open log_path {}: {err}",
                         path.display()
                     ))
                 })?;
+            self.logger.path = Some(path);
         }
+        if let Some(level) = cfg.level.as_deref() {
+            self.logger.level = LogLevel::parse(level)?;
+        }
+        if let Some(show_level) = cfg.show_level {
+            self.logger.show_level = show_level;
+        }
+        if let Some(show_log_origin) = cfg.show_log_origin {
+            self.logger.show_log_origin = show_log_origin;
+        }
+        if let Some(module) = cfg.module {
+            self.logger.module = if module.is_empty() {
+                None
+            } else {
+                Some(module)
+            };
+        }
+        self.log_info(
+            "api_server::request::logger",
+            "The logger was configured successfully.",
+        );
         Ok(())
     }
 
     fn configure_metrics(&mut self, cfg: MetricsConfig) -> Result<(), VmmBackendError> {
-        // Same shape as configure_logger: open the file, write a single
-        // structured init line, return. Real periodic-flush plumbing is
-        // deferred (most upstream metrics fields don't map to macOS).
-        let line =
-            "{\"timestamp\":\"init\",\"event\":\"hephaestus-firecracker metrics configured\"}\n";
-        std::fs::OpenOptions::new()
+        OpenOptions::new()
             .create(true)
             .append(true)
             .open(&cfg.metrics_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()))
             .map_err(|err| {
                 VmmBackendError::InvalidConfig(format!(
                     "cannot open metrics_path {}: {err}",
                     cfg.metrics_path.display()
                 ))
-            })
+            })?;
+        self.metrics.path = Some(cfg.metrics_path);
+        self.flush_metrics();
+        Ok(())
+    }
+
+    fn get_mmds(&self) -> Value {
+        self.mmds.clone()
+    }
+
+    fn put_mmds(&mut self, data: Value) -> Result<(), VmmBackendError> {
+        self.mmds = data;
+        self.refresh_mmds_vsock_service()?;
+        Ok(())
+    }
+
+    fn patch_mmds(&mut self, data: Value) -> Result<(), VmmBackendError> {
+        merge_json(&mut self.mmds, data);
+        self.refresh_mmds_vsock_service()?;
+        Ok(())
+    }
+
+    fn configure_mmds(&mut self, cfg: MmdsConfig) -> Result<(), VmmBackendError> {
+        self.require_preboot()?;
+        self.mmds_config = cfg;
+        Ok(())
+    }
+
+    fn configure_vsock(&mut self, cfg: VsockConfig) -> Result<(), VmmBackendError> {
+        self.require_preboot()?;
+        if cfg.guest_cid < 3 {
+            return Err(VmmBackendError::InvalidConfig(
+                "vsock.guest_cid must be >= 3".into(),
+            ));
+        }
+        if cfg.uds_path.as_os_str().is_empty() {
+            return Err(VmmBackendError::InvalidConfig(
+                "vsock.uds_path is required".into(),
+            ));
+        }
+        self.vsock = Some(cfg);
+        Ok(())
     }
 
     fn get_machine_config(&self) -> MachineConfig {
@@ -219,6 +581,11 @@ impl VmmBackend for VzBackend {
         if cfg.mem_size_mib == 0 {
             return Err(VmmBackendError::InvalidConfig(
                 "mem_size_mib must be > 0".into(),
+            ));
+        }
+        if cfg.cpu_template.is_some() {
+            return Err(VmmBackendError::NotSupported(
+                "cpu_template is not supported on Apple Silicon/VZ".into(),
             ));
         }
         self.machine_config = cfg;
@@ -248,8 +615,10 @@ impl VmmBackend for VzBackend {
         if let Some(h) = update.huge_pages {
             cfg.huge_pages = h;
         }
-        if let Some(v) = update.cpu_template {
-            cfg.cpu_template = Some(v);
+        if update.cpu_template.is_some() {
+            return Err(VmmBackendError::NotSupported(
+                "cpu_template is not supported on Apple Silicon/VZ".into(),
+            ));
         }
         self.put_machine_config(cfg)
     }
@@ -309,6 +678,9 @@ impl VmmBackend for VzBackend {
                         self.pool_slot = Some(slot);
                         self.state = VmState::Running;
                         self.origin = Some(RunOrigin::Pool);
+                        self.metrics.pool_hits = self.metrics.pool_hits.saturating_add(1);
+                        self.start_vsock_bridge()?;
+                        self.flush_metrics();
                         return Ok(());
                     }
                     Err(err) => {
@@ -321,6 +693,7 @@ impl VmmBackend for VzBackend {
                 },
                 Ok(None) => {
                     // Either config mismatch or all slots busy — cold-boot.
+                    self.metrics.pool_misses = self.metrics.pool_misses.saturating_add(1);
                 }
                 Err(err) => {
                     eprintln!("hephaestus-firecracker: pool claim error ({err}); cold-booting");
@@ -343,6 +716,8 @@ impl VmmBackend for VzBackend {
         self.vm = Some(vm);
         self.state = VmState::Running;
         self.origin = Some(RunOrigin::ColdBoot);
+        self.start_vsock_bridge()?;
+        self.log_info("vmm", "Vmm is running.");
         Ok(())
     }
 
@@ -467,6 +842,10 @@ impl VmmBackend for VzBackend {
             VmState::Paused
         };
         self.origin = Some(RunOrigin::SnapshotLoad);
+        self.start_vsock_bridge()?;
+        self.metrics.snapshot_loads = self.metrics.snapshot_loads.saturating_add(1);
+        self.flush_metrics();
+        self.log_info("vmm", "Snapshot loaded.");
         Ok(())
     }
 
@@ -487,6 +866,7 @@ impl VmmBackend for VzBackend {
         vm.pause()
             .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
         self.state = VmState::Paused;
+        self.log_info("vmm", "Vmm is paused.");
         Ok(())
     }
 
@@ -507,6 +887,42 @@ impl VmmBackend for VzBackend {
         vm.resume()
             .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
         self.state = VmState::Running;
+        self.log_info("vmm", "Vmm is resumed.");
         Ok(())
+    }
+}
+
+fn read_connect_line(stream: &mut std::os::unix::net::UnixStream) -> Option<String> {
+    let mut out = Vec::with_capacity(32);
+    let mut byte = [0u8; 1];
+    while out.len() < 64 {
+        stream.read_exact(&mut byte).ok()?;
+        out.push(byte[0]);
+        if byte[0] == b'\n' {
+            return String::from_utf8(out).ok();
+        }
+    }
+    None
+}
+
+fn parse_connect_line(line: &str) -> Option<u32> {
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    let rest = trimmed.strip_prefix("CONNECT ")?;
+    let port = rest.parse::<u32>().ok()?;
+    (port > 0).then_some(port)
+}
+
+fn merge_json(dst: &mut Value, patch: Value) {
+    match (dst, patch) {
+        (Value::Object(dst_map), Value::Object(patch_map)) => {
+            for (key, value) in patch_map {
+                if value.is_null() {
+                    dst_map.remove(&key);
+                } else {
+                    merge_json(dst_map.entry(key).or_insert(Value::Null), value);
+                }
+            }
+        }
+        (dst_slot, value) => *dst_slot = value,
     }
 }

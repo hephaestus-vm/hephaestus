@@ -22,7 +22,9 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use std::ffi::{CStr, CString, NulError};
-use std::os::raw::{c_char, c_void};
+use std::os::fd::{FromRawFd, RawFd};
+use std::os::raw::{c_char, c_int, c_void};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 // =============================================================================
@@ -237,6 +239,19 @@ unsafe extern "C" {
     fn hb_vz_long_start(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
     fn hb_vz_long_pause(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
     fn hb_vz_long_resume(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
+    fn hb_vz_long_serve_mmds(
+        vm: *mut HbVzVm,
+        port: u32,
+        json: *const u8,
+        json_len: usize,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
+    fn hb_vz_long_connect(
+        vm: *mut HbVzVm,
+        port: u32,
+        out_fd: *mut c_int,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
     fn hb_vz_long_stop(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
     fn hb_vz_long_free(vm: *mut HbVzVm);
     fn hb_vz_pool_restore_long(
@@ -575,6 +590,8 @@ pub struct VzVm {
 
 // SAFETY: see VzVm doc comment.
 unsafe impl Send for VzVm {}
+// SAFETY: Swift serializes all handle access through the per-VM dispatch queue.
+unsafe impl Sync for VzVm {}
 
 impl VzVm {
     fn new(spec: VzSpec) -> Result<Self, VmError> {
@@ -631,6 +648,28 @@ impl VzVm {
         status.into_result(out_err)
     }
 
+    /// Serve a static JSON MMDS response on a guest-initiated vsock port.
+    pub fn serve_mmds_vsock(&self, port: u32, json: &[u8]) -> Result<(), VmError> {
+        let mut out_err: *mut c_char = std::ptr::null_mut();
+        let status = unsafe {
+            hb_vz_long_serve_mmds(self.handle, port, json.as_ptr(), json.len(), &mut out_err)
+        };
+        status.into_result(out_err)
+    }
+
+    /// Connect to a guest vsock port and return a UnixStream for the bridged
+    /// host-side file descriptor.
+    pub fn connect_vsock(&self, port: u32) -> Result<UnixStream, VmError> {
+        connect_vsock_handle(self.handle.cast::<()>() as usize, port)
+    }
+
+    /// Return an opaque raw handle address for helper threads that need to
+    /// initiate host-side vsock connects while the owning `VzVm` remains in
+    /// the backend. The address is only valid for the VM handle's lifetime.
+    pub fn handle_addr(&self) -> usize {
+        self.handle.cast::<()>() as usize
+    }
+
     /// Request graceful stop, then force-stop. Idempotent.
     pub fn stop(&self) -> Result<(), VmError> {
         let mut out_err: *mut c_char = std::ptr::null_mut();
@@ -651,6 +690,21 @@ impl VzVm {
         let status = unsafe { hb_vz_long_save(self.handle, save_c.as_ptr(), &mut out_err) };
         status.into_result(out_err)
     }
+}
+
+/// Connect to a guest vsock port using an opaque handle address returned by
+/// [`VzVm::handle_addr`].
+pub fn connect_vsock_handle(handle_addr: usize, port: u32) -> Result<UnixStream, VmError> {
+    let handle = handle_addr as *mut HbVzVm;
+    let mut out_fd: c_int = -1;
+    let mut out_err: *mut c_char = std::ptr::null_mut();
+    let status = unsafe { hb_vz_long_connect(handle, port, &mut out_fd, &mut out_err) };
+    status.into_result(out_err)?;
+    debug_assert!(out_fd >= 0);
+    let fd: RawFd = out_fd;
+    // SAFETY: hb_vz_long_connect returns a freshly dup(2)'d descriptor whose
+    // ownership is transferred to Rust.
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
 impl Drop for VzVm {
