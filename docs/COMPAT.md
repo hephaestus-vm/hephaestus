@@ -61,8 +61,10 @@ Legend:
 ### `PUT /actions`
 
 - **Status:** ✓
-- Only `action_type: "InstanceStart"` is supported. Other actions
-  (`SendCtrlAltDel`, `FlushMetrics`) return `NotSupported`.
+- `action_type: "InstanceStart"` cold-boots/restores the VM.
+- `action_type: "FlushMetrics"` forces an immediate metrics JSON flush when
+  `PUT /metrics` has configured a sink.
+- `action_type: "SendCtrlAltDel"` returns `NotSupported`.
 
 ### `PATCH /vm`
 

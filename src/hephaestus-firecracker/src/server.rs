@@ -182,6 +182,12 @@ async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Respon
             Ok(ActionBody {
                 action_type: ActionType::InstanceStart,
             }) => to_response(backend.lock().await.start_micro_vm()),
+            Ok(ActionBody {
+                action_type: ActionType::FlushMetrics,
+            }) => {
+                backend.lock().await.flush_metrics();
+                to_response(Ok(()))
+            }
             Ok(ActionBody { action_type }) => fault(
                 StatusCode::BAD_REQUEST,
                 &format!("action_type `{action_type:?}` is not supported"),

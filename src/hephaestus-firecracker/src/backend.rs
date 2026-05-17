@@ -309,10 +309,16 @@ impl VzBackend {
     }
 
     fn start_vsock_bridge(&self) -> Result<(), VmmBackendError> {
-        self.refresh_mmds_vsock_service()?;
         let Some(cfg) = self.vsock.clone() else {
+            // Stock-init pool snapshots intentionally have no virtio-vsock device.
+            // MMDS-over-vsock is best-effort unless the client explicitly
+            // configured PUT /vsock and therefore expects a host UDS bridge.
+            if let Err(err) = self.refresh_mmds_vsock_service() {
+                eprintln!("hephaestus-firecracker: MMDS vsock service unavailable ({err})");
+            }
             return Ok(());
         };
+        self.refresh_mmds_vsock_service()?;
         let handle_addr = self
             .vm
             .as_ref()

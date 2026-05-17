@@ -144,7 +144,7 @@ per-endpoint notes and known deviations.
 | `PATCH /network-interfaces/{id}`      | ⚠︎         | Accept-noop (rate-limiter ignored)         |
 | `PUT /logger`                         | ✓          | Firecracker-style text logs + debug access |
 | `PUT /metrics`                        | ⚠︎         | Firecracker-style JSON; Linux counters zero |
-| `PUT /actions` (`InstanceStart`)      | ✓          | Cold boot or warm-pool restore             |
+| `PUT /actions` (`InstanceStart`, `FlushMetrics`) | ✓ | Boot/restore or force metrics flush |
 | `PATCH /vm`                           | ✓          | `Paused ↔ Resumed`                         |
 | `PUT /snapshot/create`                | ✓          | A+stub (single blob at `snapshot_path`)    |
 | `PUT /snapshot/load`                  | ✓          | Round-trip across process restart          |

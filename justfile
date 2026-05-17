@@ -20,9 +20,9 @@ default:
 
 # ───────── Build ─────────
 
-# Compile the workspace. Auto-codesigns the binary via scripts/link-and-sign.sh.
+# Compile the workspace. Auto-codesigns binaries via scripts/link-and-sign.sh.
 build:
-    cargo build -p hephaestus-cli
+    cargo build --workspace
 
 # `cargo clean` plus wipe the Swift build cache.
 clean:
@@ -386,7 +386,7 @@ fc-compat-pool-stock: build fc-harness-build
     for _ in $(seq 1 20); do [[ -S "$sock" ]] && break; sleep 0.1; done
     compat/firectl-harness/firectl-harness \
         -sock "$sock" -kernel "$kernel" -rootfs "$pool/pristine.ext4" \
-        -log "$log" -pause \
+        -log "$log" -pause -skip-vsock \
         -vcpu 2 -mem 512 -mem-patch 512
 
 # Run cargo unit tests + ping + test-rootfs. No VM boot; safe without artifacts.

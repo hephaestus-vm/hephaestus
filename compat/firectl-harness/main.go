@@ -45,18 +45,19 @@ import (
 
 func main() {
 	var (
-		sock     = flag.String("sock", "/tmp/hephaestus-firecracker.socket", "path to hephaestus-firecracker UNIX socket")
-		kernel   = flag.String("kernel", "", "path to guest kernel image (vmlinux)")
-		rootfs   = flag.String("rootfs", "", "path to ext4 rootfs")
-		bootArgs = flag.String("boot-args", "console=ttyS0 reboot=k panic=1 nomodule quiet loglevel=3", "kernel cmdline")
-		logFile  = flag.String("log", "", "if set, PUT /logger with this path before boot")
-		skipBoot = flag.Bool("skip-boot", false, "configure only, do not InstanceStart")
-		pause    = flag.Bool("pause", false, "after boot, exercise PATCH /vm Paused/Resumed")
-		vcpu     = flag.Int64("vcpu", 1, "vcpu count for PUT /machine-config")
-		mem      = flag.Int64("mem", 256, "initial memory MiB for PUT /machine-config")
-		memPatch = flag.Int64("mem-patch", 512, "memory MiB for the PATCH /machine-config bump")
-		snapSave = flag.String("snapshot-save", "", "after boot+pause, PUT /snapshot/create writing state to this path (and a stub at .mem)")
-		snapLoad = flag.String("snapshot-load", "", "instead of InstanceStart, PUT /snapshot/load from this state path with resume_vm=true")
+		sock      = flag.String("sock", "/tmp/hephaestus-firecracker.socket", "path to hephaestus-firecracker UNIX socket")
+		kernel    = flag.String("kernel", "", "path to guest kernel image (vmlinux)")
+		rootfs    = flag.String("rootfs", "", "path to ext4 rootfs")
+		bootArgs  = flag.String("boot-args", "console=ttyS0 reboot=k panic=1 nomodule quiet loglevel=3", "kernel cmdline")
+		logFile   = flag.String("log", "", "if set, PUT /logger with this path before boot")
+		skipBoot  = flag.Bool("skip-boot", false, "configure only, do not InstanceStart")
+		pause     = flag.Bool("pause", false, "after boot, exercise PATCH /vm Paused/Resumed")
+		skipVsock = flag.Bool("skip-vsock", false, "do not configure PUT /vsock (for stock-init pools without a socket device)")
+		vcpu      = flag.Int64("vcpu", 1, "vcpu count for PUT /machine-config")
+		mem       = flag.Int64("mem", 256, "initial memory MiB for PUT /machine-config")
+		memPatch  = flag.Int64("mem-patch", 512, "memory MiB for the PATCH /machine-config bump")
+		snapSave  = flag.String("snapshot-save", "", "after boot+pause, PUT /snapshot/create writing state to this path (and a stub at .mem)")
+		snapLoad  = flag.String("snapshot-load", "", "instead of InstanceStart, PUT /snapshot/load from this state path with resume_vm=true")
 	)
 	flag.Parse()
 
@@ -171,10 +172,20 @@ func main() {
 		return nil
 	})
 
-	h.run("PUT /vsock", func() error {
-		cid := int64(3)
-		uds := filepath.Join(os.TempDir(), "hephaestus-vsock.sock")
-		_, err := ops.PutGuestVsock(operations.NewPutGuestVsockParams().WithBody(&models.Vsock{GuestCid: &cid, UdsPath: &uds}))
+	if !*skipVsock {
+		h.run("PUT /vsock", func() error {
+			cid := int64(3)
+			uds := filepath.Join(os.TempDir(), "hephaestus-vsock.sock")
+			_, err := ops.PutGuestVsock(operations.NewPutGuestVsockParams().WithBody(&models.Vsock{GuestCid: &cid, UdsPath: &uds}))
+			return err
+		})
+	}
+
+	h.run("PUT /actions FlushMetrics", func() error {
+		action := "FlushMetrics"
+		_, err := ops.CreateSyncAction(operations.NewCreateSyncActionParams().WithInfo(&models.InstanceActionInfo{
+			ActionType: &action,
+		}))
 		return err
 	})
 
