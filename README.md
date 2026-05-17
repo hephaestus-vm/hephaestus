@@ -151,7 +151,7 @@ per-endpoint notes and known deviations.
 | `GET /version`                        | ✓          | Reports pinned Firecracker compat version  |
 | `GET/PUT/PATCH /mmds`, `PUT /mmds/config` | ⚠︎     | Stored JSON; guest vsock port 16992        |
 | `PUT /vsock`                         | ⚠︎         | Host UDS `CONNECT <port>` bridge after boot |
-| balloon / entropy / cpu-config       | ✗          | Routed, return Firecracker-shaped errors   |
+| balloon / entropy / cpu-config / pmem / serial / hotplug memory / vm config | ✗ | Routed, return Firecracker-shaped errors |
 
 ## Performance
 

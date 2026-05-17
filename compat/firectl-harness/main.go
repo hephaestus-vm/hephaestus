@@ -213,13 +213,26 @@ func main() {
 		}); err != nil {
 			return err
 		}
-		if err := h.expectHTTPError("PUT /entropy", http.MethodPut, "/entropy", `{"rate_limiter":null}`); err != nil {
-			return err
+		checks := []struct{ name, method, path, body string }{
+			{"PATCH /balloon/hinting/start", http.MethodPatch, "/balloon/hinting/start", `{}`},
+			{"GET /balloon/hinting/status", http.MethodGet, "/balloon/hinting/status", ``},
+			{"PATCH /balloon/hinting/stop", http.MethodPatch, "/balloon/hinting/stop", `{}`},
+			{"PUT /entropy", http.MethodPut, "/entropy", `{"rate_limiter":null}`},
+			{"PUT /cpu-config", http.MethodPut, "/cpu-config", `{}`},
+			{"PATCH /cpu-config", http.MethodPatch, "/cpu-config", `{}`},
+			{"PUT /pmem/pmem0", http.MethodPut, "/pmem/pmem0", `{"pmem_id":"pmem0","host_path":"/tmp/pmem","size":1048576}`},
+			{"PUT /serial", http.MethodPut, "/serial", `{"file_path":"/tmp/serial.log"}`},
+			{"GET /hotplug/memory", http.MethodGet, "/hotplug/memory", ``},
+			{"PUT /hotplug/memory", http.MethodPut, "/hotplug/memory", `{"size_mib":128}`},
+			{"PATCH /hotplug/memory", http.MethodPatch, "/hotplug/memory", `{"desired_size_mib":256}`},
+			{"GET /vm/config", http.MethodGet, "/vm/config", ``},
 		}
-		if err := h.expectHTTPError("PUT /cpu-config", http.MethodPut, "/cpu-config", `{}`); err != nil {
-			return err
+		for _, check := range checks {
+			if err := h.expectHTTPError(check.name, check.method, check.path, check.body); err != nil {
+				return err
+			}
 		}
-		return h.expectHTTPError("PATCH /cpu-config", http.MethodPatch, "/cpu-config", `{}`)
+		return nil
 	})
 
 	h.run("PUT /machine-config rejects cpu_template", func() error {

@@ -164,12 +164,21 @@ migration between hephaestus processes).
   hephaestus-agent by convention. Config-only CI validates the wire shape;
   full data-path validation needs a guest vsock server.
 - **`PUT /balloon`, `PATCH /balloon`, `GET /balloon`,
-  `GET/PATCH /balloon/statistics`** — routed but return `NotSupported`;
-  VZ doesn't expose a balloon device.
+  `GET/PATCH /balloon/statistics`, `PATCH /balloon/hinting/start`,
+  `GET /balloon/hinting/status`, `PATCH /balloon/hinting/stop`** —
+  routed but return `NotSupported`; VZ doesn't expose a balloon device.
 - **`PUT /entropy`** — routed but returns `NotSupported`; no
   configurable virtio-rng device.
 - **`PUT/PATCH /cpu-config`, CPU templates** — routed/rejected with
   `NotSupported`; Apple Silicon CPU templates are not configurable.
+- **`PUT /pmem/{id}`** — routed but returns `NotSupported`; VZ's direct
+  Linux path does not expose Firecracker's persistent-memory device model.
+- **`PUT /serial`** — routed but returns `NotSupported`; hephaestus owns
+  the serial console plumbing for boot logs and agent init.
+- **`GET/PUT/PATCH /hotplug/memory`** — routed but returns
+  `NotSupported`; VZ memory size is fixed at VM construction here.
+- **`GET /vm/config`** — routed but returns `NotSupported`; hephaestus
+  does not expose Firecracker's runtime VM config toggles.
 - **`PATCH /vm` with anything other than Paused/Resumed** — upstream
   has `RestoreVm`/`CreateSnapshot`/etc.; hephaestus uses the
   dedicated `/snapshot/*` endpoints instead.

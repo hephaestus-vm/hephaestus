@@ -202,10 +202,39 @@ async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Respon
             Ok(_) => unsupported("balloon/statistics"),
             Err(resp) => resp,
         },
+        (Method::PATCH, "/balloon/hinting/start") => match parse_body::<Value>(req).await {
+            Ok(_) => unsupported("balloon/hinting/start"),
+            Err(resp) => resp,
+        },
+        (Method::GET, "/balloon/hinting/status") => unsupported("balloon/hinting/status"),
+        (Method::PATCH, "/balloon/hinting/stop") => match parse_body::<Value>(req).await {
+            Ok(_) => unsupported("balloon/hinting/stop"),
+            Err(resp) => resp,
+        },
         (Method::PUT, "/entropy") => match parse_body::<Value>(req).await {
             Ok(_) => unsupported("entropy"),
             Err(resp) => resp,
         },
+        (Method::PUT, p) if p.starts_with("/pmem/") => {
+            let id = p.trim_start_matches("/pmem/");
+            if id.is_empty() || id.contains('/') {
+                return fault(StatusCode::BAD_REQUEST, "invalid pmem id");
+            }
+            match parse_body::<Value>(req).await {
+                Ok(_) => unsupported("pmem"),
+                Err(resp) => resp,
+            }
+        }
+        (Method::PUT, "/serial") => match parse_body::<Value>(req).await {
+            Ok(_) => unsupported("serial"),
+            Err(resp) => resp,
+        },
+        (Method::GET, "/hotplug/memory") => unsupported("hotplug/memory"),
+        (Method::PUT | Method::PATCH, "/hotplug/memory") => match parse_body::<Value>(req).await {
+            Ok(_) => unsupported("hotplug/memory"),
+            Err(resp) => resp,
+        },
+        (Method::GET, "/vm/config") => unsupported("vm/config"),
         (Method::PUT, "/vsock") => match parse_body::<VsockConfig>(req).await {
             Ok(cfg) => to_response(backend.lock().await.configure_vsock(cfg)),
             Err(resp) => resp,
