@@ -240,6 +240,17 @@ fc-harness-build:
 fc-compat-config:
     scripts/fc-compat-config-only.sh
 
+# CI-safe restrictive-sandbox compat smoke. Generates a deny-by-default macOS
+# profile, proves an unrelated file is denied, then runs fc-compat-config's
+# Go SDK harness with dummy artifacts and -skip-boot.
+fc-compat-sandbox-config:
+    scripts/fc-compat-sandbox-config.sh
+
+# Real-VM compat smoke under a generated deny-by-default macOS sandbox profile.
+# Requires apple/container kernel/rootfs artifacts; not CI-safe.
+fc-compat-sandbox:
+    scripts/fc-compat-sandbox.sh
+
 # End-to-end compat smoke: starts hephaestus-firecracker on a fresh socket,
 # replays the firectl request sequence (logger, machine-config, boot-source,
 # drives, InstanceStart, PATCH /vm pause+resume), tears the server down.
@@ -276,6 +287,22 @@ fc-compat boot='1': build fc-harness-build
 # Requires apple/container kernel/rootfs artifacts; not CI-safe.
 fc-compat-vsock-e2e:
     scripts/fc-compat-vsock-e2e.sh
+
+# Same vsock/MMDS e2e under a generated deny-by-default sandbox profile.
+fc-compat-sandbox-vsock-e2e:
+    HEPHAESTUS_SANDBOX=1 scripts/fc-compat-vsock-e2e.sh
+
+# Snapshot save/load round-trip under generated deny-by-default sandbox profiles.
+fc-compat-sandbox-snapshot:
+    scripts/fc-compat-sandbox-snapshot.sh
+
+# Pool restore under generated deny-by-default sandbox profiles.
+fc-compat-sandbox-pool:
+    scripts/fc-compat-sandbox-pool.sh agent
+
+# Stock-init pool restore under generated deny-by-default sandbox profiles.
+fc-compat-sandbox-pool-stock:
+    scripts/fc-compat-sandbox-pool.sh stock
 
 # Pool-backed compat smoke. Initializes a 1-slot warm pool with the same
 # kernel + rootfs + 2 CPU / 512 MiB tuple the harness asks for, then

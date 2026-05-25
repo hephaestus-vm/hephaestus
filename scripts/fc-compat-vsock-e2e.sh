@@ -33,6 +33,7 @@ vsock="$tmp/guest-vsock.sock"
 rootfs="$tmp/rootfs.ext4"
 log="$tmp/fc.log"
 serial="$tmp/serial.log"
+profile="$tmp/restrictive-vsock.sb"
 server=""
 cleanup() {
   if [[ -n "$server" ]]; then
@@ -45,9 +46,24 @@ trap cleanup EXIT
 
 cp -c "$rootfs_src" "$rootfs"
 
+server_args=(
+  --api-sock "$sock"
+  --id fc-vsock-e2e
+)
+if [[ "${HEPHAESTUS_SANDBOX:-0}" == "1" ]]; then
+  scripts/generate-fc-sandbox-profile.sh \
+    --output "$profile" \
+    --work-dir "$tmp" \
+    --work-dir /tmp \
+    --work-dir "${TMPDIR:-/tmp}" \
+    --read "$kernel" \
+    --read "$repo_root/build/agent.cpio.gz" \
+    --read-write-file "$rootfs"
+  server_args+=(--sandbox-profile "$profile")
+fi
+
 ./build/cargo_target/debug/hephaestus-firecracker \
-  --api-sock "$sock" \
-  --id fc-vsock-e2e \
+  "${server_args[@]}" \
   >"$tmp/server.out" \
   2>"$tmp/server.err" &
 server=$!
@@ -188,6 +204,7 @@ for _ in range(80):
         if code != 0:
             raise RuntimeError(f"guest vsock suite exited {code}")
         print("guest MMDS vsock test exited 0")
+        print("guest MMDS link-local shim test exited 0")
         print("generic guest-port vsock echo test exited 0")
         raise SystemExit(0)
     except Exception as exc:

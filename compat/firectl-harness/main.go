@@ -136,6 +136,19 @@ func main() {
 		})
 	}
 
+	h.run("PUT /mmds/config rejects non-link-local IPv4", func() error {
+		return expectErr("PUT /mmds/config non-link-local IPv4", func() error {
+			version := "V2"
+			ipv4 := "10.0.0.2"
+			_, err := ops.PutMmdsConfig(operations.NewPutMmdsConfigParams().WithBody(&models.MmdsConfig{
+				IPV4Address:       &ipv4,
+				NetworkInterfaces: []string{},
+				Version:           &version,
+			}))
+			return err
+		})
+	})
+
 	h.run("PUT /mmds/config", func() error {
 		version := "V2"
 		ipv4 := "169.254.169.254"

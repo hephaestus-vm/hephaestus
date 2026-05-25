@@ -6,6 +6,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::net::Ipv4Addr;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -138,6 +139,40 @@ impl Default for MetricsState {
     }
 }
 
+trait VzVmHandle: std::fmt::Debug + Send {
+    fn serve_mmds_vsock(&self, port: u32, json: &[u8]) -> Result<(), VmmBackendError>;
+    fn handle_addr(&self) -> usize;
+    fn save_state(&self, path: &std::path::Path) -> Result<(), VmmBackendError>;
+    fn pause(&self) -> Result<(), VmmBackendError>;
+    fn resume(&self) -> Result<(), VmmBackendError>;
+}
+
+impl VzVmHandle for VzVm {
+    fn serve_mmds_vsock(&self, port: u32, json: &[u8]) -> Result<(), VmmBackendError> {
+        self.serve_mmds_vsock(port, json)
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))
+    }
+
+    fn handle_addr(&self) -> usize {
+        self.handle_addr()
+    }
+
+    fn save_state(&self, path: &std::path::Path) -> Result<(), VmmBackendError> {
+        self.save_state(path)
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))
+    }
+
+    fn pause(&self) -> Result<(), VmmBackendError> {
+        self.pause()
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))
+    }
+
+    fn resume(&self) -> Result<(), VmmBackendError> {
+        self.resume()
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))
+    }
+}
+
 #[derive(Debug)]
 pub struct VzBackend {
     id: String,
@@ -154,7 +189,7 @@ pub struct VzBackend {
     /// Drop order matters: `vm` is dropped before `pool_slot` so the
     /// VM tears down before the slot's `Drop` deletes the rootfs the VM
     /// was reading from.
-    vm: Option<VzVm>,
+    vm: Option<Box<dyn VzVmHandle>>,
     pool_slot: Option<ClaimedSlot>,
     pool: Option<Pool>,
     /// Set once start_micro_vm or load_snapshot succeeds. None
@@ -305,7 +340,6 @@ impl VzBackend {
         let json = serde_json::to_vec(&self.mmds)
             .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
         vm.serve_mmds_vsock(MMDS_VSOCK_PORT, &json)
-            .map_err(|err| VmmBackendError::Internal(err.to_string()))
     }
 
     fn start_vsock_bridge(&self) -> Result<(), VmmBackendError> {
@@ -553,6 +587,9 @@ impl VmmBackend for VzBackend {
 
     fn configure_mmds(&mut self, cfg: MmdsConfig) -> Result<(), VmmBackendError> {
         self.require_preboot()?;
+        if let Some(addr) = cfg.ipv4_address.as_deref() {
+            validate_mmds_link_local_addr(addr)?;
+        }
         self.mmds_config = cfg;
         Ok(())
     }
@@ -680,7 +717,7 @@ impl VmmBackend for VzBackend {
                             ms(breakdown.vz.restore_nanos),
                             ms(breakdown.vz.resume_nanos),
                         );
-                        self.vm = Some(vm);
+                        self.vm = Some(Box::new(vm));
                         self.pool_slot = Some(slot);
                         self.state = VmState::Running;
                         self.origin = Some(RunOrigin::Pool);
@@ -719,7 +756,7 @@ impl VmmBackend for VzBackend {
         vm.start()
             .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
 
-        self.vm = Some(vm);
+        self.vm = Some(Box::new(vm));
         self.state = VmState::Running;
         self.origin = Some(RunOrigin::ColdBoot);
         self.start_vsock_bridge()?;
@@ -758,8 +795,7 @@ impl VmmBackend for VzBackend {
             .vm
             .as_ref()
             .ok_or_else(|| VmmBackendError::Internal("Paused state without a VM handle".into()))?;
-        vm.save_state(&params.snapshot_path)
-            .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
+        vm.save_state(&params.snapshot_path)?;
 
         // A+stub: touch an empty file at mem_file_path so clients that
         // os.Stat(mem_file_path) post-save don't error. The real blob
@@ -841,7 +877,7 @@ impl VmmBackend for VzBackend {
             params.resume_vm,
         );
 
-        self.vm = Some(vm);
+        self.vm = Some(Box::new(vm));
         self.state = if params.resume_vm {
             VmState::Running
         } else {
@@ -869,8 +905,7 @@ impl VmmBackend for VzBackend {
             .vm
             .as_ref()
             .ok_or_else(|| VmmBackendError::Internal("running state without a VM handle".into()))?;
-        vm.pause()
-            .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
+        vm.pause()?;
         self.state = VmState::Paused;
         self.log_info("vmm", "Vmm is paused.");
         Ok(())
@@ -890,8 +925,7 @@ impl VmmBackend for VzBackend {
             .vm
             .as_ref()
             .ok_or_else(|| VmmBackendError::Internal("paused state without a VM handle".into()))?;
-        vm.resume()
-            .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
+        vm.resume()?;
         self.state = VmState::Running;
         self.log_info("vmm", "Vmm is resumed.");
         Ok(())
@@ -918,6 +952,20 @@ fn parse_connect_line(line: &str) -> Option<u32> {
     (port > 0).then_some(port)
 }
 
+fn validate_mmds_link_local_addr(addr: &str) -> Result<(), VmmBackendError> {
+    let parsed: Ipv4Addr = addr.parse().map_err(|err| {
+        VmmBackendError::InvalidConfig(format!("mmds.ipv4_address must be IPv4: {err}"))
+    })?;
+    let octets = parsed.octets();
+    if octets[0] == 169 && octets[1] == 254 {
+        Ok(())
+    } else {
+        Err(VmmBackendError::InvalidConfig(
+            "mmds.ipv4_address must be in 169.254.0.0/16".into(),
+        ))
+    }
+}
+
 fn merge_json(dst: &mut Value, patch: Value) {
     match (dst, patch) {
         (Value::Object(dst_map), Value::Object(patch_map)) => {
@@ -930,5 +978,215 @@ fn merge_json(dst: &mut Value, patch: Value) {
             }
         }
         (dst_slot, value) => *dst_slot = value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    #[derive(Debug, Default)]
+    struct FakeVm {
+        pauses: Arc<AtomicU32>,
+        resumes: Arc<AtomicU32>,
+        mmds_refreshes: Arc<AtomicU32>,
+    }
+
+    impl FakeVm {
+        fn boxed() -> (
+            Box<dyn VzVmHandle>,
+            Arc<AtomicU32>,
+            Arc<AtomicU32>,
+            Arc<AtomicU32>,
+        ) {
+            let pauses = Arc::new(AtomicU32::new(0));
+            let resumes = Arc::new(AtomicU32::new(0));
+            let mmds = Arc::new(AtomicU32::new(0));
+            (
+                Box::new(Self {
+                    pauses: pauses.clone(),
+                    resumes: resumes.clone(),
+                    mmds_refreshes: mmds.clone(),
+                }),
+                pauses,
+                resumes,
+                mmds,
+            )
+        }
+    }
+
+    impl VzVmHandle for FakeVm {
+        fn serve_mmds_vsock(&self, _port: u32, _json: &[u8]) -> Result<(), VmmBackendError> {
+            self.mmds_refreshes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn handle_addr(&self) -> usize {
+            0
+        }
+
+        fn save_state(&self, path: &Path) -> Result<(), VmmBackendError> {
+            std::fs::write(path, b"fake-vz-state")
+                .map_err(|err| VmmBackendError::Internal(err.to_string()))
+        }
+
+        fn pause(&self) -> Result<(), VmmBackendError> {
+            self.pauses.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn resume(&self) -> Result<(), VmmBackendError> {
+            self.resumes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "hephaestus-backend-test-{}-{name}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn snapshot_params() -> CreateSnapshotParams {
+        CreateSnapshotParams {
+            snapshot_path: temp_path("state"),
+            mem_file_path: temp_path("mem"),
+            snapshot_type: SnapshotType::Full,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn pause_resume_state_machine_calls_vm_once_and_is_idempotent() {
+        let (vm, pauses, resumes, _) = FakeVm::boxed();
+        let mut backend = VzBackend::new("test".into());
+        backend.vm = Some(vm);
+        backend.state = VmState::Running;
+        backend.origin = Some(RunOrigin::ColdBoot);
+
+        backend.pause().unwrap();
+        backend.pause().unwrap();
+        assert_eq!(backend.state, VmState::Paused);
+        assert_eq!(pauses.load(Ordering::Relaxed), 1);
+
+        backend.resume().unwrap();
+        backend.resume().unwrap();
+        assert_eq!(backend.state, VmState::Running);
+        assert_eq!(resumes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn preboot_only_config_rejects_after_start() {
+        let mut backend = VzBackend::new("test".into());
+        backend.state = VmState::Running;
+
+        let err = backend
+            .put_machine_config(MachineConfig::default())
+            .unwrap_err();
+        assert!(matches!(err, VmmBackendError::InvalidState(_)));
+
+        let err = backend
+            .configure_vsock(VsockConfig {
+                guest_cid: 3,
+                uds_path: temp_path("vsock.sock"),
+                vsock_id: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, VmmBackendError::InvalidState(_)));
+    }
+
+    #[test]
+    fn drive_patch_is_preboot_and_updates_root_path() {
+        let rootfs = temp_path("rootfs.ext4");
+        std::fs::write(&rootfs, b"rootfs").unwrap();
+        let mut backend = VzBackend::new("test".into());
+
+        backend
+            .update_block_device(BlockDeviceUpdateConfig {
+                drive_id: "root".into(),
+                path_on_host: Some(rootfs.display().to_string()),
+                rate_limiter: None,
+            })
+            .unwrap();
+        assert_eq!(backend.root_drive, Some(rootfs.clone()));
+
+        backend.state = VmState::Running;
+        let err = backend
+            .update_block_device(BlockDeviceUpdateConfig {
+                drive_id: "root".into(),
+                path_on_host: Some(rootfs.display().to_string()),
+                rate_limiter: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, VmmBackendError::InvalidState(_)));
+    }
+
+    #[test]
+    fn snapshot_create_origin_gating_matches_documented_contract() {
+        let mut backend = VzBackend::new("test".into());
+        backend.state = VmState::Paused;
+        backend.origin = Some(RunOrigin::Pool);
+        let err = backend.create_snapshot(snapshot_params()).unwrap_err();
+        assert!(matches!(err, VmmBackendError::NotSupported(_)));
+
+        let (vm, _, _, _) = FakeVm::boxed();
+        let mut backend = VzBackend::new("test".into());
+        backend.vm = Some(vm);
+        backend.state = VmState::Paused;
+        backend.origin = Some(RunOrigin::ColdBoot);
+        let params = snapshot_params();
+        backend.create_snapshot(params.clone()).unwrap();
+        assert_eq!(
+            std::fs::read(&params.snapshot_path).unwrap(),
+            b"fake-vz-state"
+        );
+        assert_eq!(std::fs::read(&params.mem_file_path).unwrap(), b"");
+    }
+
+    #[test]
+    fn mmds_config_validates_firecracker_link_local_address() {
+        let mut backend = VzBackend::new("test".into());
+        backend
+            .configure_mmds(MmdsConfig {
+                ipv4_address: Some("169.254.169.254".into()),
+                network_interfaces: vec!["eth0".into()],
+                version: None,
+            })
+            .unwrap();
+
+        let err = backend
+            .configure_mmds(MmdsConfig {
+                ipv4_address: Some("10.0.0.2".into()),
+                network_interfaces: vec!["eth0".into()],
+                version: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, VmmBackendError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn mmds_patch_refreshes_running_vsock_service() {
+        let (vm, _, _, mmds_refreshes) = FakeVm::boxed();
+        let mut backend = VzBackend::new("test".into());
+        backend.vm = Some(vm);
+        backend.state = VmState::Running;
+
+        backend
+            .put_mmds(serde_json::json!({"meta": {"a": 1, "b": 2}}))
+            .unwrap();
+        backend
+            .patch_mmds(serde_json::json!({"meta": {"b": null, "c": 3}}))
+            .unwrap();
+
+        assert_eq!(
+            backend.get_mmds(),
+            serde_json::json!({"meta": {"a": 1, "c": 3}})
+        );
+        assert_eq!(mmds_refreshes.load(Ordering::Relaxed), 2);
     }
 }

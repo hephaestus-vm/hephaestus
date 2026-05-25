@@ -226,10 +226,16 @@ align on scope.
 
 ## Security
 
-**hephaestus assumes trusted guest code.** There is no jailer, no
-host sandbox, and no hardening against guest-to-host escape beyond
-what Apple's Virtualization.framework provides out of the box. Don't
-run untrusted code until that's built.
+**hephaestus assumes trusted guest code.** There is no full jailer and no
+hardening against guest-to-host escape beyond what Apple's
+Virtualization.framework provides out of the box. `hephaestus-firecracker`
+has an experimental `--sandbox-profile <file>` hook for users who want to
+enter a custom macOS sandbox profile; `just fc-compat-sandbox-config`,
+`just fc-compat-sandbox`, `just fc-compat-sandbox-vsock-e2e`,
+`just fc-compat-sandbox-snapshot`, and the sandbox pool recipes exercise
+initial generated deny-by-default profiles across config-only, cold-boot,
+vsock/MMDS, snapshot, and warm-pool paths. Launchd/supervisor isolation is not
+automated yet. Don't run untrusted code until that's built.
 
 Please report vulnerabilities privately — see
 [SECURITY.md](SECURITY.md) for scope and the reporting address.

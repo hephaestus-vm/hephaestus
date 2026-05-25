@@ -156,7 +156,12 @@ migration between hephaestus processes).
   MMDS JSON is also served to guest-initiated vsock connections on reserved
   port `16992` as an HTTP/1.1 JSON response. This is practical guest-visible
   metadata, not Firecracker's link-local `169.254.169.254` network path; the
-  MMDS config's interface binding/IP/version are stored but not enforced.
+  MMDS config's interface binding/version are stored but not enforced. If an
+  `ipv4_address` is supplied it must be in Firecracker's link-local
+  `169.254.0.0/16` range. Controlled hephaestus-agent e2e guests also validate
+  a guest-side shim that serves `http://169.254.169.254/` by forwarding to the
+  vsock MMDS service; transparent host-network MMDS for arbitrary existing
+  guest images is not emulated yet.
 - **`PUT /vsock`** — ⚠︎ Partial. Accepts Firecracker's `guest_cid`,
   `uds_path`, and deprecated `vsock_id` fields pre-boot. hephaestus stores
   `guest_cid` for wire compatibility but VZ assigns the actual CID. After
@@ -164,8 +169,8 @@ migration between hephaestus processes).
   Firecracker's `CONNECT <guest_port>\n` line, then the stream is bridged to
   `VZVirtioSocketDevice.connect(toPort:)`. Port 1234 remains reserved for
   hephaestus-agent by convention. Config-only CI validates the wire shape;
-  `just fc-compat-vsock-e2e` validates both the agent/MMDS path and a generic
-  guest-port echo server.
+  `just fc-compat-vsock-e2e` validates the agent/MMDS path, the guest-side
+  link-local MMDS shim, and a generic guest-port echo server.
 - **`PUT /balloon`, `PATCH /balloon`, `GET /balloon`,
   `GET/PATCH /balloon/statistics`, `PATCH /balloon/hinting/start`,
   `GET /balloon/hinting/status`, `PATCH /balloon/hinting/stop`** —
@@ -194,13 +199,19 @@ same marshaling + strict deserializer that real `firectl` and Kata
 use. Run after every upstream rebase:
 
 ```bash
-just fc-compat-config     # CI-safe config-only run with dummy artifacts
-just fc-compat 0          # alias for the config-only path
-just fc-compat            # cold boot with real kernel/rootfs artifacts
-just fc-compat-vsock-e2e  # real-VM /vsock bridge + guest MMDS smoke
-just fc-compat-pool       # warm-pool restore (agent flavor)
-just fc-compat-pool-stock # warm-pool restore (stock-init flavor)
-just fc-compat-snapshot   # save/stop/fresh-process/load round-trip
+just fc-compat-config          # CI-safe config-only run with dummy artifacts
+just fc-compat-sandbox-config  # CI-safe config-only run under a restrictive sandbox
+just fc-compat 0               # alias for the config-only path
+just fc-compat                 # cold boot with real kernel/rootfs artifacts
+just fc-compat-sandbox         # cold boot under a restrictive sandbox
+just fc-compat-vsock-e2e       # real-VM /vsock bridge + guest MMDS smoke
+just fc-compat-sandbox-vsock-e2e # same, under a restrictive sandbox
+just fc-compat-pool            # warm-pool restore (agent flavor)
+just fc-compat-sandbox-pool    # same, under a restrictive sandbox
+just fc-compat-pool-stock      # warm-pool restore (stock-init flavor)
+just fc-compat-sandbox-pool-stock # same, under a restrictive sandbox
+just fc-compat-snapshot        # save/stop/fresh-process/load round-trip
+just fc-compat-sandbox-snapshot # same, under a restrictive sandbox
 ```
 
 `fc-compat-config` runs in GitHub Actions on every PR and catches
@@ -209,5 +220,5 @@ apple/container kernel + rootfs artifacts and remain local/e2e smokes.
 `fc-compat-vsock-e2e` is headless but boots a real VM: it configures MMDS,
 configures `PUT /vsock`, reaches the guest agent through Firecracker's UDS
 `CONNECT 1234` bridge, asks the agent to fetch MMDS from guest vsock port
-`16992`, and validates a generic guest-port echo exchange over the same UDS
-bridge.
+`16992`, validates the guest-side `169.254.169.254:80` MMDS shim, and validates
+an arbitrary guest-port echo exchange over the same UDS bridge.

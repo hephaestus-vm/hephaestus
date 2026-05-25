@@ -20,11 +20,13 @@
 use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 // OwnedFd is used via its AsRawFd impl on the listen socket.
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 use nix::mount::{MsFlags, mount};
 use nix::sys::reboot::{RebootMode, reboot};
@@ -205,6 +207,12 @@ fn run_command(cmd: &str) -> AgentResult<i32> {
             Ok(1)
         });
     }
+    if let Some(needle) = cmd.strip_prefix("__hephaestus_test_mmds_linklocal ") {
+        return test_mmds_linklocal(needle).map(|()| 0).or_else(|err| {
+            eprintln!("hephaestus-agent: mmds-linklocal test failed: {err}");
+            Ok(1)
+        });
+    }
     if let Some(args) = cmd.strip_prefix("__hephaestus_test_vsock_suite ") {
         return test_vsock_suite(args).map(|()| 0).or_else(|err| {
             eprintln!("hephaestus-agent: vsock suite failed: {err}");
@@ -234,7 +242,7 @@ fn run_command(cmd: &str) -> AgentResult<i32> {
     }
 }
 
-fn test_mmds_vsock(needle: &str) -> AgentResult<()> {
+fn fetch_mmds_vsock_response() -> AgentResult<Vec<u8>> {
     let fd = socket(
         AddressFamily::Vsock,
         SockType::Stream,
@@ -251,16 +259,83 @@ fn test_mmds_vsock(needle: &str) -> AgentResult<()> {
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: mmds\r\nConnection: close\r\n\r\n")
         .map_err(|e| format!("mmds request write: {e}"))?;
-    let mut response = String::new();
+    let mut response = Vec::new();
     stream
-        .read_to_string(&mut response)
+        .read_to_end(&mut response)
         .map_err(|e| format!("mmds response read: {e}"))?;
+    Ok(response)
+}
+
+fn test_mmds_vsock(needle: &str) -> AgentResult<()> {
+    let response = fetch_mmds_vsock_response()?;
+    let response = String::from_utf8_lossy(&response);
     if !response.contains(needle) {
         return Err(format!(
             "mmds response did not contain {needle:?}: {response:?}"
         ));
     }
     eprintln!("hephaestus-agent: mmds-vsock test matched {needle:?}");
+    Ok(())
+}
+
+fn configure_linklocal_loopback() -> AgentResult<()> {
+    // Prefer `ip` when present, but fall back to busybox ifconfig. The agent
+    // runs as root/PID1, so this is enough for our controlled e2e rootfs while
+    // the longer-term transparent host-network MMDS path remains separate.
+    let script = r#"
+        (ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true)
+        (ip addr add 169.254.169.254/32 dev lo 2>/dev/null || \
+         ifconfig lo:heph 169.254.169.254 netmask 255.255.255.255 up 2>/dev/null || true)
+    "#;
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .status()
+        .map_err(|e| format!("configure link-local loopback: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("configure link-local loopback exited {status}"))
+    }
+}
+
+fn test_mmds_linklocal(needle: &str) -> AgentResult<()> {
+    configure_linklocal_loopback()?;
+    let listener = TcpListener::bind(("169.254.169.254", 80))
+        .map_err(|e| format!("bind 169.254.169.254:80: {e}"))?;
+    let proxy = std::thread::spawn(move || -> AgentResult<()> {
+        let (mut client, _) = listener.accept().map_err(|e| format!("mmds tcp accept: {e}"))?;
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|e| format!("mmds tcp set timeout: {e}"))?;
+        let mut request_buf = [0u8; 1024];
+        let _ = client.read(&mut request_buf);
+        let response = fetch_mmds_vsock_response()?;
+        client
+            .write_all(&response)
+            .map_err(|e| format!("mmds tcp response write: {e}"))?;
+        client.flush().map_err(|e| format!("mmds tcp flush: {e}"))?;
+        Ok(())
+    });
+
+    let mut stream = TcpStream::connect(("169.254.169.254", 80))
+        .map_err(|e| format!("connect 169.254.169.254:80: {e}"))?;
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: 169.254.169.254\r\nConnection: close\r\n\r\n")
+        .map_err(|e| format!("link-local request write: {e}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("link-local response read: {e}"))?;
+    proxy
+        .join()
+        .map_err(|_| "mmds link-local proxy panicked".to_string())??;
+    if !response.contains(needle) {
+        return Err(format!(
+            "link-local MMDS response did not contain {needle:?}: {response:?}"
+        ));
+    }
+    eprintln!("hephaestus-agent: mmds-linklocal test matched {needle:?}");
     Ok(())
 }
 
@@ -281,6 +356,7 @@ fn test_vsock_suite(args: &str) -> AgentResult<()> {
         .to_vec();
 
     test_mmds_vsock(needle)?;
+    test_mmds_linklocal(needle)?;
     test_vsock_echo(echo_port, &token)?;
     Ok(())
 }

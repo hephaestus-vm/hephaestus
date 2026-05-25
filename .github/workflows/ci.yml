@@ -76,3 +76,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: scripts/fc-compat-config-only.sh
+
+  fc-compat-sandbox-config:
+    name: Firecracker API restrictive sandbox compat
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: compat/firectl-harness/go.mod
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/fc-compat-sandbox-config.sh

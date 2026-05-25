@@ -28,6 +28,7 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
 mod backend;
+mod sandbox;
 mod server;
 
 use backend::VzBackend;
@@ -47,11 +48,49 @@ struct Args {
     /// for the agent-init divergence note.
     #[arg(long)]
     pool_dir: Option<PathBuf>,
+    /// Experimental macOS sandbox profile to enter before serving requests.
+    /// The profile must allow the API socket plus all kernel/rootfs/log/snapshot
+    /// paths the client will later configure. This is the first jailer hook, not
+    /// a full Firecracker jailer replacement yet.
+    #[arg(long)]
+    sandbox_profile: Option<PathBuf>,
+    /// Test-only jailer probe: after entering the sandbox, try to read this
+    /// path and fail startup if the read succeeds. Used by restrictive-profile
+    /// e2e to prove the sandbox denies paths outside the generated allowlist.
+    #[arg(long, hide = true)]
+    sandbox_deny_probe: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    if let Some(path) = args.sandbox_profile.as_deref() {
+        let profile = std::fs::read_to_string(path)?;
+        sandbox::apply_profile(&profile)
+            .map_err(|err| format!("failed to apply sandbox profile {}: {err}", path.display()))?;
+        eprintln!(
+            "hephaestus-firecracker: entered sandbox profile {}",
+            path.display()
+        );
+        if let Some(probe) = args.sandbox_deny_probe.as_deref() {
+            match std::fs::read(probe) {
+                Ok(_) => {
+                    return Err(format!(
+                        "sandbox deny probe unexpectedly read {}",
+                        probe.display()
+                    )
+                    .into());
+                }
+                Err(err) => {
+                    eprintln!(
+                        "hephaestus-firecracker: sandbox deny probe blocked {} ({err})",
+                        probe.display()
+                    );
+                }
+            }
+        }
+    }
 
     // Remove any stale socket from a previous run; UnixListener::bind fails
     // if the path already exists.

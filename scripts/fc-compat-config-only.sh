@@ -21,6 +21,7 @@ sock="$tmp/fc.sock"
 kernel="$tmp/dummy-vmlinux"
 rootfs="$tmp/dummy-rootfs.ext4"
 log="$tmp/fc-compat.log"
+sandbox_profile="$tmp/permissive.sb"
 server=""
 
 cleanup() {
@@ -33,10 +34,15 @@ cleanup() {
 trap cleanup EXIT
 
 touch "$kernel" "$rootfs"
+cat >"$sandbox_profile" <<'EOF'
+(version 1)
+(allow default)
+EOF
 
 ./build/cargo_target/debug/hephaestus-firecracker \
   --api-sock "$sock" \
   --id fc-compat-config \
+  --sandbox-profile "$sandbox_profile" \
   >"$tmp/server.out" \
   2>"$tmp/server.err" &
 server=$!

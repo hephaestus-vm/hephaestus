@@ -132,9 +132,10 @@ For direct-VZ VMs, hephaestus exposes that JSON inside the guest through a
 reserved virtio-vsock service on port `16992` (port `1234` stays reserved for
 `hephaestus-agent`). The Swift bridge installs a `VZVirtioSocketListener` via
 `hb_vz_long_serve_mmds`; each guest connection gets an HTTP/1.1 JSON response
-with the current MMDS document. This does **not** emulate Firecracker's
-link-local IP path (`169.254.169.254`) yet; it is the macOS/VZ transport for
-metadata until a network-level shim exists.
+with the current MMDS document. Controlled agent-flavor e2e guests can also
+exercise a guest-side `169.254.169.254:80` shim that forwards to this vsock
+service. This is still not transparent host-network MMDS for arbitrary existing
+guest images; see [JAILER_MMDS_PLAN.md](JAILER_MMDS_PLAN.md).
 
 ## Match key
 
