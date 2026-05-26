@@ -6,24 +6,31 @@
 //! 1. The kernel hands us PID 1 out of the initramfs.
 //! 2. We mount /proc, /sys, /dev, the container rootfs on /dev/vda, then
 //!    `chroot` into the rootfs.
-//! 3. We listen on vsock port 1234. The host connects and sends a
+//! 3. Unless disabled with `HEPHAESTUS_MMDS_SHIM=0` or
+//!    `hephaestus.mmds=off`, we start a guest-side link-local MMDS shim:
+//!    `http://169.254.169.254/` forwards to host vsock port 16992.
+//! 4. We listen on vsock port 1234. The host connects and sends a
 //!    length-prefixed UTF-8 command string.
-//! 4. We `fork` + `exec /bin/sh -c <cmd>` and `waitpid`.
-//! 5. We write the exit code back over the same vsock connection as a
+//! 5. We `fork` + `exec /bin/sh -c <cmd>` and `waitpid`.
+//! 6. We write the exit code back over the same vsock connection as a
 //!    little-endian i32, close, `sync`, and call
 //!    `reboot(RB_POWER_OFF)` so the host observes a clean `.stopped`
 //!    state transition.
 //!
-//! The wire protocol is intentionally trivial — no framing beyond the
-//! length prefix — because there's exactly one exchange per boot.
+//! `hephaestus-agent mmds-shim` also runs the same shim as a foreground
+//! helper for custom images that want to launch it from their own init.
+//!
+//! The command wire protocol is intentionally trivial — no framing beyond
+//! the length prefix — because there's exactly one exchange per boot.
 
-use std::ffi::CString;
+use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 // OwnedFd is used via its AsRawFd impl on the listen socket.
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::time::Duration;
@@ -33,8 +40,7 @@ use nix::sys::reboot::{RebootMode, reboot};
 use nix::sys::socket::{
     AddressFamily, Backlog, SockFlag, SockType, VsockAddr, accept, bind, connect, listen, socket,
 };
-use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, chdir, chroot, execv, fork};
+use nix::unistd::{chdir, chroot};
 
 type AgentResult<T> = Result<T, String>;
 
@@ -42,10 +48,25 @@ type AgentResult<T> = Result<T, String>;
 /// agent per VM; the host knows where to connect.
 const COMMAND_PORT: u32 = 1234;
 const MMDS_VSOCK_PORT: u32 = 16_992;
+const MMDS_LINKLOCAL_ADDR: &str = "169.254.169.254";
+const MMDS_LINKLOCAL_PORT: u16 = 80;
 const VMADDR_CID_HOST: u32 = 2;
 
 fn main() -> ExitCode {
-    eprintln!("hephaestus-agent: init starting (pid {})", std::process::id());
+    if env::args().nth(1).as_deref() == Some("mmds-shim") {
+        return match run_mmds_linklocal_shim() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("hephaestus-agent: mmds-shim fatal: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    eprintln!(
+        "hephaestus-agent: init starting (pid {})",
+        std::process::id()
+    );
     match run() {
         Ok(()) => {
             eprintln!("hephaestus-agent: run returned Ok unexpectedly");
@@ -62,6 +83,8 @@ fn run() -> AgentResult<()> {
     mount_essentials()?;
     mount_rootfs("/dev/vda", "/newroot")?;
     enter_rootfs("/newroot")?;
+
+    maybe_start_mmds_linklocal_shim();
 
     // Open the vsock socket BEFORE the host tries to connect. Once listen
     // has returned, any connect from the host will succeed.
@@ -124,10 +147,30 @@ fn enter_rootfs(new_root: &str) -> AgentResult<()> {
     for sub in ["proc", "sys", "dev", "tmp"] {
         mkdir_p(&format!("{new_root}/{sub}"))?;
     }
-    let _ = do_mount(Some("/proc"), &format!("{new_root}/proc"), None, MsFlags::MS_BIND);
-    let _ = do_mount(Some("/sys"), &format!("{new_root}/sys"), None, MsFlags::MS_BIND);
-    let _ = do_mount(Some("/dev"), &format!("{new_root}/dev"), None, MsFlags::MS_BIND);
-    let _ = do_mount(Some("/tmp"), &format!("{new_root}/tmp"), None, MsFlags::MS_BIND);
+    let _ = do_mount(
+        Some("/proc"),
+        &format!("{new_root}/proc"),
+        None,
+        MsFlags::MS_BIND,
+    );
+    let _ = do_mount(
+        Some("/sys"),
+        &format!("{new_root}/sys"),
+        None,
+        MsFlags::MS_BIND,
+    );
+    let _ = do_mount(
+        Some("/dev"),
+        &format!("{new_root}/dev"),
+        None,
+        MsFlags::MS_BIND,
+    );
+    let _ = do_mount(
+        Some("/tmp"),
+        &format!("{new_root}/tmp"),
+        None,
+        MsFlags::MS_BIND,
+    );
     chroot(new_root).map_err(|e| format!("chroot({new_root}): {e}"))?;
     chdir("/").map_err(|e| format!("chdir(/): {e}"))?;
     Ok(())
@@ -220,29 +263,24 @@ fn run_command(cmd: &str) -> AgentResult<i32> {
         });
     }
 
-    let sh = CString::new("/bin/sh").unwrap();
-    let flag = CString::new("-c").unwrap();
-    let cmd_c = CString::new(cmd).map_err(|e| format!("cmd has NUL byte: {e}"))?;
-
-    // SAFETY: single-threaded agent; post-fork we only call async-signal-safe
-    // operations before execv.
-    match unsafe { fork() }.map_err(|e| format!("fork: {e}"))? {
-        ForkResult::Parent { child } => match waitpid(child, None) {
-            Ok(WaitStatus::Exited(_, code)) => Ok(code),
-            Ok(WaitStatus::Signaled(_, sig, _)) => Ok(128 + sig as i32),
-            Ok(other) => Err(format!("unexpected wait status: {other:?}")),
-            Err(e) => Err(format!("waitpid: {e}")),
-        },
-        ForkResult::Child => {
-            let _ = execv(&sh, &[sh.as_c_str(), flag.as_c_str(), cmd_c.as_c_str()]);
-            // execv only returns on error.
-            eprintln!("hephaestus-agent: execv failed");
-            std::process::exit(127);
-        }
-    }
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cmd)
+        .status()
+        .map_err(|e| format!("exec /bin/sh: {e}"))?;
+    Ok(match status.code() {
+        Some(code) => code,
+        None => 128 + status.signal().unwrap_or(0),
+    })
 }
 
 fn fetch_mmds_vsock_response() -> AgentResult<Vec<u8>> {
+    fetch_mmds_vsock_response_for_request(
+        b"GET / HTTP/1.1\r\nHost: mmds\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+    )
+}
+
+fn fetch_mmds_vsock_response_for_request(request: &[u8]) -> AgentResult<Vec<u8>> {
     let fd = socket(
         AddressFamily::Vsock,
         SockType::Stream,
@@ -257,7 +295,10 @@ fn fetch_mmds_vsock_response() -> AgentResult<Vec<u8>> {
     // Prevent OwnedFd from closing the descriptor now owned by UnixStream.
     std::mem::forget(fd);
     stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: mmds\r\nConnection: close\r\n\r\n")
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("mmds vsock set read timeout: {e}"))?;
+    stream
+        .write_all(request)
         .map_err(|e| format!("mmds request write: {e}"))?;
     let mut response = Vec::new();
     stream
@@ -282,11 +323,14 @@ fn configure_linklocal_loopback() -> AgentResult<()> {
     // Prefer `ip` when present, but fall back to busybox ifconfig. The agent
     // runs as root/PID1, so this is enough for our controlled e2e rootfs while
     // the longer-term transparent host-network MMDS path remains separate.
-    let script = r#"
+    let script = format!(
+        r#"
         (ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true)
-        (ip addr add 169.254.169.254/32 dev lo 2>/dev/null || \
-         ifconfig lo:heph 169.254.169.254 netmask 255.255.255.255 up 2>/dev/null || true)
-    "#;
+        (ip addr add {addr}/32 dev lo 2>/dev/null || \
+         ifconfig lo:heph {addr} netmask 255.255.255.255 up 2>/dev/null || true)
+    "#,
+        addr = MMDS_LINKLOCAL_ADDR
+    );
     let status = Command::new("/bin/sh")
         .arg("-c")
         .arg(script)
@@ -299,37 +343,128 @@ fn configure_linklocal_loopback() -> AgentResult<()> {
     }
 }
 
-fn test_mmds_linklocal(needle: &str) -> AgentResult<()> {
-    configure_linklocal_loopback()?;
-    let listener = TcpListener::bind(("169.254.169.254", 80))
-        .map_err(|e| format!("bind 169.254.169.254:80: {e}"))?;
-    let proxy = std::thread::spawn(move || -> AgentResult<()> {
-        let (mut client, _) = listener.accept().map_err(|e| format!("mmds tcp accept: {e}"))?;
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|e| format!("mmds tcp set timeout: {e}"))?;
-        let mut request_buf = [0u8; 1024];
-        let _ = client.read(&mut request_buf);
-        let response = fetch_mmds_vsock_response()?;
-        client
-            .write_all(&response)
-            .map_err(|e| format!("mmds tcp response write: {e}"))?;
-        client.flush().map_err(|e| format!("mmds tcp flush: {e}"))?;
-        Ok(())
-    });
+fn mmds_linklocal_enabled() -> bool {
+    if matches!(
+        env::var("HEPHAESTUS_MMDS_SHIM").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    ) {
+        return false;
+    }
+    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    !cmdline.split_ascii_whitespace().any(|arg| {
+        matches!(
+            arg,
+            "hephaestus.mmds=0"
+                | "hephaestus.mmds=off"
+                | "hephaestus.mmds=false"
+                | "hephaestus.mmds_shim=0"
+                | "hephaestus.mmds_shim=off"
+                | "hephaestus.mmds_shim=false"
+        )
+    })
+}
 
-    let mut stream = TcpStream::connect(("169.254.169.254", 80))
-        .map_err(|e| format!("connect 169.254.169.254:80: {e}"))?;
+fn maybe_start_mmds_linklocal_shim() {
+    if !mmds_linklocal_enabled() {
+        eprintln!("hephaestus-agent: link-local MMDS shim disabled");
+        return;
+    }
+    std::thread::spawn(|| {
+        if let Err(err) = run_mmds_linklocal_shim() {
+            eprintln!("hephaestus-agent: link-local MMDS shim stopped: {err}");
+        }
+    });
+}
+
+fn run_mmds_linklocal_shim() -> AgentResult<()> {
+    configure_linklocal_loopback()?;
+    let listener = TcpListener::bind((MMDS_LINKLOCAL_ADDR, MMDS_LINKLOCAL_PORT))
+        .map_err(|e| format!("bind {MMDS_LINKLOCAL_ADDR}:{MMDS_LINKLOCAL_PORT}: {e}"))?;
+    eprintln!(
+        "hephaestus-agent: link-local MMDS shim listening on http://{MMDS_LINKLOCAL_ADDR}:{MMDS_LINKLOCAL_PORT}/ -> vsock:{MMDS_VSOCK_PORT}"
+    );
+    for conn in listener.incoming() {
+        match conn {
+            Ok(client) => {
+                std::thread::spawn(move || {
+                    if let Err(err) = handle_mmds_linklocal_client(client) {
+                        eprintln!("hephaestus-agent: link-local MMDS request failed: {err}");
+                    }
+                });
+            }
+            Err(err) => eprintln!("hephaestus-agent: link-local MMDS accept failed: {err}"),
+        }
+    }
+    Ok(())
+}
+
+fn handle_mmds_linklocal_client(mut client: TcpStream) -> AgentResult<()> {
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|e| format!("mmds tcp set timeout: {e}"))?;
+    let request = read_http_request_head(&mut client)?;
+    let response = fetch_mmds_vsock_response_for_request(&request)?;
+    client
+        .write_all(&response)
+        .map_err(|e| format!("mmds tcp response write: {e}"))?;
+    client.flush().map_err(|e| format!("mmds tcp flush: {e}"))?;
+    Ok(())
+}
+
+fn read_http_request_head(client: &mut TcpStream) -> AgentResult<Vec<u8>> {
+    let mut request = Vec::with_capacity(512);
+    let mut buf = [0u8; 512];
+    loop {
+        match client.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") || request.len() >= 16 * 1024 {
+                    break;
+                }
+            }
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => break,
+            Err(err) => return Err(format!("mmds tcp request read: {err}")),
+        }
+    }
+    if request.is_empty() {
+        request.extend_from_slice(
+            b"GET / HTTP/1.1\r\nHost: 169.254.169.254\r\nConnection: close\r\n\r\n",
+        );
+    }
+    Ok(request)
+}
+
+fn fetch_mmds_linklocal_response() -> AgentResult<String> {
+    let mut stream = TcpStream::connect((MMDS_LINKLOCAL_ADDR, MMDS_LINKLOCAL_PORT))
+        .map_err(|e| format!("connect {MMDS_LINKLOCAL_ADDR}:{MMDS_LINKLOCAL_PORT}: {e}"))?;
     stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: 169.254.169.254\r\nConnection: close\r\n\r\n")
+        .write_all(
+            b"GET / HTTP/1.1\r\nHost: 169.254.169.254\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        )
         .map_err(|e| format!("link-local request write: {e}"))?;
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
         .map_err(|e| format!("link-local response read: {e}"))?;
-    proxy
-        .join()
-        .map_err(|_| "mmds link-local proxy panicked".to_string())??;
+    Ok(response)
+}
+
+fn test_mmds_linklocal(needle: &str) -> AgentResult<()> {
+    let response = match fetch_mmds_linklocal_response() {
+        Ok(response) => response,
+        Err(first_err) => {
+            std::thread::spawn(|| {
+                if let Err(err) = run_mmds_linklocal_shim() {
+                    eprintln!("hephaestus-agent: test link-local MMDS shim stopped: {err}");
+                }
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            fetch_mmds_linklocal_response().map_err(|retry_err| {
+                format!("{retry_err}; initial attempt failed with: {first_err}")
+            })?
+        }
+    };
     if !response.contains(needle) {
         return Err(format!(
             "link-local MMDS response did not contain {needle:?}: {response:?}"

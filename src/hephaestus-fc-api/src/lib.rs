@@ -40,11 +40,14 @@ mod property_tests {
     use super::vmm_config::boot_source::BootSourceConfig;
     use super::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
     use super::vmm_config::logger::LoggerConfig;
-    use super::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
+    use super::vmm_config::machine_config::{HugePageConfig, MachineConfig, MachineConfigUpdate};
     use super::vmm_config::metrics::MetricsConfig;
-    use super::vmm_config::mmds::MmdsConfig;
+    use super::vmm_config::mmds::{MmdsConfig, MmdsVersion};
     use super::vmm_config::net::NetworkInterfaceConfig;
-    use super::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotConfig};
+    use super::vmm_config::snapshot::{
+        CreateSnapshotParams, LoadSnapshotConfig, MemBackendType, SnapshotType,
+    };
+    use super::vmm_config::version::{FIRECRACKER_COMPAT_VERSION, FirecrackerVersion};
     use super::vmm_config::vm::UpdatedVm;
     use super::vmm_config::vsock::VsockConfig;
     use proptest::prelude::*;
@@ -70,6 +73,117 @@ mod property_tests {
 
     fn parse_is_clean<T: DeserializeOwned>(value: &Value) {
         let _ = serde_json::from_value::<T>(value.clone()).map_err(|err| err.to_string());
+    }
+
+    #[test]
+    fn upstream_api_version_wire_shape() {
+        let value = serde_json::to_value(FirecrackerVersion::default()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "firecracker_version": FIRECRACKER_COMPAT_VERSION })
+        );
+    }
+
+    #[test]
+    fn upstream_machine_config_wire_shape_and_patch_semantics() {
+        let full: MachineConfig = serde_json::from_value(serde_json::json!({
+            "vcpu_count": 2,
+            "mem_size_mib": 256,
+            "smt": true,
+            "cpu_template": "T2",
+            "track_dirty_pages": true,
+            "huge_pages": "2M"
+        }))
+        .unwrap();
+        assert_eq!(full.vcpu_count, 2);
+        assert_eq!(full.mem_size_mib, 256);
+        assert_eq!(full.cpu_template, Some(serde_json::json!("T2")));
+        assert_eq!(full.huge_pages, HugePageConfig::Hugetlbfs2M);
+        assert_eq!(
+            serde_json::to_value(MachineConfig::default()).unwrap(),
+            serde_json::json!({
+                "vcpu_count": 1,
+                "mem_size_mib": 128,
+                "smt": false,
+                "track_dirty_pages": false,
+                "huge_pages": "None"
+            })
+        );
+
+        let patch: MachineConfigUpdate = serde_json::from_value(serde_json::json!({
+            "mem_size_mib": 512,
+            "track_dirty_pages": false
+        }))
+        .unwrap();
+        assert!(!patch.is_empty());
+        assert_eq!(patch.mem_size_mib, Some(512));
+        assert_eq!(patch.track_dirty_pages, Some(false));
+        assert!(
+            serde_json::from_value::<MachineConfigUpdate>(serde_json::json!({}))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            serde_json::from_value::<MachineConfig>(serde_json::json!({
+                "vcpu_count": 1,
+                "mem_size_mib": 128,
+                "unknown": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn upstream_mmds_vsock_snapshot_wire_shapes() {
+        let mmds: MmdsConfig = serde_json::from_value(serde_json::json!({
+            "network_interfaces": ["eth0"],
+            "version": "V2",
+            "ipv4_address": "169.254.169.254"
+        }))
+        .unwrap();
+        assert_eq!(mmds.version, Some(MmdsVersion::V2));
+        assert_eq!(
+            serde_json::to_value(MmdsConfig::default()).unwrap(),
+            serde_json::json!({
+                "network_interfaces": [],
+                "version": "V1"
+            })
+        );
+
+        let vsock: VsockConfig = serde_json::from_value(serde_json::json!({
+            "guest_cid": 3,
+            "uds_path": "/tmp/firecracker.vsock",
+            "vsock_id": "vsock0"
+        }))
+        .unwrap();
+        assert_eq!(vsock.guest_cid, 3);
+        assert_eq!(
+            vsock.uds_path,
+            std::path::PathBuf::from("/tmp/firecracker.vsock")
+        );
+        assert_eq!(vsock.vsock_id.as_deref(), Some("vsock0"));
+
+        let create: CreateSnapshotParams = serde_json::from_value(serde_json::json!({
+            "snapshot_path": "/tmp/vm.snap",
+            "mem_file_path": "/tmp/vm.mem",
+            "snapshot_type": "Diff",
+            "version": "1.0.0"
+        }))
+        .unwrap();
+        assert_eq!(create.snapshot_type, SnapshotType::Diff);
+
+        let load: LoadSnapshotConfig = serde_json::from_value(serde_json::json!({
+            "snapshot_path": "/tmp/vm.snap",
+            "mem_backend": {"backend_path": "/tmp/vm.mem", "backend_type": "Uffd"},
+            "enable_diff_snapshots": true,
+            "track_dirty_pages": true,
+            "resume_vm": true
+        }))
+        .unwrap();
+        assert_eq!(load.mem_backend.unwrap().backend_type, MemBackendType::Uffd);
+        assert!(load.enable_diff_snapshots);
+        assert!(load.track_dirty_pages);
+        assert!(load.resume_vm);
     }
 
     proptest! {

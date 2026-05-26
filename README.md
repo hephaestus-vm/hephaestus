@@ -149,7 +149,7 @@ per-endpoint notes and known deviations.
 | `PUT /snapshot/create`                | ✓          | A+stub (single blob at `snapshot_path`)    |
 | `PUT /snapshot/load`                  | ✓          | Round-trip across process restart          |
 | `GET /version`                        | ✓          | Reports pinned Firecracker compat version  |
-| `GET/PUT/PATCH /mmds`, `PUT /mmds/config` | ⚠︎     | Stored JSON; guest vsock port 16992        |
+| `GET/PUT/PATCH /mmds`, `PUT /mmds/config` | ⚠︎     | Stored JSON; guest vsock/link-local path GETs via agent shim |
 | `PUT /vsock`                         | ⚠︎         | Host UDS `CONNECT <port>` bridge after boot |
 | balloon / entropy / cpu-config / pmem / serial / hotplug memory / vm config | ✗ | Routed, return Firecracker-shaped errors |
 

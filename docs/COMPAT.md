@@ -155,13 +155,18 @@ migration between hephaestus processes).
   metadata without hitting 404s. On direct-VZ long-running VMs, the current
   MMDS JSON is also served to guest-initiated vsock connections on reserved
   port `16992` as an HTTP/1.1 JSON response. This is practical guest-visible
-  metadata, not Firecracker's link-local `169.254.169.254` network path; the
-  MMDS config's interface binding/version are stored but not enforced. If an
-  `ipv4_address` is supplied it must be in Firecracker's link-local
-  `169.254.0.0/16` range. Controlled hephaestus-agent e2e guests also validate
-  a guest-side shim that serves `http://169.254.169.254/` by forwarding to the
-  vsock MMDS service; transparent host-network MMDS for arbitrary existing
-  guest images is not emulated yet.
+  metadata. The bundled `hephaestus-agent` starts a guest-side link-local
+  MMDS shim by default: it configures `169.254.169.254/32` on loopback, listens
+  on `http://169.254.169.254/`, and forwards requests to the vsock MMDS service.
+  The vsock service handles Firecracker-style GET paths into the JSON data store:
+  `Accept: application/json` returns JSON subtrees, while the default/plain-text
+  response lists object keys or returns string leaves in IMDS format. Custom
+  images can launch the same helper with `hephaestus-agent mmds-shim`,
+  or disable the PID1 auto-start with `HEPHAESTUS_MMDS_SHIM=0` /
+  `hephaestus.mmds=off`. The MMDS config's interface binding/version are
+  stored but not enforced. If an `ipv4_address` is supplied it must be in
+  Firecracker's link-local `169.254.0.0/16` range. Transparent host-network
+  MMDS for arbitrary existing guest images is not emulated yet.
 - **`PUT /vsock`** — ⚠︎ Partial. Accepts Firecracker's `guest_cid`,
   `uds_path`, and deprecated `vsock_id` fields pre-boot. hephaestus stores
   `guest_cid` for wire compatibility but VZ assigns the actual CID. After

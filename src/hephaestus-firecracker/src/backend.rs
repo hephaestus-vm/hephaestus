@@ -20,7 +20,7 @@ use hephaestus_fc_api::vmm_config::metrics::MetricsConfig;
 use hephaestus_fc_api::vmm_config::mmds::MmdsConfig;
 use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
 use hephaestus_fc_api::vmm_config::snapshot::{
-    CreateSnapshotParams, LoadSnapshotConfig, MemBackendType, SnapshotType,
+    CreateSnapshotParams, LoadSnapshotConfig, MemBackendConfig, MemBackendType, SnapshotType,
 };
 use hephaestus_fc_api::vmm_config::vsock::VsockConfig;
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
@@ -1081,6 +1081,54 @@ mod tests {
     }
 
     #[test]
+    fn machine_config_matches_upstream_preboot_contract() {
+        let mut backend = VzBackend::new("test".into());
+
+        backend
+            .put_machine_config(MachineConfig {
+                vcpu_count: 2,
+                mem_size_mib: 256,
+                smt: false,
+                cpu_template: None,
+                track_dirty_pages: true,
+                huge_pages: Default::default(),
+            })
+            .unwrap();
+        backend
+            .patch_machine_config(MachineConfigUpdate {
+                vcpu_count: Some(1),
+                mem_size_mib: Some(128),
+                smt: Some(false),
+                cpu_template: None,
+                track_dirty_pages: Some(false),
+                huge_pages: None,
+            })
+            .unwrap();
+        assert_eq!(backend.get_machine_config(), MachineConfig::default());
+
+        let err = backend
+            .patch_machine_config(MachineConfigUpdate::default())
+            .unwrap_err();
+        assert!(matches!(err, VmmBackendError::InvalidConfig(_)));
+
+        let err = backend
+            .put_machine_config(MachineConfig {
+                vcpu_count: 0,
+                ..MachineConfig::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, VmmBackendError::InvalidConfig(_)));
+
+        let err = backend
+            .patch_machine_config(MachineConfigUpdate {
+                cpu_template: Some(serde_json::json!("T2")),
+                ..MachineConfigUpdate::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, VmmBackendError::NotSupported(_)));
+    }
+
+    #[test]
     fn preboot_only_config_rejects_after_start() {
         let mut backend = VzBackend::new("test".into());
         backend.state = VmState::Running;
@@ -1146,6 +1194,37 @@ mod tests {
             b"fake-vz-state"
         );
         assert_eq!(std::fs::read(&params.mem_file_path).unwrap(), b"");
+    }
+
+    #[test]
+    fn snapshot_load_rejects_upstream_linux_only_modes_before_vz_restore() {
+        let base = || LoadSnapshotConfig {
+            snapshot_path: temp_path("snapshot"),
+            mem_file_path: Some(temp_path("mem")),
+            mem_backend: None,
+            enable_diff_snapshots: false,
+            track_dirty_pages: false,
+            resume_vm: false,
+        };
+
+        let mut backend = VzBackend::new("test".into());
+        let mut cfg = base();
+        cfg.enable_diff_snapshots = true;
+        let err = backend.load_snapshot(cfg).unwrap_err();
+        assert!(matches!(err, VmmBackendError::NotSupported(_)));
+
+        let mut cfg = base();
+        cfg.track_dirty_pages = true;
+        let err = backend.load_snapshot(cfg).unwrap_err();
+        assert!(matches!(err, VmmBackendError::NotSupported(_)));
+
+        let mut cfg = base();
+        cfg.mem_backend = Some(MemBackendConfig {
+            backend_path: temp_path("uffd"),
+            backend_type: MemBackendType::Uffd,
+        });
+        let err = backend.load_snapshot(cfg).unwrap_err();
+        assert!(matches!(err, VmmBackendError::NotSupported(_)));
     }
 
     #[test]

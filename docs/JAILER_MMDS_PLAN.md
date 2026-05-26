@@ -39,9 +39,14 @@ The controlled-image shim should:
 3. Forward HTTP requests to host vsock port `16992`.
 4. Return the host's MMDS HTTP response unchanged where practical.
 
-The current real-VM e2e path exercises this in `hephaestus-agent` with an
-internal command used only by tests. That proves the transport before we turn it
-into a user-facing helper/package/initramfs feature.
+The host vsock MMDS service now also resolves Firecracker-style GET paths into
+the configured JSON data store, returning JSON for `Accept: application/json`
+and IMDS-style plain text otherwise.
+
+`hephaestus-agent` now ships this as a real guest-side feature. In PID1 mode it
+starts the shim automatically unless disabled with `HEPHAESTUS_MMDS_SHIM=0` or
+`hephaestus.mmds=off`; custom images can run the same foreground helper with
+`hephaestus-agent mmds-shim`.
 
 ### E2E plan
 
@@ -50,7 +55,7 @@ into a user-facing helper/package/initramfs feature.
 - **Local real-VM:** `fc-compat-vsock-e2e` boots a VM and now validates:
   - host UDS `CONNECT 1234` to the guest agent,
   - guest vsock fetch from host MMDS port `16992`,
-  - guest link-local fetch through the shim at `169.254.169.254:80`,
+  - guest link-local fetch through the supported shim at `169.254.169.254:80`,
   - generic non-MMDS vsock echo traffic.
 
 ### Host-network path, later

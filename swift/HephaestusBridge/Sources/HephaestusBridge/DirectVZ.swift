@@ -1071,6 +1071,23 @@ private final class ConnectionResultBox: @unchecked Sendable {
     var result: Result<VZVirtioSocketConnection, Error>?
 }
 
+private enum MmdsOutputFormat {
+    case json
+    case imds
+}
+
+private struct MmdsHttpRequest {
+    let method: String
+    let path: String
+    let outputFormat: MmdsOutputFormat
+}
+
+private struct MmdsHttpResponse {
+    let status: String
+    let contentType: String
+    let body: Data
+}
+
 private final class MmdsSocketService: NSObject, VZVirtioSocketListenerDelegate, @unchecked Sendable {
     let listener = VZVirtioSocketListener()
     let body: Data
@@ -1092,15 +1109,20 @@ private final class MmdsSocketService: NSObject, VZVirtioSocketListenerDelegate,
         connections.append(connection)
         lock.unlock()
         let fd = connection.fileDescriptor
-        let responseBody = body
+        let fallbackBody = body
         DispatchQueue.global(qos: .utility).async { [weak self, weak connection] in
             var scratch = [UInt8](repeating: 0, count: 4096)
-            _ = scratch.withUnsafeMutableBufferPointer { buf in
+            let n = scratch.withUnsafeMutableBufferPointer { buf in
                 read(fd, buf.baseAddress, buf.count)
             }
-            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(responseBody.count)\r\nConnection: close\r\n\r\n"
+            let requestBytes = n > 0 ? Data(scratch.prefix(n)) : Data()
+            let response = MmdsSocketService.response(
+                fallbackBody: fallbackBody,
+                requestBytes: requestBytes
+            )
+            let header = "HTTP/1.1 \(response.status)\r\nContent-Type: \(response.contentType)\r\nContent-Length: \(response.body.count)\r\nConnection: close\r\n\r\n"
             _ = header.withCString { ptr in write(fd, ptr, strlen(ptr)) }
-            responseBody.withUnsafeBytes { raw in
+            response.body.withUnsafeBytes { raw in
                 if let base = raw.baseAddress {
                     _ = write(fd, base, raw.count)
                 }
@@ -1113,6 +1135,110 @@ private final class MmdsSocketService: NSObject, VZVirtioSocketListenerDelegate,
             self?.lock.unlock()
         }
         return true
+    }
+
+    private static func response(
+        fallbackBody: Data,
+        requestBytes: Data
+    ) -> MmdsHttpResponse {
+        guard let request = parseRequest(requestBytes) else {
+            return MmdsHttpResponse(status: "200 OK", contentType: "application/json", body: fallbackBody)
+        }
+        guard request.method == "GET" else {
+            return textResponse("405 Method Not Allowed", "Method not allowed")
+        }
+        guard let root = try? JSONSerialization.jsonObject(with: fallbackBody, options: [.fragmentsAllowed]) else {
+            return MmdsHttpResponse(status: "200 OK", contentType: "application/json", body: fallbackBody)
+        }
+        guard let value = lookup(root: root, path: request.path) else {
+            return textResponse("404 Not Found", "The MMDS resource does not exist: \(request.path)")
+        }
+        switch request.outputFormat {
+        case .json:
+            do {
+                let data = try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed])
+                return MmdsHttpResponse(status: "200 OK", contentType: "application/json", body: data)
+            } catch {
+                return textResponse("500 Internal Server Error", "MMDS JSON serialization failed")
+            }
+        case .imds:
+            guard let text = formatImds(value) else {
+                return textResponse("501 Not Implemented", "Cannot retrieve value. The value has an unsupported type.")
+            }
+            return textResponse("200 OK", text)
+        }
+    }
+
+    private static func parseRequest(_ data: Data) -> MmdsHttpRequest? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map {
+            String($0).trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+        }
+        guard let requestLine = lines.first else { return nil }
+        let parts = requestLine.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2 else { return nil }
+        let method = String(parts[0]).uppercased()
+        let target = String(parts[1])
+        let path = sanitizePath(target)
+        let acceptsJson = lines.dropFirst().contains { line in
+            let lower = line.lowercased()
+            return lower.hasPrefix("accept:") && lower.contains("application/json")
+        }
+        return MmdsHttpRequest(method: method, path: path, outputFormat: acceptsJson ? .json : .imds)
+    }
+
+    private static func sanitizePath(_ target: String) -> String {
+        let rawPath: String
+        if let url = URL(string: target), let scheme = url.scheme, !scheme.isEmpty {
+            rawPath = url.path.isEmpty ? "/" : url.path
+        } else {
+            rawPath = String(target.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first ?? "/")
+        }
+        var path = rawPath.isEmpty ? "/" : rawPath
+        while path.contains("//") {
+            path = path.replacingOccurrences(of: "//", with: "/")
+        }
+        return path
+    }
+
+    private static func lookup(root: Any, path: String) -> Any? {
+        if path == "/" || path.isEmpty {
+            return root
+        }
+        var value: Any? = root
+        let trimmed = path.hasSuffix("/") ? String(path.dropLast()) : path
+        for component in trimmed.split(separator: "/").map(String.init) {
+            let key = component.replacingOccurrences(of: "~1", with: "/")
+                .replacingOccurrences(of: "~0", with: "~")
+            if let dict = value as? [String: Any] {
+                value = dict[key]
+            } else if let array = value as? [Any], let idx = Int(key), array.indices.contains(idx) {
+                value = array[idx]
+            } else {
+                return nil
+            }
+        }
+        return value
+    }
+
+    private static func formatImds(_ value: Any) -> String? {
+        if let dict = value as? [String: Any] {
+            return dict.keys.sorted().map { key in
+                if dict[key] is [String: Any] {
+                    return "\(key)/"
+                }
+                return key
+            }.joined(separator: "\n")
+        }
+        return value as? String
+    }
+
+    private static func textResponse(_ status: String, _ text: String) -> MmdsHttpResponse {
+        MmdsHttpResponse(
+            status: status,
+            contentType: "text/plain",
+            body: text.data(using: .utf8) ?? Data()
+        )
     }
 }
 
