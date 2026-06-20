@@ -10,6 +10,19 @@ rustflags = [
 # call fails with VZErrorDomain code 2.
 [target.aarch64-apple-darwin]
 linker = "scripts/link-and-sign.sh"
+# Xcode 27 beta's Swift static runtime emits a strong reference to
+# libswiftCompatibilitySpan.dylib, which only resolves via an LC_RPATH into
+# /usr/lib/swift (macOS 26+). The cli/firecracker build.rs emit this rpath,
+# but only with `-bin=` scoping, so test harnesses that transitively link
+# the Swift archive (hephaestus-pool, -vmm, -bridge) abort in dyld under
+# `cargo test`. Apply it target-wide so every macOS binary — tests included —
+# resolves the dylib at load. NOTE: a `[target.*]` rustflags block replaces
+# `[build].rustflags` rather than merging, so `-Ccodegen-units=1` is repeated
+# here to keep it in effect for the host target.
+rustflags = [
+  "-Ccodegen-units=1",
+  "-Clink-arg=-Wl,-rpath,/usr/lib/swift",
+]
 
 [net]
 git-fetch-with-cli = true
