@@ -75,7 +75,10 @@ pub async fn spawn(
     Ok(())
 }
 
-async fn handle(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Response<Full<Bytes>> {
+// Generic over the request body: `handle` only inspects the method, the
+// `Accept` header, and the URI path — never the body — so tests can drive it
+// with a bodyless `Request` instead of a live `Incoming` stream.
+async fn handle<B>(req: Request<B>, backend: Arc<Mutex<VzBackend>>) -> Response<Full<Bytes>> {
     if req.method() != Method::GET {
         return text_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed");
     }
@@ -225,5 +228,103 @@ mod tests {
         let mmds = serde_json::json!({"a": 1});
         assert_eq!(lookup(&mmds, "/"), Some(serde_json::json!({"a": 1})));
         assert_eq!(lookup(&mmds, ""), Some(serde_json::json!({"a": 1})));
+    }
+
+    // ── handle() control-plane coverage ──────────────────────────────────
+    // Drives the real HTTP dispatch (method check + Accept-based content
+    // negotiation + path lookup) without binding the privileged
+    // 169.254.169.254:80 socket, so it runs on CI with no entitlement.
+
+    use http_body_util::BodyExt;
+
+    async fn backend_with(mmds: Value) -> Arc<Mutex<VzBackend>> {
+        let mut backend = VzBackend::new("host-mmds-test".into());
+        backend.put_mmds(mmds).expect("put_mmds");
+        Arc::new(Mutex::new(backend))
+    }
+
+    fn get(uri: &str, accept_json: bool) -> Request<()> {
+        let mut builder = Request::builder().method(Method::GET).uri(uri);
+        if accept_json {
+            builder = builder.header(hyper::header::ACCEPT, "application/json");
+        }
+        builder.body(()).unwrap()
+    }
+
+    async fn parts(resp: Response<Full<Bytes>>) -> (StatusCode, String, String) {
+        let status = resp.status();
+        let ctype = resp
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, ctype, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    fn sample() -> Value {
+        serde_json::json!({
+            "latest": {
+                "meta-data": {
+                    "instance-id": "i-hephaestus",
+                    "placement": {"region": "us-mars-1"}
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn json_accept_returns_subtree_as_json() {
+        let backend = backend_with(sample()).await;
+        let resp = handle(get("/latest/meta-data", true), backend).await;
+        let (status, ctype, body) = parts(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ctype, "application/json");
+        let got: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(got["instance-id"], "i-hephaestus");
+    }
+
+    #[tokio::test]
+    async fn plain_accept_lists_object_keys_imds_style() {
+        let backend = backend_with(sample()).await;
+        let resp = handle(get("/latest/meta-data", false), backend).await;
+        let (status, ctype, body) = parts(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ctype, "text/plain");
+        // Directories get a trailing slash; keys sort; no JSON braces.
+        assert_eq!(body, "instance-id\nplacement/");
+    }
+
+    #[tokio::test]
+    async fn string_leaf_returns_raw_value_as_text() {
+        let backend = backend_with(sample()).await;
+        let resp = handle(get("/latest/meta-data/instance-id", false), backend).await;
+        let (status, ctype, body) = parts(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ctype, "text/plain");
+        assert_eq!(body, "i-hephaestus");
+    }
+
+    #[tokio::test]
+    async fn missing_path_is_404() {
+        let backend = backend_with(sample()).await;
+        let resp = handle(get("/latest/meta-data/nope", false), backend).await;
+        let (status, _ctype, body) = parts(resp).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("does not exist"), "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn non_get_is_405() {
+        let backend = backend_with(sample()).await;
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/latest/meta-data")
+            .body(())
+            .unwrap();
+        let resp = handle(req, backend).await;
+        let (status, _ctype, _body) = parts(resp).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     }
 }

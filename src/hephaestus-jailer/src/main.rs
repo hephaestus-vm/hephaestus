@@ -121,12 +121,29 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn run(args: Args) -> Result<u8, JailerError> {
+/// Everything the jailer resolves before exec: the binary to run, the per-VM
+/// work dir, and the paths it materializes inside it. Split out from `run` so
+/// the preparation — input validation, work-dir creation, and profile
+/// generation — is unit-testable without actually exec'ing the daemon.
+struct Plan {
+    binary: PathBuf,
+    work_dir: PathBuf,
+    api_sock: PathBuf,
+    profile_path: PathBuf,
+}
+
+/// Validate inputs, materialize the per-VM work dir, and write the generated
+/// sandbox profile. Returns the resolved paths; performs no exec.
+fn prepare(args: &Args) -> Result<Plan, JailerError> {
     if !args.kernel.exists() {
-        return Err(JailerError::KernelNotFound { path: args.kernel });
+        return Err(JailerError::KernelNotFound {
+            path: args.kernel.clone(),
+        });
     }
     if !args.rootfs.exists() {
-        return Err(JailerError::RootfsNotFound { path: args.rootfs });
+        return Err(JailerError::RootfsNotFound {
+            path: args.rootfs.clone(),
+        });
     }
 
     // Resolve the binary to exec. Default to `hephaestus-firecracker` on
@@ -188,30 +205,48 @@ fn run(args: Args) -> Result<u8, JailerError> {
         profile_path.display()
     );
 
-    // Exec the firecracker binary under the generated profile. The child
-    // enters the sandbox before serving the API socket, so every API
-    // request is bound by the profile.
-    let mut cmd = Command::new(&binary);
-    cmd.env("HEPHAESTUS_FC_WORK_DIR", &work_dir);
-    cmd.arg("--api-sock").arg(&api_sock);
+    Ok(Plan {
+        binary,
+        work_dir,
+        api_sock,
+        profile_path,
+    })
+}
+
+/// Build the `hephaestus-firecracker` command line from a prepared plan. Pure
+/// (no side effects, no exec) so a test can assert the args/env it produces.
+fn build_command(plan: &Plan, args: &Args) -> Command {
+    let mut cmd = Command::new(&plan.binary);
+    cmd.env("HEPHAESTUS_FC_WORK_DIR", &plan.work_dir);
+    cmd.arg("--api-sock").arg(&plan.api_sock);
     cmd.arg("--id").arg(&args.id);
-    cmd.arg("--sandbox-profile").arg(&profile_path);
+    cmd.arg("--sandbox-profile").arg(&plan.profile_path);
     if let Some(pool_dir) = args.pool_dir.as_deref() {
         cmd.arg("--pool-dir").arg(pool_dir);
     }
     if let Some(probe) = args.deny_probe.as_deref() {
         cmd.arg("--sandbox-deny-probe").arg(probe);
     }
+    cmd
+}
+
+fn run(args: Args) -> Result<u8, JailerError> {
+    let plan = prepare(&args)?;
+
+    // Exec the firecracker binary under the generated profile. The child
+    // enters the sandbox before serving the API socket, so every API
+    // request is bound by the profile.
+    let mut cmd = build_command(&plan, &args);
     eprintln!(
         "hephaestus-jailer: exec {} {}",
-        binary.display(),
+        plan.binary.display(),
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(" ")
     );
     let status = cmd.status().map_err(|source| JailerError::Exec {
-        binary: binary.clone(),
+        binary: plan.binary.clone(),
         source,
     })?;
     Ok(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1))
@@ -232,4 +267,142 @@ fn which(name: &str) -> Option<PathBuf> {
 /// Default work root: `$TMPDIR/hephaestus-jail` or `/tmp/hephaestus-jail`.
 fn default_work_root() -> PathBuf {
     std::env::temp_dir().join("hephaestus-jail")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Fresh, per-test scratch dir. Unique by test tag + pid so parallel
+    /// tests don't collide; wiped on entry so reruns start clean. Avoids a
+    /// tempfile dependency (the crate ships only clap + thiserror).
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("heph-jailer-test-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: PathBuf) -> PathBuf {
+        fs::write(&path, b"x").unwrap();
+        path
+    }
+
+    /// Args with all required inputs existing under `dir` and an explicit
+    /// fake firecracker binary, so `prepare` never falls back to `$PATH`.
+    fn args_in(dir: &Path) -> Args {
+        Args {
+            id: "vm-test".into(),
+            work_dir: Some(dir.join("work")),
+            firecracker_binary: Some(touch(dir.join("fake-firecracker"))),
+            kernel: touch(dir.join("vmlinux")),
+            rootfs: touch(dir.join("rootfs.ext4")),
+            initramfs: None,
+            pool_dir: None,
+            deny_probe: None,
+        }
+    }
+
+    fn arg_strings(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn prepare_rejects_missing_kernel() {
+        let dir = scratch("missing-kernel");
+        let mut args = args_in(&dir);
+        args.kernel = dir.join("no-such-kernel");
+        assert!(matches!(
+            prepare(&args),
+            Err(JailerError::KernelNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn prepare_rejects_missing_rootfs() {
+        let dir = scratch("missing-rootfs");
+        let mut args = args_in(&dir);
+        args.rootfs = dir.join("no-such-rootfs");
+        assert!(matches!(
+            prepare(&args),
+            Err(JailerError::RootfsNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn prepare_rejects_missing_binary() {
+        let dir = scratch("missing-binary");
+        let mut args = args_in(&dir);
+        args.firecracker_binary = Some(dir.join("no-such-binary"));
+        assert!(matches!(
+            prepare(&args),
+            Err(JailerError::BinaryNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn prepare_materializes_work_dir_and_profile() {
+        let dir = scratch("happy");
+        let args = args_in(&dir);
+        let plan = prepare(&args).expect("prepare should succeed");
+
+        assert!(plan.work_dir.is_dir(), "work dir should be created");
+        assert_eq!(plan.work_dir.file_name().unwrap(), "vm-test");
+        assert_eq!(plan.api_sock, plan.work_dir.join("api.sock"));
+        assert_eq!(plan.profile_path, plan.work_dir.join("sandbox.profile"));
+
+        let profile = fs::read_to_string(&plan.profile_path).expect("profile written");
+        assert!(!profile.is_empty(), "profile should be non-empty");
+        // The rootfs is granted read/write, so its name appears in the profile.
+        assert!(
+            profile.contains("rootfs.ext4"),
+            "profile should grant the rootfs path"
+        );
+    }
+
+    #[test]
+    fn build_command_wires_core_args_and_env() {
+        let dir = scratch("cmd-core");
+        let args = args_in(&dir);
+        let plan = prepare(&args).unwrap();
+        let cmd = build_command(&plan, &args);
+
+        let got = arg_strings(&cmd);
+        assert!(
+            got.windows(2)
+                .any(|w| w == ["--id".to_string(), "vm-test".to_string()])
+        );
+        assert!(got.iter().any(|a| a == "--api-sock"));
+        assert!(got.iter().any(|a| a == "--sandbox-profile"));
+        // pool-dir / deny-probe omitted when their args are None.
+        assert!(!got.iter().any(|a| a == "--pool-dir"));
+        assert!(!got.iter().any(|a| a == "--sandbox-deny-probe"));
+
+        let work_env = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "HEPHAESTUS_FC_WORK_DIR")
+            .and_then(|(_, v)| v)
+            .map(PathBuf::from);
+        assert_eq!(work_env.as_deref(), Some(plan.work_dir.as_path()));
+    }
+
+    #[test]
+    fn build_command_passes_pool_dir_and_deny_probe_when_set() {
+        let dir = scratch("cmd-opts");
+        let mut args = args_in(&dir);
+        // pool_dir is a directory (generate's subpath_form create_dir_all's it);
+        // deny_probe is just passed through as a CLI arg, never materialized.
+        args.pool_dir = Some(dir.join("pool"));
+        args.deny_probe = Some(dir.join("secret"));
+        let plan = prepare(&args).unwrap();
+        let cmd = build_command(&plan, &args);
+
+        let got = arg_strings(&cmd);
+        assert!(got.iter().any(|a| a == "--pool-dir"));
+        assert!(got.iter().any(|a| a == "--sandbox-deny-probe"));
+    }
 }
