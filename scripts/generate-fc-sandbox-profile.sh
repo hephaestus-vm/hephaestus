@@ -89,7 +89,7 @@ EOF
     echo
     echo ';; Explicit read-only VM inputs.'
     echo '(allow file-read-data'
-    for path in "${reads[@]}"; do
+    for path in ${reads[@]+"${reads[@]}"}; do
       printf '  %s\n' "$(literal_form "$path")"
     done
     echo ')'
@@ -99,10 +99,10 @@ EOF
     echo
     echo ';; Per-VM working directories/files: API socket, logs, metrics, snapshots.'
     echo '(allow file-read* file-write*'
-    for path in "${read_writes[@]}"; do
+    for path in ${read_writes[@]+"${read_writes[@]}"}; do
       printf '  %s\n' "$(subpath_form "$path")"
     done
-    for path in "${read_write_files[@]}"; do
+    for path in ${read_write_files[@]+"${read_write_files[@]}"}; do
       printf '  %s\n' "$(literal_form "$path")"
     done
     echo ')'
