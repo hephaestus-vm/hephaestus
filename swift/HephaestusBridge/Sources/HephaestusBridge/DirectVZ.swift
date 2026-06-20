@@ -977,14 +977,30 @@ private final class ExecSession: @unchecked Sendable {
         )
         config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)]
 
-        // URL-based serial: VZ can serialize this across save/restore.
-        // User can `tail -f` the log to see output in real time.
+        // First serial port (hvc0): URL-based so VZ can serialize it across
+        // save/restore. User can `tail -f` the log to see stdout in real time.
         let serialLog = logURL ?? URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("hephaestus-vz-exec-\(UUID().uuidString).log")
         FileManager.default.createFile(atPath: serialLog.path, contents: nil)
         let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
         serial.attachment = try VZFileSerialPortAttachment(url: serialLog, append: true)
-        config.serialPorts = [serial]
+
+        // Second serial port (hvc1): guest command stderr. URL-based too, so
+        // it survives save/restore exactly like hvc0 — a FileHandle pipe (what
+        // the cold-exec path uses to live-stream to host fd 2) would not. The
+        // agent dups /dev/hvc1 onto fd 2 before exec; without this port the
+        // restored guest has no hvc1 and stderr stays merged on hvc0. Stderr
+        // lands in a sibling `<log>.stderr` file rather than the host's fd 2:
+        // the restore path can't live-stream the way the cold path does, so
+        // file-level separation is the ceiling here. The save and restore
+        // configs must match shape, so both carry these two ports — which
+        // means snapshots taken before this change can no longer be restored.
+        let stderrLog = serialLog.appendingPathExtension("stderr")
+        FileManager.default.createFile(atPath: stderrLog.path, contents: nil)
+        let stderrSerial = VZVirtioConsoleDeviceSerialPortConfiguration()
+        stderrSerial.attachment = try VZFileSerialPortAttachment(url: stderrLog, append: true)
+
+        config.serialPorts = [serial, stderrSerial]
 
         config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
@@ -994,8 +1010,9 @@ private final class ExecSession: @unchecked Sendable {
         }
 
         // No Pipe → no readabilityHandler, no logHandle to close on our side.
-        // The snapshotable config uses URL-based serial attachments only, so
-        // stderr-split is not wired here; the second pipe stays inert.
+        // Both serial ports are URL-based, so the host reads the split streams
+        // from the `<log>` / `<log>.stderr` files rather than live pipes; the
+        // inert Pipes below just satisfy the initializer.
         return ExecSession(
             config: config,
             outputPipe: Pipe(),

@@ -18,9 +18,14 @@ numbers follow [Semantic Versioning](https://semver.org/).
 - **Separate stdout/stderr streams in `vz-exec`.** A second
   `VZVirtioConsoleDeviceSerialPortConfiguration` (hvc1) carries guest
   stderr to the host's stderr; the agent `dup2`s `/dev/hvc1` onto fd 2
-  before exec'ing the child. Best-effort: a missing `/dev/hvc1` (older
-  config, snapshot-restore path that uses URL serial attachments only)
-  leaves stderr on hvc0 and the streams stay merged — same as before.
+  before exec'ing the child. Cold boot live-streams hvc1 to host fd 2;
+  best-effort there means a missing `/dev/hvc1` leaves stderr merged on
+  hvc0. The snapshot/restore path (`vz-warm`) now also carries a second
+  hvc1 serial, but URL-based so it survives restore — stderr lands in a
+  sibling `<log>.stderr` file rather than the host's fd 2 (a restored VM
+  can't live-stream). NOTE: this adds a serial port to the saved VM
+  config, so `vz-warm` snapshots taken before this change can no longer
+  be restored (regenerate them with `vz-warm save`).
 - **`hephaestus-firecracker --host-mmds` scaffold.** Binds a host-side
   HTTP listener on `169.254.169.254:80` that serves the current MMDS JSON
   with Firecracker-style path-aware semantics (JSON subtrees for
