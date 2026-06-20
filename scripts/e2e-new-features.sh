@@ -3,6 +3,7 @@
 #   1. `hephaestus vz-exec --stdin` host-stdin forwarding.
 #   2. direct-VZ stdout/stderr split over hvc0/hvc1.
 #   3. `hephaestus-jailer` launching a real `hephaestus-firecracker` daemon.
+#   4. `vz-warm` snapshot/restore stderr split to a sibling `<log>.stderr` file.
 #
 # Requires apple/container kernel/rootfs artifacts. This is intentionally not
 # wired into GitHub-hosted CI; use `just e2e-new-features` on a Mac that can run
@@ -158,5 +159,52 @@ if ! compat/firectl-harness/firectl-harness \
   exit 1
 fi
 echo "hephaestus-jailer real-VM e2e passed"
+
+# 4. vz-warm snapshot/restore stderr split. The restored VM can't live-stream to
+# host fd 2, so the URL-based hvc1 lands stderr in the sibling <log>.stderr file
+# while stdout stays in --log. The save/run configs must match (same kernel,
+# initramfs, cpu/memory), so pass identical --cpus/--memory-mib to both.
+warm_rootfs=$(clone_rootfs warm)
+warm_state="$tmp/warm.state"
+warm_log="$tmp/warm.out"
+warm_err_log="$warm_log.stderr"
+warm_stdout_token="heph-warm-stdout-token-$(date +%s%N)"
+warm_stderr_token="heph-warm-stderr-token-$(date +%s%N)"
+"$heph" vz-warm save \
+  --kernel "$kernel" \
+  --rootfs "$warm_rootfs" \
+  --initramfs "$initramfs" \
+  --save "$warm_state" \
+  --cpus 2 \
+  --memory-mib 512
+"$heph" vz-warm run \
+  --kernel "$kernel" \
+  --rootfs "$warm_rootfs" \
+  --initramfs "$initramfs" \
+  --save "$warm_state" \
+  --cpus 2 \
+  --memory-mib 512 \
+  --log "$warm_log" \
+  --cmd "printf '%s\\n' '$warm_stdout_token'; printf '%s\\n' '$warm_stderr_token' >&2"
+dump_warm() {
+  echo "--- $warm_log ---" >&2; cat "$warm_log" >&2 2>/dev/null || true
+  echo "--- $warm_err_log ---" >&2; cat "$warm_err_log" >&2 2>/dev/null || true
+}
+if ! grep -Fq "$warm_stdout_token" "$warm_log"; then
+  echo "vz-warm stdout marker missing from stdout log" >&2
+  dump_warm
+  exit 1
+fi
+if [[ ! -f "$warm_err_log" ]] || ! grep -Fq "$warm_stderr_token" "$warm_err_log"; then
+  echo "vz-warm stderr marker missing from sibling .stderr log" >&2
+  dump_warm
+  exit 1
+fi
+if grep -Fq "$warm_stderr_token" "$warm_log"; then
+  echo "vz-warm stderr marker leaked into stdout log (still merged)" >&2
+  dump_warm
+  exit 1
+fi
+echo "vz-warm stderr-split e2e passed"
 
 echo "new-feature real-VM e2e passed"
