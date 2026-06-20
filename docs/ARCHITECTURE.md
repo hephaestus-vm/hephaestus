@@ -12,6 +12,8 @@ src/
 ├── hephaestus-cli/           ← `hephaestus` binary (run/rootfs/vz-*/pool)
 ├── hephaestus-firecracker/   ← `hephaestus-firecracker` HTTP daemon
 ├── hephaestus-fc-api/        ← wire types + VmmBackend trait
+├── hephaestus-jailer/        ← per-VM supervisor: generates sandbox
+│                              profiles and execs hephaestus-firecracker
 ├── hephaestus-pool/          ← disk-persistent warm-pool primitive
 ├── hephaestus-vmm/           ← thin re-export over hephaestus-bridge
 └── hephaestus-bridge/        ← Rust↔Swift FFI bindings
@@ -27,7 +29,7 @@ vendor/
 └── firecracker/              ← upstream reference (not built on macOS)
 ```
 
-The workspace has six members: the hephaestus crates. Everything under
+The workspace has seven members: the hephaestus crates. Everything under
 `vendor/firecracker/` is excluded — see
 [vendor/firecracker/README.md](../vendor/firecracker/README.md).
 

@@ -1,0 +1,18 @@
+[package]
+name = "hephaestus-jailer"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Per-VM supervisor that generates a deny-by-default macOS sandbox profile and launches hephaestus-firecracker under it."
+
+[[bin]]
+name = "hephaestus-jailer"
+path = "src/main.rs"
+bench = false
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive", "string"] }
+thiserror = "2.0.18"
+
+[lints]
+workspace = true

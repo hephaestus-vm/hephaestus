@@ -20,10 +20,11 @@ substitutes Apple's Virtualization.framework for KVM underneath. Your
 existing orchestrator code points at a different UNIX socket and keeps
 working.
 
-> **Status: alpha.** The HTTP API, CLI, warm pool, and snapshot
-> endpoints all work end-to-end. No jailer, no multi-tenant hardening,
-> no stability guarantees pre-v1.0. Don't run untrusted guest code.
-> See [Security](#security) and [Status at a glance](#status-at-a-glance).
+> **Status: alpha.** The HTTP API, CLI, warm pool, snapshots, and
+> experimental jailer supervisor work end-to-end. Multi-tenant hardening
+> is still incomplete, and there are no stability guarantees pre-v1.0.
+> Don't run untrusted guest code. See [Security](#security) and
+> [Status at a glance](#status-at-a-glance).
 
 [Kata]: https://katacontainers.io/
 [firectl]: https://github.com/firecracker-microvm/firectl
@@ -125,7 +126,7 @@ the real SDK.
 | Firecracker HTTP API                    | Alpha — 14/14 SDK calls green on macOS      |
 | CLI surface (`run` / `vz-exec` / `pool` / `snapshot`) | Working           |
 | Warm pool + snapshot endpoints          | Working (~235 ms restore, see [Performance](#performance)) |
-| Multi-tenant / untrusted guests         | **Not supported** — no jailer               |
+| Multi-tenant / untrusted guests         | **Not supported** — experimental jailer supervisor only |
 | Cross-tool snapshot interop with real Firecracker | Impossible — different hypervisor blob formats |
 | Public API stability                    | Breaking changes expected pre-v1.0          |
 
@@ -226,16 +227,17 @@ align on scope.
 
 ## Security
 
-**hephaestus assumes trusted guest code.** There is no full jailer and no
-hardening against guest-to-host escape beyond what Apple's
-Virtualization.framework provides out of the box. `hephaestus-firecracker`
-has an experimental `--sandbox-profile <file>` hook for users who want to
-enter a custom macOS sandbox profile; `just fc-compat-sandbox-config`,
-`just fc-compat-sandbox`, `just fc-compat-sandbox-vsock-e2e`,
-`just fc-compat-sandbox-snapshot`, and the sandbox pool recipes exercise
-initial generated deny-by-default profiles across config-only, cold-boot,
-vsock/MMDS, snapshot, and warm-pool paths. Launchd/supervisor isolation is not
-automated yet. Don't run untrusted code until that's built.
+**hephaestus assumes trusted guest code.** The `hephaestus-jailer`
+supervisor can generate a per-VM deny-by-default macOS sandbox profile and
+launch `hephaestus-firecracker` under it, and `hephaestus-firecracker` still
+accepts an experimental `--sandbox-profile <file>` hook for custom profiles.
+The sandbox recipes (`just fc-compat-sandbox-config`, `just fc-compat-sandbox`,
+`just fc-compat-sandbox-vsock-e2e`, `just fc-compat-sandbox-snapshot`, and the
+sandbox pool recipes) exercise generated profiles across config-only,
+cold-boot, vsock/MMDS, snapshot, and warm-pool paths. This is not yet complete
+multi-tenant hardening: launchd supervision, uid/gid isolation, and host-network
+MMDS entitlements are still future work. Don't run untrusted code until those
+pieces are built.
 
 Please report vulnerabilities privately — see
 [SECURITY.md](SECURITY.md) for scope and the reporting address.

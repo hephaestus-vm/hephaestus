@@ -21,6 +21,16 @@ numbers follow [Semantic Versioning](https://semver.org/).
   before exec'ing the child. Best-effort: a missing `/dev/hvc1` (older
   config, snapshot-restore path that uses URL serial attachments only)
   leaves stderr on hvc0 and the streams stay merged — same as before.
+- **`hephaestus-jailer` binary.** Per-VM supervisor that materializes a
+  per-VM work dir, canonicalizes caller-supplied kernel/rootfs/initramfs
+  paths, generates a deny-by-default macOS sandbox profile granting
+  only those paths plus the work dir subtree, and execs
+  `hephaestus-firecracker` under that profile. A Rust port of the
+  existing `scripts/generate-fc-sandbox-profile.sh` lives in the
+  `profile` module so the same generation logic is available
+  programmatically. Not a launchd job, not a full Firecracker jailer
+  replacement — no uid/gid drop, no chroot, no cgroup pinning. The
+  sandbox profile is the only isolation boundary.
 
 ## [0.3.0-alpha.1] — 2026-04-22
 

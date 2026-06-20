@@ -9,6 +9,7 @@ members = [
     "src/hephaestus-cli",
     "src/hephaestus-fc-api",
     "src/hephaestus-firecracker",
+    "src/hephaestus-jailer",
     "src/hephaestus-pool",
     "src/hephaestus-vmm",
 ]

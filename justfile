@@ -288,6 +288,11 @@ fc-compat boot='1': build fc-harness-build
 fc-compat-vsock-e2e:
     scripts/fc-compat-vsock-e2e.sh
 
+# Real-VM e2e for vz-exec --stdin, stderr split, and hephaestus-jailer.
+# Requires apple/container kernel/rootfs artifacts; not CI-safe.
+e2e-new-features:
+    scripts/e2e-new-features.sh
+
 # Same vsock/MMDS e2e under a generated deny-by-default sandbox profile.
 fc-compat-sandbox-vsock-e2e:
     HEPHAESTUS_SANDBOX=1 scripts/fc-compat-vsock-e2e.sh

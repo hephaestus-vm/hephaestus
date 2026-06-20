@@ -20,7 +20,7 @@ use hephaestus_fc_api::vmm_config::metrics::MetricsConfig;
 use hephaestus_fc_api::vmm_config::mmds::MmdsConfig;
 use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
 use hephaestus_fc_api::vmm_config::snapshot::{
-    CreateSnapshotParams, LoadSnapshotConfig, MemBackendConfig, MemBackendType, SnapshotType,
+    CreateSnapshotParams, LoadSnapshotConfig, MemBackendType, SnapshotType,
 };
 use hephaestus_fc_api::vmm_config::vsock::VsockConfig;
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
@@ -235,6 +235,13 @@ impl VzBackend {
                 "operation not supported post-boot".into(),
             ))
         }
+    }
+
+    fn serial_log_path(&self) -> PathBuf {
+        std::env::var_os("HEPHAESTUS_FC_WORK_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("hephaestus-firecracker-{}.log", self.id))
     }
 
     pub fn observe_request(&mut self, request_id: u64, method: &str, path: &str, status: u16) {
@@ -685,7 +692,7 @@ impl VmmBackend for VzBackend {
         let cpu = u32::from(self.machine_config.vcpu_count);
         let memory = u64::try_from(self.machine_config.mem_size_mib)
             .map_err(|err| VmmBackendError::InvalidConfig(err.to_string()))?;
-        let log = PathBuf::from(format!("/tmp/hephaestus-firecracker-{}.log", self.id));
+        let log = self.serial_log_path();
 
         // Pool fast-path. Match against the requested kernel+rootfs+cpu+
         // memory tuple; on a hit we restore from the snapshot, skip
@@ -845,7 +852,7 @@ impl VmmBackend for VzBackend {
         let cpu = u32::from(self.machine_config.vcpu_count);
         let memory = u64::try_from(self.machine_config.mem_size_mib)
             .map_err(|err| VmmBackendError::InvalidConfig(err.to_string()))?;
-        let log = PathBuf::from(format!("/tmp/hephaestus-firecracker-{}.log", self.id));
+        let log = self.serial_log_path();
 
         let initrd = boot.initrd_path.as_ref().map(PathBuf::from);
         let (vm, timings) = vz_long_restore(
@@ -984,6 +991,7 @@ fn merge_json(dst: &mut Value, patch: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hephaestus_fc_api::vmm_config::snapshot::MemBackendConfig;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
