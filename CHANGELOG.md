@@ -41,6 +41,24 @@ numbers follow [Semantic Versioning](https://semver.org/).
   replacement — no uid/gid drop, no chroot, no cgroup pinning. The
   sandbox profile is the only isolation boundary.
 
+### Fixed
+
+- **Xcode 27 beta SPM regression with header-only C target.** Added
+  `swift/HephaestusBridge/Sources/CHephaestusBridge/dummy.c` (empty
+  translation unit) so SPM emits `CHephaestusBridge.o` for the
+  header-only C target — without it, Xcode 27 beta skips the compile
+  phase and the downstream `libtool` step fails looking for the `.o`.
+- **`hephaestus-firecracker` runtime linking on Xcode 27 beta.**
+  `hephaestus-firecracker` lacked a `build.rs`, so cargo didn't emit the
+  `-Wl,-rpath,/usr/lib/swift` flag the cli's build.rs emits — and the
+  new `libswiftCompatibilitySpan.dylib` strong reference Xcode 27 emits
+  needs that rpath to resolve at runtime. Added a `build.rs` mirroring
+  `hephaestus-cli`'s, plus a direct `hephaestus-bridge` dependency so
+  `DEP_HEPHAESTUS_BRIDGE_NATIVE_ARCHIVE` propagates and the archive can
+  be force-loaded. Without this, every freshly-built
+  `hephaestus-firecracker` (including test binaries) failed with
+  `dyld: Library not loaded: @rpath/libswiftCompatibilitySpan.dylib`.
+
 ## [0.3.0-alpha.1] — 2026-04-22
 
 First public release. Adds a drop-in Firecracker HTTP API over UNIX

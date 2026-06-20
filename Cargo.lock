@@ -337,6 +337,7 @@ name = "hephaestus-firecracker"
 version = "0.3.0-dev"
 dependencies = [
  "clap",
+ "hephaestus-bridge",
  "hephaestus-fc-api",
  "hephaestus-pool",
  "hephaestus-vmm",

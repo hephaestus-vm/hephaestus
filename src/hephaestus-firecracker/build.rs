@@ -1,11 +1,6 @@
-//! Emits `-force_load <path>` on the final binary's link step so Swift's
-//! module-init sections from the statically-linked HephaestusBridge archive
-//! actually run. Without this, NIO + swift-atomics module registration is
-//! skipped and the process crashes at runtime allocating
-//! `ManagedAtomic<Bool>` because its type metadata is never registered.
-//!
-//! We read the archive path via the `DEP_HEPHAESTUS_BRIDGE_ARCHIVE` env var
-//! that cargo sets from `cargo:archive=...` in hephaestus-bridge's build.rs.
+//! Mirror hephaestus-cli's build.rs: force-load the Swift archive so Swift's
+//! module-init sections run, and emit the Swift runtime rpath so binaries
+//! find libswift*.dylib at runtime without relying on the dyld cache.
 
 use std::env;
 
@@ -21,10 +16,10 @@ fn main() {
         return;
     };
     println!("cargo:rerun-if-env-changed=DEP_HEPHAESTUS_BRIDGE_NATIVE_ARCHIVE");
-    println!("cargo:rustc-link-arg=-Wl,-force_load,{archive}");
+    println!("cargo:rustc-link-arg-bin=hephaestus-firecracker=-Wl,-force_load,{archive}");
     // Xcode 27 beta's Swift emits a strong reference to
     // libswiftCompatibilitySpan.dylib; the dyld cache only resolves weak
     // refs, so we need an LC_RPATH pointing at /usr/lib/swift where the
     // dylib lives on macOS 26+.
-    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+    println!("cargo:rustc-link-arg-bin=hephaestus-firecracker=-Wl,-rpath,/usr/lib/swift");
 }

@@ -1,19 +1,18 @@
 # Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# We keep a rust-toolchain file checked into the repository such that in the
-# rare event that we need to do an A/B-test across toolchains, cargo will
-# download the toolchains of the A and B revisions on the fly (if they do not
-# match the toolchain installed in the environment in which the test is
-# executed). This is needed for example if a toolchain upgrade introduces a new
-# syscall into our seccomp filters. Then, since our PR CI contains A/B-tests,
-# we will compile a version of Firecracker that does not have this syscall
-# allowlisted using a toolchain that requires it, causing the A/B-test to
-# always fail.
+# Pin the workspace to a known-good rustc channel so CI, contributors,
+# and Homebrew builds all see the same compiler. Bump as a deliberate
+# change (not via dependabot) — the floor stays loose enough that any
+# rustup-supported stable patch can build the workspace, but tight
+# enough that a surprise minor-version bump can't silently change
+# codegen or lint behavior under us.
 [toolchain]
-# hephaestus targets macOS/Apple Silicon as host. Keep the channel floor loose
-# so Homebrew's rustc can build the workspace without a forced rustup install.
-channel = "1.94"
+# hephaestus targets macOS/Apple Silicon as host. Keep the channel floor
+# loose enough that Homebrew's rustc can build the workspace without a
+# forced rustup install — `brew upgrade rust` or `rustup toolchain
+# install 1.96` is enough if the floor moves under us.
+channel = "1.96"
 targets = ["aarch64-apple-darwin"]
 profile = "minimal"
 
