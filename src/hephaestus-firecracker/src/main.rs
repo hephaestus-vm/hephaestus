@@ -28,6 +28,7 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
 mod backend;
+mod host_mmds;
 mod sandbox;
 mod server;
 
@@ -59,6 +60,15 @@ struct Args {
     /// e2e to prove the sandbox denies paths outside the generated allowlist.
     #[arg(long, hide = true)]
     sandbox_deny_probe: Option<PathBuf>,
+    /// Bind a host-side MMDS HTTP listener on `169.254.169.254:80` so
+    /// arbitrary guest images (without our agent's link-local shim) can
+    /// fetch metadata via `http://169.254.169.254/`. Requires a VM network
+    /// attachment that routes guest traffic to the host (e.g.
+    /// `VZVmnetNetworkDeviceAttachment` + the `com.apple.vm.networking`
+    /// entitlement) and a signed binary; bind fails with `EACCES` or
+    /// `EADDRNOTAVAIL` otherwise. See `docs/JAILER_MMDS_PLAN.md`.
+    #[arg(long)]
+    host_mmds: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -133,6 +143,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 backend.lock().await.flush_metrics();
             }
         });
+    }
+
+    if args.host_mmds
+        && let Err(err) = host_mmds::spawn(backend.clone()).await
+    {
+        eprintln!(
+            "hephaestus-firecracker: --host-mmds listener failed to bind ({err}); \
+             this typically means the binary lacks the com.apple.vm.networking entitlement \
+             or the host has no interface on 169.254.169.254. See docs/JAILER_MMDS_PLAN.md."
+        );
+        return Err(err.to_string().into());
     }
 
     loop {

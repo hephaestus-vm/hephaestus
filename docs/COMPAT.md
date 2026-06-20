@@ -165,8 +165,12 @@ migration between hephaestus processes).
   or disable the PID1 auto-start with `HEPHAESTUS_MMDS_SHIM=0` /
   `hephaestus.mmds=off`. The MMDS config's interface binding/version are
   stored but not enforced. If an `ipv4_address` is supplied it must be in
-  Firecracker's link-local `169.254.0.0/16` range. Transparent host-network
-  MMDS for arbitrary existing guest images is not emulated yet.
+  Firecracker's link-local `169.254.0.0/16` range. `hephaestus-firecracker
+  --host-mmds` also includes a host-side `169.254.169.254:80` listener with
+  the same path-aware MMDS semantics, but it is a scaffold until real VM
+  networking is wired through `VZVmnetNetworkDeviceAttachment` and a signed
+  binary with `com.apple.vm.networking`; without that, arbitrary existing
+  guest images should use the agent shim/vsock path.
 - **`PUT /vsock`** — ⚠︎ Partial. Accepts Firecracker's `guest_cid`,
   `uds_path`, and deprecated `vsock_id` fields pre-boot. hephaestus stores
   `guest_cid` for wire compatibility but VZ assigns the actual CID. After

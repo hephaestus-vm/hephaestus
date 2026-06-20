@@ -21,6 +21,15 @@ numbers follow [Semantic Versioning](https://semver.org/).
   before exec'ing the child. Best-effort: a missing `/dev/hvc1` (older
   config, snapshot-restore path that uses URL serial attachments only)
   leaves stderr on hvc0 and the streams stay merged — same as before.
+- **`hephaestus-firecracker --host-mmds` scaffold.** Binds a host-side
+  HTTP listener on `169.254.169.254:80` that serves the current MMDS JSON
+  with Firecracker-style path-aware semantics (JSON subtrees for
+  `Accept: application/json`, IMDS-style plain text otherwise). Real-VM
+  reachability still requires `VZVmnetNetworkDeviceAttachment` +
+  `com.apple.vm.networking` + a Developer ID signed binary; the
+  listener binds and the handler runs even without those, so the
+  scaffold is shippable behind the flag until the entitlement story is
+  ready.
 - **`hephaestus-jailer` binary.** Per-VM supervisor that materializes a
   per-VM work dir, canonicalizes caller-supplied kernel/rootfs/initramfs
   paths, generates a deny-by-default macOS sandbox profile granting

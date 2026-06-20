@@ -136,8 +136,10 @@ reserved virtio-vsock service on port `16992` (port `1234` stays reserved for
 `hb_vz_long_serve_mmds`; each guest connection gets an HTTP/1.1 JSON response
 with the current MMDS document. Controlled agent-flavor e2e guests can also
 exercise a guest-side `169.254.169.254:80` shim that forwards to this vsock
-service. This is still not transparent host-network MMDS for arbitrary existing
-guest images; see [JAILER_MMDS_PLAN.md](JAILER_MMDS_PLAN.md).
+service. `hephaestus-firecracker --host-mmds` can additionally bind a host-side
+`169.254.169.254:80` listener with the same path-aware semantics, but that path
+is scaffolded until vmnet attachment + `com.apple.vm.networking` signing are in
+place for real guest reachability; see [JAILER_MMDS_PLAN.md](JAILER_MMDS_PLAN.md).
 
 ## Match key
 
