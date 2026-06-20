@@ -6,6 +6,22 @@ numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`vz-exec --stdin` forwards host stdin to the guest command.** The
+  CLI wraps `--cmd` with a `__hephaestus_stdin__` sentinel; the guest
+  agent strips it and pumps vsock bytes into the child's stdin. The
+  Swift FFI gains a `forward_stdin` flag on `hb_vz_exec` and a
+  background pump thread (`pumpStdinToVsock`) that copies host stdin →
+  vsock until EOF. Lets `vz-exec` cover interactive command delivery
+  without keeping `vz-sh` for that use case.
+- **Separate stdout/stderr streams in `vz-exec`.** A second
+  `VZVirtioConsoleDeviceSerialPortConfiguration` (hvc1) carries guest
+  stderr to the host's stderr; the agent `dup2`s `/dev/hvc1` onto fd 2
+  before exec'ing the child. Best-effort: a missing `/dev/hvc1` (older
+  config, snapshot-restore path that uses URL serial attachments only)
+  leaves stderr on hvc0 and the streams stay merged — same as before.
+
 ## [0.3.0-alpha.1] — 2026-04-22
 
 First public release. Adds a drop-in Firecracker HTTP API over UNIX

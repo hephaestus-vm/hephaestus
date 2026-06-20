@@ -538,11 +538,17 @@ const VZ_EXEC_USAGE: &str = "\
 usage: hephaestus vz-exec \\
     --kernel <path> --rootfs <path> --cmd <shell-command> \\
     [--initramfs <path>] [--log <path>] \\
-    [--cpus N] [--memory-mib N] [--timeout-seconds N]
+    [--cpus N] [--memory-mib N] [--timeout-seconds N] \\
+    [--stdin]
 
 --initramfs defaults to `./build/agent.cpio.gz`. Build it with
     scripts/build-agent.sh  (requires rustup + the
-    aarch64-unknown-linux-musl target, and zig ≥ 0.15).";
+    aarch64-unknown-linux-musl target, and zig ≥ 0.15).
+
+--stdin forwards the host's stdin to the guest command's stdin. When
+    set, `--cmd` is wrapped with a sentinel so the agent knows to pump
+    vsock bytes into the child's stdin instead of treating the channel
+    as one-shot. Lets `vz-exec` cover interactive command delivery too.";
 
 #[derive(Debug)]
 struct VzExecOptions {
@@ -554,6 +560,7 @@ struct VzExecOptions {
     cpus: u32,
     memory_mib: u64,
     timeout_seconds: u32,
+    stdin: bool,
 }
 
 fn parse_vz_exec_args(args: &mut impl Iterator<Item = String>) -> Result<VzExecOptions, String> {
@@ -567,6 +574,7 @@ fn parse_vz_exec_args(args: &mut impl Iterator<Item = String>) -> Result<VzExecO
         cpus: 0,
         memory_mib: 0,
         timeout_seconds: 0,
+        stdin: false,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -590,6 +598,7 @@ fn parse_vz_exec_args(args: &mut impl Iterator<Item = String>) -> Result<VzExecO
                     .parse()
                     .map_err(|e| format!("invalid --timeout-seconds: {e}"))?;
             }
+            "--stdin" => opts.stdin = true,
             other => return Err(format!("unknown flag `{other}`")),
         }
     }
@@ -616,7 +625,7 @@ fn parse_vz_exec_args(args: &mut impl Iterator<Item = String>) -> Result<VzExecO
 
 fn vz_exec_cmd(opts: VzExecOptions) -> ExitCode {
     eprintln!(
-        "hephaestus: vz-exec cmd={:?} (initramfs={}, cpus={}, mem={} MiB)",
+        "hephaestus: vz-exec cmd={:?} (initramfs={}, cpus={}, mem={} MiB, stdin={})",
         opts.command,
         opts.initramfs.display(),
         if opts.cpus == 0 {
@@ -629,17 +638,28 @@ fn vz_exec_cmd(opts: VzExecOptions) -> ExitCode {
         } else {
             opts.memory_mib.to_string()
         },
+        opts.stdin,
     );
+    // The agent strips this sentinel and pipes the vsock bytes that follow
+    // the command frame into the child's stdin. Keep the user's `--cmd`
+    // intact for display/logging above; only the wire frame carries the
+    // sentinel.
+    let wire_command = if opts.stdin {
+        format!("__hephaestus_stdin__{}", opts.command)
+    } else {
+        opts.command.clone()
+    };
     let start = std::time::Instant::now();
     match vz_exec(
         &opts.kernel,
         &opts.initramfs,
         &opts.rootfs,
-        &opts.command,
+        &wire_command,
         opts.log.as_deref(),
         opts.cpus,
         opts.memory_mib,
         opts.timeout_seconds,
+        opts.stdin,
     ) {
         Ok(code) => {
             eprintln!(

@@ -199,6 +199,7 @@ unsafe extern "C" {
         cpu_count: u32,
         memory_mib: u64,
         timeout_seconds: u32,
+        forward_stdin: u8,
         out_exit_code: *mut i32,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
@@ -915,6 +916,12 @@ pub fn vz_boot(
 /// The command is delivered *after* VM start via vsock (not via kernel
 /// cmdline) so the same booted VM can later be snapshotted and restored
 /// with a different command — the command isn't baked into the save.
+///
+/// When `forward_stdin` is true, the host pumps its stdin into the guest
+/// command's stdin after sending the command frame. The command string
+/// must be prefixed with `__hephaestus_stdin__` so the agent knows to
+/// pipe the vsock bytes into the child's stdin instead of treating the
+/// vsock as a one-shot command/response channel.
 #[allow(clippy::too_many_arguments)] // mirrors the FFI shape; refactor doesn't help
 pub fn vz_exec(
     kernel: &Path,
@@ -925,6 +932,7 @@ pub fn vz_exec(
     cpu_count: u32,
     memory_mib: u64,
     timeout_seconds: u32,
+    forward_stdin: bool,
 ) -> Result<i32, VmError> {
     let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
     let initramfs_c = CString::new(path_to_str(initramfs, "initramfs")?)?;
@@ -946,6 +954,7 @@ pub fn vz_exec(
             cpu_count,
             memory_mib,
             timeout_seconds,
+            if forward_stdin { 1 } else { 0 },
             &mut exit_code,
             &mut out_err,
         )

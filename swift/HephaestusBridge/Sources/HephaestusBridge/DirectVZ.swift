@@ -572,6 +572,10 @@ private final class ExitCodeBox: @unchecked Sendable {
     var code: Int32 = -1
 }
 
+private final class StdinPumpErrorBox: @unchecked Sendable {
+    var error: Error?
+}
+
 // =============================================================================
 // FFI: hb_vz_exec — boot direct-VZ with our guest agent initramfs, run a
 // single command inside the provided rootfs, capture exit code. No vminitd,
@@ -592,6 +596,7 @@ public func hb_vz_exec(
     cpuCount: UInt32,
     memoryMib: UInt64,
     timeoutSeconds: UInt32,
+    forwardStdin: UInt8,
     outExitCode: UnsafeMutablePointer<Int32>?,
     outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
@@ -649,7 +654,9 @@ public func hb_vz_exec(
         let exitCode = try sendCommandAndAwaitExit(
             holder: holder,
             queue: queue,
-            command: command
+            command: command,
+            forwardStdin: forwardStdin != 0,
+            stdinFd: FileHandle.standardInput.fileDescriptor
         )
 
         // Agent halts after responding, so wait for the clean VZ shutdown.
@@ -813,7 +820,9 @@ public func hb_vz_exec_snapshot_restore(
         let exitCode = try sendCommandAndAwaitExit(
             holder: holder,
             queue: queue,
-            command: command
+            command: command,
+            forwardStdin: false,
+            stdinFd: -1
         )
 
         // Give the agent a beat to halt the VM cleanly.
@@ -832,15 +841,18 @@ public func hb_vz_exec_snapshot_restore(
 private final class ExecSession: @unchecked Sendable {
     let config: VZVirtualMachineConfiguration
     let outputPipe: Pipe
+    let stderrPipe: Pipe
     let logHandle: FileHandle?
 
     private init(
         config: VZVirtualMachineConfiguration,
         outputPipe: Pipe,
+        stderrPipe: Pipe,
         logHandle: FileHandle?
     ) {
         self.config = config
         self.outputPipe = outputPipe
+        self.stderrPipe = stderrPipe
         self.logHandle = logHandle
     }
 
@@ -870,8 +882,8 @@ private final class ExecSession: @unchecked Sendable {
         )
         config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)]
 
-        // Serial port streams guest stdio (agent diagnostics + guest
-        // command stdout) to host stdout, tee'd to `logURL` if supplied.
+        // First serial port (hvc0): agent diagnostics + guest command
+        // stdout, streamed to host stdout, tee'd to `logURL` if supplied.
         let outputPipe = Pipe()
         let logHandle: FileHandle? = logURL.flatMap { url in
             FileManager.default.createFile(atPath: url.path, contents: nil)
@@ -883,22 +895,44 @@ private final class ExecSession: @unchecked Sendable {
             try? logHandle?.write(contentsOf: data)
             try? FileHandle.standardOutput.write(contentsOf: data)
         }
-        let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
-        serial.attachment = VZFileHandleSerialPortAttachment(
+        let stdoutSerial = VZVirtioConsoleDeviceSerialPortConfiguration()
+        stdoutSerial.attachment = VZFileHandleSerialPortAttachment(
             fileHandleForReading: nil,
             fileHandleForWriting: outputPipe.fileHandleForWriting
         )
-        config.serialPorts = [serial]
+
+        // Second serial port (hvc1): guest command stderr, streamed to
+        // host stderr (no log tee — the log file is for stdout only, so
+        // stderr stays separable for downstream consumers). The agent
+        // dups /dev/hvc1 onto fd 2 before exec'ing /bin/sh -c CMD.
+        let stderrPipe = Pipe()
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty { return }
+            try? FileHandle.standardError.write(contentsOf: data)
+        }
+        let stderrSerial = VZVirtioConsoleDeviceSerialPortConfiguration()
+        stderrSerial.attachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: nil,
+            fileHandleForWriting: stderrPipe.fileHandleForWriting
+        )
+        config.serialPorts = [stdoutSerial, stderrSerial]
 
         config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         try config.validate()
 
-        return ExecSession(config: config, outputPipe: outputPipe, logHandle: logHandle)
+        return ExecSession(
+            config: config,
+            outputPipe: outputPipe,
+            stderrPipe: stderrPipe,
+            logHandle: logHandle
+        )
     }
 
     func close() {
         outputPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
         try? logHandle?.close()
     }
 
@@ -960,7 +994,14 @@ private final class ExecSession: @unchecked Sendable {
         }
 
         // No Pipe → no readabilityHandler, no logHandle to close on our side.
-        return ExecSession(config: config, outputPipe: Pipe(), logHandle: nil)
+        // The snapshotable config uses URL-based serial attachments only, so
+        // stderr-split is not wired here; the second pipe stays inert.
+        return ExecSession(
+            config: config,
+            outputPipe: Pipe(),
+            stderrPipe: Pipe(),
+            logHandle: nil
+        )
     }
 }
 
@@ -984,10 +1025,18 @@ private enum VsockError: Error, CustomStringConvertible {
 /// Connect to the guest agent's vsock listener, send the command, read the
 /// exit code i32 little-endian, close. Retries the initial connect for up
 /// to ~5 seconds so the host doesn't race against the guest's `listen()`.
+///
+/// When `forwardStdin` is true, the host pumps bytes from `stdinFd` to the
+/// guest vsock connection after sending the command frame, so the guest
+/// agent can pipe them into the child's stdin. The guest signals end-of-
+/// stdin by closing its read side (host closes the connection after
+/// `stdinFd` returns EOF).
 private func sendCommandAndAwaitExit(
     holder: VMHolder,
     queue: DispatchQueue,
-    command: String
+    command: String,
+    forwardStdin: Bool,
+    stdinFd: Int32
 ) throws -> Int32 {
     let connection = try connectToAgent(holder: holder, queue: queue)
     defer { connection.close() }
@@ -1003,6 +1052,29 @@ private func sendCommandAndAwaitExit(
         try writeAll(fd: fd, bytes: UnsafeRawBufferPointer(buf))
     }
 
+    // Stdin forwarding: pump host stdin → vsock until EOF. A dedicated
+    // thread owns the reads so the exit-code read below can race against
+    // it without the pump stealing the 4-byte exit-code tail. The guest
+    // agent closes its end when the child exits, which causes our read
+    // below to return 0 (EOF) — we read the exit code first, then the
+    // pump thread observes EOF on stdin and exits.
+    let pumpErrorBox = StdinPumpErrorBox()
+    let pumpDone = DispatchSemaphore(value: 0)
+    if forwardStdin {
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                try pumpStdinToVsock(srcFd: stdinFd, dstFd: fd)
+                // Signal EOF to the guest's stdin without closing the read side
+                // we still need for the 4-byte exit-code response.
+                _ = shutdown(fd, SHUT_WR)
+            } catch {
+                pumpErrorBox.error = error
+                _ = shutdown(fd, SHUT_WR)
+            }
+            pumpDone.signal()
+        }
+    }
+
     // Response: i32 LE exit code.
     var codeBytes = [UInt8](repeating: 0, count: 4)
     try codeBytes.withUnsafeMutableBufferPointer { buf in
@@ -1014,7 +1086,34 @@ private func sendCommandAndAwaitExit(
         | (UInt32(codeBytes[2]) << 16)
         | (UInt32(codeBytes[3]) << 24)
     )
+    // Drain the pump thread so it doesn't race teardown.
+    if forwardStdin {
+        _ = pumpDone.wait(timeout: .now() + .seconds(5))
+        if let err = pumpErrorBox.error { throw err }
+    }
     return code
+}
+
+/// Pump bytes from `srcFd` (a POSIX file descriptor) to `dstFd` until
+/// `read` returns 0 (EOF) or fails. The caller owns both fds; this
+/// helper does not close or half-close them.
+private func pumpStdinToVsock(srcFd: Int32, dstFd: Int32) throws {
+    var buf = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let n = buf.withUnsafeMutableBufferPointer { ptr -> ssize_t in
+            read(srcFd, ptr.baseAddress, ptr.count)
+        }
+        if n < 0 {
+            let err = errno
+            if err == EINTR { continue }
+            throw POSIXError(.init(rawValue: err) ?? .EIO)
+        }
+        if n == 0 { return }
+        try buf.withUnsafeBufferPointer { ptr in
+            let raw = UnsafeRawBufferPointer(start: ptr.baseAddress, count: Int(n))
+            try writeAll(fd: dstFd, bytes: raw)
+        }
+    }
 }
 
 private func connectToAgent(

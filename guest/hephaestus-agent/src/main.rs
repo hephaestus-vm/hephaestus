@@ -84,6 +84,14 @@ fn run() -> AgentResult<()> {
     mount_rootfs("/dev/vda", "/newroot")?;
     enter_rootfs("/newroot")?;
 
+    // Redirect stderr to the second virtio-console device (hvc1) so the
+    // host sees stdout and stderr on separate streams. hvc0 keeps agent
+    // diagnostics + the child's stdout; hvc1 carries only the child's
+    // stderr. Best-effort: if /dev/hvc1 isn't present (older kernel or
+    // VZ config without the second serial), stderr stays on hvc0 and
+    // the two streams stay merged — same as before this change.
+    let _ = redirect_stderr_to_hvc1();
+
     maybe_start_mmds_linklocal_shim();
 
     // Open the vsock socket BEFORE the host tries to connect. Once listen
@@ -98,7 +106,7 @@ fn run() -> AgentResult<()> {
     let (command, mut stream) = accept_command_loop(&listen_fd)?;
     eprintln!("hephaestus-agent: cmd = {command:?}");
 
-    let exit_code = run_command(&command)?;
+    let exit_code = run_command(&command, &mut stream)?;
     write_exit_code(&mut stream, exit_code)?;
     drop(stream); // flush before halt
     halt();
@@ -193,6 +201,34 @@ fn mkdir_p(path: &str) -> AgentResult<()> {
     fs::create_dir_all(path).map_err(|e| format!("mkdir -p {path}: {e}"))
 }
 
+/// Redirect fd 2 (stderr) to `/dev/hvc1`, the second virtio-console
+/// device. The host's `ExecSession.make` attaches a second serial port
+/// whose read end is forwarded to the host's stderr; dups ensure the
+/// child `/bin/sh -c CMD` inherits that fd as its own stderr, so the
+/// two streams stay separated on the host. Best-effort: a missing
+/// `/dev/hvc1` (older config, snapshot-restore path that uses URL
+/// serial attachments only) leaves stderr on hvc0 and the streams
+/// remain merged — same as the pre-stderr-split behavior.
+fn redirect_stderr_to_hvc1() -> AgentResult<()> {
+    use std::os::fd::AsRawFd;
+    let hvc1 = match fs::OpenOptions::new().write(true).open("/dev/hvc1") {
+        Ok(f) => f,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            eprintln!("hephaestus-agent: /dev/hvc1 not present; stderr stays merged with stdout");
+            return Ok(());
+        }
+        Err(e) => return Err(format!("open /dev/hvc1: {e}")),
+    };
+    if unsafe { libc::dup2(hvc1.as_raw_fd(), 2) } < 0 {
+        return Err(format!(
+            "dup2(/dev/hvc1, 2): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    eprintln!("hephaestus-agent: stderr redirected to /dev/hvc1");
+    Ok(())
+}
+
 // =============================================================================
 // Vsock listener + framed I/O.
 // =============================================================================
@@ -243,7 +279,7 @@ fn write_exit_code(stream: &mut UnixStream, code: i32) -> AgentResult<()> {
 // Command execution.
 // =============================================================================
 
-fn run_command(cmd: &str) -> AgentResult<i32> {
+fn run_command(cmd: &str, stream: &mut UnixStream) -> AgentResult<i32> {
     if let Some(needle) = cmd.strip_prefix("__hephaestus_test_mmds_vsock ") {
         return test_mmds_vsock(needle).map(|()| 0).or_else(|err| {
             eprintln!("hephaestus-agent: mmds-vsock test failed: {err}");
@@ -263,11 +299,63 @@ fn run_command(cmd: &str) -> AgentResult<i32> {
         });
     }
 
-    let status = Command::new("/bin/sh")
+    let (cmd, forward_stdin) = match cmd.strip_prefix("__hephaestus_stdin__") {
+        Some(rest) => (rest, true),
+        None => (cmd, false),
+    };
+
+    let mut child = Command::new("/bin/sh")
         .arg("-c")
         .arg(cmd)
-        .status()
+        .stdin(if forward_stdin {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .spawn()
         .map_err(|e| format!("exec /bin/sh: {e}"))?;
+
+    if forward_stdin {
+        if let Some(mut child_stdin) = child.stdin.take() {
+            let mut stream_clone = match stream.try_clone() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("hephaestus-agent: stdin stream clone failed: {e}");
+                    let _ = child.kill();
+                    return Err(format!("clone stdin stream: {e}"));
+                }
+            };
+            let _stdin_pump = std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream_clone.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if child_stdin.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                            if child_stdin.flush().is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            let status = child.wait().map_err(|e| format!("wait /bin/sh: {e}"))?;
+            // Do not join the stdin pump here. If the child exits before
+            // consuming all host stdin, the host may still be blocked reading
+            // from its stdin and may not half-close the vsock write side yet.
+            // Writing the exit code is safe on the other half of the socket;
+            // the agent process halts immediately afterwards.
+            return Ok(match status.code() {
+                Some(code) => code,
+                None => 128 + status.signal().unwrap_or(0),
+            });
+        }
+    }
+
+    let status = child.wait().map_err(|e| format!("wait /bin/sh: {e}"))?;
     Ok(match status.code() {
         Some(code) => code,
         None => 128 + status.signal().unwrap_or(0),

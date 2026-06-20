@@ -123,14 +123,12 @@ mod property_tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(
-            serde_json::from_value::<MachineConfig>(serde_json::json!({
-                "vcpu_count": 1,
-                "mem_size_mib": 128,
-                "unknown": true
-            }))
-            .is_err()
-        );
+        serde_json::from_value::<MachineConfig>(serde_json::json!({
+            "vcpu_count": 1,
+            "mem_size_mib": 128,
+            "unknown": true
+        }))
+        .unwrap_err();
     }
 
     #[test]
