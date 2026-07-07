@@ -1587,6 +1587,13 @@ private func buildLongRunningConfig(
     config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
     config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
 
+    // Always attach a traditional memory balloon. Idle (target == full
+    // memory) it reclaims nothing, so it's inert until `PATCH /balloon`
+    // sets a smaller target — mirroring how the entropy device is always
+    // present. Keeps the FFI simple (no attach flag) and the config
+    // identical across save/restore.
+    config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
+
     // Guest networking via VZ's built-in NAT. NAT only needs the base
     // com.apple.security.virtualization entitlement (unlike vmnet's
     // restricted com.apple.vm.networking), so it works under ad-hoc
@@ -1717,6 +1724,34 @@ public func hb_vz_long_pause(
         writeError(outErr, formatError(error))
         return Status.swiftError
     }
+}
+
+/// Set the memory balloon's target VM memory size (bytes). Inflating the
+/// balloon (target < configured memory) reclaims guest memory; deflating
+/// (target → configured memory) returns it. The VZ analog of Firecracker's
+/// `PATCH /balloon`.
+@_cdecl("hb_vz_long_set_balloon_target")
+public func hb_vz_long_set_balloon_target(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    targetBytes: UInt64,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrowVz(vm, outErr) else { return Status.invalidArgument }
+    var found = false
+    handle.queue.sync {
+        guard let vm = handle.holder.vm,
+            let balloon = vm.memoryBalloonDevices.first
+                as? VZVirtioTraditionalMemoryBalloonDevice
+        else { return }
+        found = true
+        balloon.targetVirtualMachineMemorySize = targetBytes
+    }
+    if !found {
+        writeError(outErr, "no memory balloon device on this VM")
+        return Status.swiftError
+    }
+    outErr?.pointee = nil
+    return Status.ok
 }
 
 /// Request a graceful guest shutdown — the VZ analog of Firecracker's

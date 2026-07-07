@@ -202,28 +202,25 @@ func main() {
 		return err
 	})
 
+	h.run("balloon and entropy supported", func() error {
+		// PUT /balloon (pre-boot), GET echoes it, PATCH deflates back to 0 so
+		// the balloon stays inert for the boot/snapshot flow below.
+		if err := h.expectHTTPOk("PUT /balloon", http.MethodPut, "/balloon",
+			`{"amount_mib":64,"deflate_on_oom":false,"stats_polling_interval_s":0}`); err != nil {
+			return err
+		}
+		if err := h.expectHTTPOk("GET /balloon", http.MethodGet, "/balloon", ``); err != nil {
+			return err
+		}
+		if err := h.expectHTTPOk("PATCH /balloon", http.MethodPatch, "/balloon",
+			`{"amount_mib":0}`); err != nil {
+			return err
+		}
+		return h.expectHTTPOk("PUT /entropy", http.MethodPut, "/entropy", `{"rate_limiter":null}`)
+	})
+
 	h.run("unsupported device endpoints return errors", func() error {
-		if err := expectErr("PUT /balloon", func() error {
-			amount := int64(64)
-			deflate := true
-			_, err := ops.PutBalloon(operations.NewPutBalloonParams().WithBody(&models.Balloon{AmountMib: &amount, DeflateOnOom: &deflate}))
-			return err
-		}); err != nil {
-			return err
-		}
-		if err := expectErr("PATCH /balloon", func() error {
-			amount := int64(32)
-			_, err := ops.PatchBalloon(operations.NewPatchBalloonParams().WithBody(&models.BalloonUpdate{AmountMib: &amount}))
-			return err
-		}); err != nil {
-			return err
-		}
-		if err := expectErr("GET /balloon", func() error {
-			_, err := ops.DescribeBalloonConfig(operations.NewDescribeBalloonConfigParams())
-			return err
-		}); err != nil {
-			return err
-		}
+		// Balloon statistics have no VZ equivalent (the balloon itself works).
 		if err := expectErr("GET /balloon/statistics", func() error {
 			_, err := ops.DescribeBalloonStats(operations.NewDescribeBalloonStatsParams())
 			return err
@@ -241,7 +238,6 @@ func main() {
 			{"PATCH /balloon/hinting/start", http.MethodPatch, "/balloon/hinting/start", `{}`},
 			{"GET /balloon/hinting/status", http.MethodGet, "/balloon/hinting/status", ``},
 			{"PATCH /balloon/hinting/stop", http.MethodPatch, "/balloon/hinting/stop", `{}`},
-			{"PUT /entropy", http.MethodPut, "/entropy", `{"rate_limiter":null}`},
 			{"PUT /cpu-config", http.MethodPut, "/cpu-config", `{}`},
 			{"PATCH /cpu-config", http.MethodPatch, "/cpu-config", `{}`},
 			{"PUT /pmem/pmem0", http.MethodPut, "/pmem/pmem0", `{"pmem_id":"pmem0","host_path":"/tmp/pmem","size":1048576}`},
@@ -488,6 +484,25 @@ func (h *harness) expectHTTPError(name, method, path, body string) error {
 	payload, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 400 {
 		return fmt.Errorf("%s unexpectedly returned %d: %s", name, resp.StatusCode, string(payload))
+	}
+	fmt.Printf("    %s -> %d\n", name, resp.StatusCode)
+	return nil
+}
+
+func (h *harness) expectHTTPOk(name, method, path, body string) error {
+	req, err := http.NewRequest(method, "http://localhost"+path, bytes.NewBufferString(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("content-type", "application/json")
+	resp, err := h.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	payload, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("%s returned %d: %s", name, resp.StatusCode, string(payload))
 	}
 	fmt.Printf("    %s -> %d\n", name, resp.StatusCode)
 	return nil

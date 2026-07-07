@@ -147,13 +147,14 @@ per-endpoint notes and known deviations.
 | `PUT /metrics`                        | ⚠︎         | Firecracker-style JSON; Linux counters zero |
 | `PUT /actions` (`InstanceStart`, `FlushMetrics`, `SendCtrlAltDel`) | ✓ | Boot/restore, force metrics flush, or graceful guest stop |
 | `PUT /entropy`                        | ✓          | virtio-rng always attached; request confirmed |
+| `PUT/PATCH/GET /balloon`              | ⚠︎         | VZ traditional balloon; live target adjust; no stats |
 | `PATCH /vm`                           | ✓          | `Paused ↔ Resumed`                         |
 | `PUT /snapshot/create`                | ✓          | A+stub (single blob at `snapshot_path`)    |
 | `PUT /snapshot/load`                  | ✓          | Round-trip across process restart          |
 | `GET /version`                        | ✓          | Reports pinned Firecracker compat version  |
 | `GET/PUT/PATCH /mmds`, `PUT /mmds/config` | ⚠︎     | Stored JSON; guest vsock/link-local path GETs via agent shim |
 | `PUT /vsock`                         | ⚠︎         | Host UDS `CONNECT <port>` bridge after boot |
-| balloon / cpu-config / pmem / serial / hotplug memory / vm config | ✗ | Routed, return Firecracker-shaped errors |
+| cpu-config / pmem / serial / hotplug memory / vm config / balloon stats | ✗ | Routed, return Firecracker-shaped errors |
 
 ## Performance
 

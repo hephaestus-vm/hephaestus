@@ -212,10 +212,20 @@ migration between hephaestus processes).
   hephaestus-agent by convention. Config-only CI validates the wire shape;
   `just fc-compat-vsock-e2e` validates the agent/MMDS path, the guest-side
   link-local MMDS shim, and a generic guest-port echo server.
-- **`PUT /balloon`, `PATCH /balloon`, `GET /balloon`,
-  `GET/PATCH /balloon/statistics`, `PATCH /balloon/hinting/start`,
+- **`PUT /balloon`, `PATCH /balloon`, `GET /balloon`** — ⚠︎ supported
+  via VZ's traditional memory balloon. `PUT` (pre-boot) configures the
+  reclaim target; `PATCH` live-adjusts it on a running VM. hephaestus
+  maps Firecracker's `amount_mib` (memory to reclaim) onto VZ's
+  `targetVirtualMachineMemorySize` (memory the guest keeps), so a
+  reclaim of `amount_mib` targets `mem_size_mib - amount_mib`.
+  `amount_mib` must be `< mem_size_mib` (validated at boot). Actual
+  reclaim depends on the guest's virtio-balloon driver. `deflate_on_oom`
+  is accepted but managed by VZ; a non-zero `stats_polling_interval_s`
+  is rejected.
+- **`GET/PATCH /balloon/statistics`, `PATCH /balloon/hinting/start`,
   `GET /balloon/hinting/status`, `PATCH /balloon/hinting/stop`** —
-  routed but return `NotSupported`; VZ doesn't expose a balloon device.
+  routed but return `NotSupported`; VZ exposes no balloon statistics or
+  free-page hinting.
 - **`PUT /entropy`** — ✓ accepted (pre-boot). The direct-VZ config
   always attaches a virtio-rng (`VZVirtioEntropyDeviceConfiguration`),
   so the guest always has an entropy source; the request is accepted

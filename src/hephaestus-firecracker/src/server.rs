@@ -21,6 +21,7 @@ use serde::Serialize;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
+use hephaestus_fc_api::vmm_config::balloon::{BalloonDeviceConfig, BalloonUpdateConfig};
 use hephaestus_fc_api::vmm_config::boot_source::BootSourceConfig;
 use hephaestus_fc_api::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
 use hephaestus_fc_api::vmm_config::logger::LoggerConfig;
@@ -197,11 +198,18 @@ async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Respon
             Ok(_) => unsupported("cpu-config"),
             Err(resp) => resp,
         },
-        (Method::PUT | Method::PATCH, "/balloon") => match parse_body::<Value>(req).await {
-            Ok(_) => unsupported("balloon"),
+        (Method::PUT, "/balloon") => match parse_body::<BalloonDeviceConfig>(req).await {
+            Ok(cfg) => to_response(backend.lock().await.configure_balloon(cfg)),
             Err(resp) => resp,
         },
-        (Method::GET, "/balloon") => unsupported("balloon"),
+        (Method::PATCH, "/balloon") => match parse_body::<BalloonUpdateConfig>(req).await {
+            Ok(cfg) => to_response(backend.lock().await.update_balloon(cfg)),
+            Err(resp) => resp,
+        },
+        (Method::GET, "/balloon") => match backend.lock().await.get_balloon() {
+            Ok(cfg) => json_response(StatusCode::OK, &cfg),
+            Err(err) => to_response(Err(err)),
+        },
         (Method::GET, "/balloon/statistics") => unsupported("balloon/statistics"),
         (Method::PATCH, "/balloon/statistics") => match parse_body::<Value>(req).await {
             Ok(_) => unsupported("balloon/statistics"),

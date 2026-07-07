@@ -246,6 +246,11 @@ unsafe extern "C" {
     fn hb_vz_long_start(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
     fn hb_vz_long_pause(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
     fn hb_vz_long_request_stop(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
+    fn hb_vz_long_set_balloon_target(
+        vm: *mut HbVzVm,
+        target_bytes: u64,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
     fn hb_vz_long_resume(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
     fn hb_vz_long_serve_mmds(
         vm: *mut HbVzVm,
@@ -699,6 +704,16 @@ impl VzVm {
     pub fn request_stop(&self) -> Result<(), VmError> {
         let mut out_err: *mut c_char = std::ptr::null_mut();
         let status = unsafe { hb_vz_long_request_stop(self.handle, &mut out_err) };
+        status.into_result(out_err)
+    }
+
+    /// Set the memory balloon's target VM memory size in bytes. A target
+    /// below the configured memory inflates the balloon and reclaims the
+    /// difference from the guest.
+    pub fn set_balloon_target(&self, target_bytes: u64) -> Result<(), VmError> {
+        let mut out_err: *mut c_char = std::ptr::null_mut();
+        let status =
+            unsafe { hb_vz_long_set_balloon_target(self.handle, target_bytes, &mut out_err) };
         status.into_result(out_err)
     }
 

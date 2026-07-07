@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use hephaestus_fc_api::vmm_config::balloon::{BalloonDeviceConfig, BalloonUpdateConfig};
 use hephaestus_fc_api::vmm_config::boot_source::{BootSourceConfig, DEFAULT_KERNEL_CMDLINE};
 use hephaestus_fc_api::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
 use hephaestus_fc_api::vmm_config::instance_info::{InstanceInfo, VmState};
@@ -166,6 +167,7 @@ trait VzVmHandle: std::fmt::Debug + Send + Sync {
     fn pause(&self) -> Result<(), VmmBackendError>;
     fn resume(&self) -> Result<(), VmmBackendError>;
     fn request_stop(&self) -> Result<(), VmmBackendError>;
+    fn set_balloon_target(&self, target_bytes: u64) -> Result<(), VmmBackendError>;
 }
 
 impl VzVmHandle for VzVm {
@@ -198,6 +200,11 @@ impl VzVmHandle for VzVm {
         self.request_stop()
             .map_err(|err| VmmBackendError::Internal(err.to_string()))
     }
+
+    fn set_balloon_target(&self, target_bytes: u64) -> Result<(), VmmBackendError> {
+        self.set_balloon_target(target_bytes)
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))
+    }
 }
 
 #[derive(Debug)]
@@ -216,6 +223,10 @@ pub struct VzBackend {
     machine_config: MachineConfig,
     mmds: Value,
     mmds_config: MmdsConfig,
+    /// Configured memory balloon (`PUT /balloon`), if any. The VZ balloon
+    /// device is always attached; this tracks whether the *client* asked for
+    /// one and its current reclaim target.
+    balloon: Option<BalloonDeviceConfig>,
     vsock: Option<VsockConfig>,
     logger: LoggerState,
     metrics: MetricsState,
@@ -247,6 +258,7 @@ impl VzBackend {
             machine_config: MachineConfig::default(),
             mmds: Value::Object(Default::default()),
             mmds_config: MmdsConfig::default(),
+            balloon: None,
             vsock: None,
             logger: LoggerState::default(),
             metrics: MetricsState::default(),
@@ -309,6 +321,43 @@ impl VzBackend {
             .iter()
             .map(|d| (d.path.clone(), d.read_only))
             .collect()
+    }
+
+    /// A balloon reclaim of `amount_mib` must leave the guest some memory, so
+    /// it has to be strictly less than the configured `mem_size_mib`.
+    fn validate_balloon_amount(&self, amount_mib: u32) -> Result<(), VmmBackendError> {
+        let mem = self.machine_config.mem_size_mib;
+        if amount_mib as usize >= mem {
+            return Err(VmmBackendError::InvalidConfig(format!(
+                "balloon amount_mib ({amount_mib}) must be less than mem_size_mib ({mem})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Best-effort: apply the configured balloon at boot. A failure here
+    /// doesn't fail the boot — the VM is up and the client can retry via
+    /// `PATCH /balloon`.
+    fn apply_initial_balloon(&self) {
+        if self.balloon.is_some()
+            && let Err(err) = self.apply_balloon_target()
+        {
+            eprintln!("hephaestus-firecracker: balloon target not applied at boot ({err})");
+        }
+    }
+
+    /// Push the configured balloon target to the running VM. VZ's target is
+    /// the memory the guest keeps, so reclaiming `amount_mib` means a target of
+    /// `mem_size_mib - amount_mib`. No-op if no balloon or no VM.
+    fn apply_balloon_target(&self) -> Result<(), VmmBackendError> {
+        let (Some(cfg), Some(vm)) = (self.balloon.as_ref(), self.vm.as_ref()) else {
+            return Ok(());
+        };
+        let target_mib = self
+            .machine_config
+            .mem_size_mib
+            .saturating_sub(cfg.amount_mib as usize);
+        vm.set_balloon_target(target_mib as u64 * 1024 * 1024)
     }
 
     fn serial_log_path(&self) -> PathBuf {
@@ -740,6 +789,43 @@ impl VmmBackend for VzBackend {
         Ok(())
     }
 
+    fn configure_balloon(&mut self, cfg: BalloonDeviceConfig) -> Result<(), VmmBackendError> {
+        self.require_preboot()?;
+        if cfg.stats_polling_interval_s != 0 {
+            return Err(VmmBackendError::NotSupported(
+                "balloon statistics (VZ exposes no balloon stats)".into(),
+            ));
+        }
+        // Validate `amount_mib` against memory at boot, not here — machine
+        // config may be PUT in either order relative to the balloon.
+        self.balloon = Some(cfg);
+        Ok(())
+    }
+
+    fn update_balloon(&mut self, cfg: BalloonUpdateConfig) -> Result<(), VmmBackendError> {
+        if self.balloon.is_none() {
+            return Err(VmmBackendError::InvalidState(
+                "balloon device was not configured (PUT /balloon first)".into(),
+            ));
+        }
+        // On a live VM memory is known, so validate; pre-boot defers to boot.
+        let live = matches!(self.state, VmState::Running | VmState::Paused);
+        if live {
+            self.validate_balloon_amount(cfg.amount_mib)?;
+        }
+        self.balloon.as_mut().unwrap().amount_mib = cfg.amount_mib;
+        if live {
+            self.apply_balloon_target()?;
+        }
+        Ok(())
+    }
+
+    fn get_balloon(&self) -> Result<BalloonDeviceConfig, VmmBackendError> {
+        self.balloon
+            .clone()
+            .ok_or_else(|| VmmBackendError::NotSupported("balloon device not configured".into()))
+    }
+
     fn send_ctrl_alt_del(&mut self) -> Result<(), VmmBackendError> {
         // Firecracker's SendCtrlAltDel signals the guest to shut down. VZ's
         // requestStop() (ACPI stop request) is the closest analog — the guest
@@ -769,6 +855,9 @@ impl VmmBackend for VzBackend {
 
     fn start_micro_vm(&mut self) -> Result<(), VmmBackendError> {
         self.require_preboot()?;
+        if let Some(amount) = self.balloon.as_ref().map(|b| b.amount_mib) {
+            self.validate_balloon_amount(amount)?;
+        }
 
         let boot = self
             .boot_source
@@ -831,6 +920,7 @@ impl VmmBackend for VzBackend {
                             self.abort_boot();
                             return Err(err);
                         }
+                        self.apply_initial_balloon();
                         self.flush_metrics();
                         return Ok(());
                     }
@@ -875,6 +965,7 @@ impl VmmBackend for VzBackend {
             self.abort_boot();
             return Err(err);
         }
+        self.apply_initial_balloon();
         self.log_info("vmm", "Vmm is running.");
         Ok(())
     }
@@ -932,6 +1023,9 @@ impl VmmBackend for VzBackend {
 
     fn load_snapshot(&mut self, params: LoadSnapshotConfig) -> Result<(), VmmBackendError> {
         self.require_preboot()?;
+        if let Some(amount) = self.balloon.as_ref().map(|b| b.amount_mib) {
+            self.validate_balloon_amount(amount)?;
+        }
 
         if params.enable_diff_snapshots || params.track_dirty_pages {
             return Err(VmmBackendError::NotSupported(
@@ -1010,6 +1104,7 @@ impl VmmBackend for VzBackend {
             self.abort_boot();
             return Err(err);
         }
+        self.apply_initial_balloon();
         self.metrics.snapshot_loads = self.metrics.snapshot_loads.saturating_add(1);
         self.flush_metrics();
         self.log_info("vmm", "Snapshot loaded.");
@@ -1232,6 +1327,7 @@ mod tests {
         pauses: Arc<AtomicU32>,
         resumes: Arc<AtomicU32>,
         mmds_refreshes: Arc<AtomicU32>,
+        balloon_target: Arc<AtomicU64>,
     }
 
     impl FakeVm {
@@ -1249,6 +1345,7 @@ mod tests {
                     pauses: pauses.clone(),
                     resumes: resumes.clone(),
                     mmds_refreshes: mmds.clone(),
+                    ..Default::default()
                 }),
                 pauses,
                 resumes,
@@ -1285,6 +1382,11 @@ mod tests {
         }
 
         fn request_stop(&self) -> Result<(), VmmBackendError> {
+            Ok(())
+        }
+
+        fn set_balloon_target(&self, target_bytes: u64) -> Result<(), VmmBackendError> {
+            self.balloon_target.store(target_bytes, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -1661,6 +1763,68 @@ mod tests {
             backend.extra_drive_specs(),
             vec![(data_new, false), (data2, false)]
         );
+    }
+
+    #[test]
+    fn balloon_configure_update_get_and_target_math() {
+        use hephaestus_fc_api::vmm_config::balloon::{BalloonDeviceConfig, BalloonUpdateConfig};
+
+        let mut backend = VzBackend::new("test".into());
+        backend
+            .put_machine_config(MachineConfig {
+                vcpu_count: 2,
+                mem_size_mib: 512,
+                ..MachineConfig::default()
+            })
+            .unwrap();
+
+        // Not configured yet.
+        assert!(matches!(
+            backend.get_balloon(),
+            Err(VmmBackendError::NotSupported(_))
+        ));
+
+        // Statistics polling is unsupported on VZ.
+        let err = backend
+            .configure_balloon(BalloonDeviceConfig {
+                amount_mib: 128,
+                deflate_on_oom: false,
+                stats_polling_interval_s: 1,
+            })
+            .unwrap_err();
+        assert!(matches!(err, VmmBackendError::NotSupported(_)));
+
+        // Configure-time doesn't validate against memory (machine-config may
+        // be PUT in either order); that check happens at boot / live update.
+        backend
+            .configure_balloon(BalloonDeviceConfig {
+                amount_mib: 128,
+                deflate_on_oom: false,
+                stats_polling_interval_s: 0,
+            })
+            .unwrap();
+        assert_eq!(backend.get_balloon().unwrap().amount_mib, 128);
+
+        // PATCH on a running VM live-adjusts the target: reclaiming 64 MiB of
+        // 512 leaves a 448 MiB target.
+        let target = Arc::new(AtomicU64::new(0));
+        let vm = FakeVm {
+            balloon_target: target.clone(),
+            ..Default::default()
+        };
+        backend.vm = Some(Arc::new(vm));
+        backend.state = VmState::Running;
+        backend
+            .update_balloon(BalloonUpdateConfig { amount_mib: 64 })
+            .unwrap();
+        assert_eq!(backend.get_balloon().unwrap().amount_mib, 64);
+        assert_eq!(target.load(Ordering::Relaxed), (512 - 64) * 1024 * 1024);
+
+        // A live update can't reclaim all of memory.
+        let err = backend
+            .update_balloon(BalloonUpdateConfig { amount_mib: 512 })
+            .unwrap_err();
+        assert!(matches!(err, VmmBackendError::InvalidConfig(_)));
     }
 
     #[test]
