@@ -84,6 +84,12 @@ reuse the vsock command channel (`hephaestus-agent` runs arbitrary
 
 ### M1b — MMDS over the guest NIC (restricted entitlement, dependent)
 
+> **Environment prerequisite:** M1b needs the restricted
+> `com.apple.vm.networking` entitlement. See [DEV_ENV.md](DEV_ENV.md) for the
+> feasibility probe (`just probe-vmnet`) and the provisioning-profile setup —
+> on the current machine the probe reports `Killed: 9` (blocked until a
+> profile is installed).
+
 Make stock images reach `169.254.169.254` **without** our agent shim.
 This is *not* unblocked by NAT: VZ's NAT is a black box we can't inject
 an MMDS responder into (that's exactly why the agent shim exists). It
@@ -173,7 +179,9 @@ target shrinks resident memory).
 Separate track: no new API surface, but it's what lets us drop the
 "don't run untrusted guests" caveat. Builds on the sandbox hardening
 just landed (`--id` validation, private work-root, least-privilege pool
-grant).
+grant). Process-group ownership + signal forwarding are done. See
+[DEV_ENV.md](DEV_ENV.md) for the privilege-drop / rlimit / launchd test
+setup (uid-drop needs a service user + `sudo`; rlimits test without root).
 
 - Finish `JAILER_MMDS_PLAN.md`: uid/gid drop, per-VM resource limits,
   launchd/process-group ownership so a killed jailer reaps its daemon

@@ -447,3 +447,33 @@ test-rootfs: build
     tar -czf /tmp/hephaestus-rfs.tgz -C "$src" .
     {{bin}} rootfs --from-tar /tmp/hephaestus-rfs.tgz --output /tmp/hephaestus-rfs.ext4 --size-mib 64
     file /tmp/hephaestus-rfs.ext4
+
+# --- M1b (vmnet MMDS) enablement ------------------------------------------
+# Probe whether this machine can honor the restricted com.apple.vm.networking
+# entitlement. SIGKILL on launch => needs a provisioning profile; printed
+# output => usable. See docs/DEV_ENV.md.
+probe-vmnet:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    id="${HEPHAESTUS_SIGN_IDENTITY:-}"
+    [[ -n "$id" ]] || id="$(security find-identity -v -p codesigning | awk '/Apple Development/{print $2; exit}')"
+    [[ -n "$id" ]] || { echo "no Apple Development identity; set HEPHAESTUS_SIGN_IDENTITY"; exit 1; }
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    xcrun swiftc -O scripts/vmnet-probe.swift -o "$tmp/vmnet-probe"
+    codesign --force --sign "$id" --entitlements hephaestus-vmnet.entitlements "$tmp/vmnet-probe"
+    echo "== running probe (no output / 'Killed: 9' => entitlement not authorized) =="
+    "$tmp/vmnet-probe"
+
+# Rebuild the workspace signed with the vmnet entitlement + your Apple
+# Development identity, so bridged-networking code can actually run. Requires a
+# provisioning profile with the Virtualization Networking capability installed.
+sign-vmnet:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    id="${HEPHAESTUS_SIGN_IDENTITY:-}"
+    [[ -n "$id" ]] || id="$(security find-identity -v -p codesigning | awk '/Apple Development/{print $2; exit}')"
+    [[ -n "$id" ]] || { echo "no Apple Development identity; set HEPHAESTUS_SIGN_IDENTITY"; exit 1; }
+    HEPHAESTUS_ENTITLEMENTS="$PWD/hephaestus-vmnet.entitlements" \
+      HEPHAESTUS_SIGN_IDENTITY="$id" \
+      cargo build -p hephaestus-firecracker
+    echo "signed hephaestus-firecracker with vmnet entitlement ($id)"

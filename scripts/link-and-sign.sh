@@ -57,8 +57,18 @@ if [[ "$base" != "hephaestus" && "$base" != hephaestus-* && "$base" != hephaestu
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-entitlements="${script_dir}/../hephaestus.entitlements"
+
+# Default: base virtualization entitlement, ad-hoc signature (works under SIP
+# for everything except restricted entitlements). Both are overridable so the
+# M1b vmnet track can sign with an Apple Development identity + the vmnet
+# entitlement set without editing this script:
+#   HEPHAESTUS_ENTITLEMENTS   path to an .entitlements plist (default: base)
+#   HEPHAESTUS_SIGN_IDENTITY  codesign identity (default: - for ad-hoc)
+# See docs/DEV_ENV.md.
+entitlements="${HEPHAESTUS_ENTITLEMENTS:-${script_dir}/../hephaestus.entitlements}"
+sign_identity="${HEPHAESTUS_SIGN_IDENTITY:--}"
 
 if [[ -f "$entitlements" ]]; then
-    codesign --force --sign - --timestamp=none --entitlements "$entitlements" "$out" 2>/dev/null || true
+    codesign --force --sign "$sign_identity" --timestamp=none \
+        --entitlements "$entitlements" "$out" 2>/dev/null || true
 fi
