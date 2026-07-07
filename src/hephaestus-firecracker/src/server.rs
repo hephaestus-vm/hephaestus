@@ -188,10 +188,9 @@ async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Respon
                 backend.lock().await.flush_metrics();
                 to_response(Ok(()))
             }
-            Ok(ActionBody { action_type }) => fault(
-                StatusCode::BAD_REQUEST,
-                &format!("action_type `{action_type:?}` is not supported"),
-            ),
+            Ok(ActionBody {
+                action_type: ActionType::SendCtrlAltDel,
+            }) => to_response(backend.lock().await.send_ctrl_alt_del()),
             Err(resp) => resp,
         },
         (Method::PUT | Method::PATCH, "/cpu-config") => match parse_body::<Value>(req).await {
@@ -218,7 +217,7 @@ async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Respon
             Err(resp) => resp,
         },
         (Method::PUT, "/entropy") => match parse_body::<Value>(req).await {
-            Ok(_) => unsupported("entropy"),
+            Ok(_) => to_response(backend.lock().await.configure_entropy()),
             Err(resp) => resp,
         },
         (Method::PUT, p) if p.starts_with("/pmem/") => {

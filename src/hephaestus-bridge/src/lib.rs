@@ -242,6 +242,7 @@ unsafe extern "C" {
     ) -> HbStatus;
     fn hb_vz_long_start(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
     fn hb_vz_long_pause(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
+    fn hb_vz_long_request_stop(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
     fn hb_vz_long_resume(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
     fn hb_vz_long_serve_mmds(
         vm: *mut HbVzVm,
@@ -672,6 +673,14 @@ impl VzVm {
     pub fn pause(&self) -> Result<(), VmError> {
         let mut out_err: *mut c_char = std::ptr::null_mut();
         let status = unsafe { hb_vz_long_pause(self.handle, &mut out_err) };
+        status.into_result(out_err)
+    }
+
+    /// Request a graceful guest shutdown (VZ `requestStop()`). The guest
+    /// stops asynchronously; errors if the VM can't accept the request.
+    pub fn request_stop(&self) -> Result<(), VmError> {
+        let mut out_err: *mut c_char = std::ptr::null_mut();
+        let status = unsafe { hb_vz_long_request_stop(self.handle, &mut out_err) };
         status.into_result(out_err)
     }
 

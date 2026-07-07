@@ -156,6 +156,7 @@ trait VzVmHandle: std::fmt::Debug + Send + Sync {
     fn save_state(&self, path: &std::path::Path) -> Result<(), VmmBackendError>;
     fn pause(&self) -> Result<(), VmmBackendError>;
     fn resume(&self) -> Result<(), VmmBackendError>;
+    fn request_stop(&self) -> Result<(), VmmBackendError>;
 }
 
 impl VzVmHandle for VzVm {
@@ -181,6 +182,11 @@ impl VzVmHandle for VzVm {
 
     fn resume(&self) -> Result<(), VmmBackendError> {
         self.resume()
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))
+    }
+
+    fn request_stop(&self) -> Result<(), VmmBackendError> {
+        self.request_stop()
             .map_err(|err| VmmBackendError::Internal(err.to_string()))
     }
 }
@@ -688,6 +694,42 @@ impl VmmBackend for VzBackend {
             ));
         }
         self.put_machine_config(cfg)
+    }
+
+    fn configure_entropy(&mut self) -> Result<(), VmmBackendError> {
+        self.require_preboot()?;
+        // The direct-VZ config always attaches a
+        // VZVirtioEntropyDeviceConfiguration, so the guest always has
+        // virtio-rng. Accept the request and confirm; any rate_limiter is
+        // ignored (VZ exposes no rng rate knob).
+        Ok(())
+    }
+
+    fn send_ctrl_alt_del(&mut self) -> Result<(), VmmBackendError> {
+        // Firecracker's SendCtrlAltDel signals the guest to shut down. VZ's
+        // requestStop() (ACPI stop request) is the closest analog — the guest
+        // powers off rather than reboots, but both are graceful, guest-driven
+        // stops. Only valid on a running VM, matching upstream.
+        match self.state {
+            VmState::Running => {}
+            VmState::Paused => {
+                return Err(VmmBackendError::InvalidState(
+                    "cannot SendCtrlAltDel while paused".into(),
+                ));
+            }
+            VmState::NotStarted => {
+                return Err(VmmBackendError::InvalidState(
+                    "cannot SendCtrlAltDel before InstanceStart".into(),
+                ));
+            }
+        }
+        let vm = self
+            .vm
+            .as_ref()
+            .ok_or_else(|| VmmBackendError::Internal("running state without a VM handle".into()))?;
+        vm.request_stop()?;
+        self.log_info("vmm", "Guest shutdown requested (SendCtrlAltDel).");
+        Ok(())
     }
 
     fn start_micro_vm(&mut self) -> Result<(), VmmBackendError> {
@@ -1199,6 +1241,10 @@ mod tests {
             self.resumes.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+
+        fn request_stop(&self) -> Result<(), VmmBackendError> {
+            Ok(())
+        }
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -1533,6 +1579,35 @@ mod tests {
             .unwrap();
         assert!(backend.iface.is_some());
         assert_eq!(backend.configured_mac(), None);
+    }
+
+    #[test]
+    fn entropy_accepted_preboot_rejected_postboot() {
+        let mut backend = VzBackend::new("test".into());
+        backend.configure_entropy().unwrap();
+        backend.state = VmState::Running;
+        let err = backend.configure_entropy().unwrap_err();
+        assert!(matches!(err, VmmBackendError::InvalidState(_)));
+    }
+
+    #[test]
+    fn send_ctrl_alt_del_requires_running_vm() {
+        // Before boot: rejected.
+        let mut backend = VzBackend::new("test".into());
+        let err = backend.send_ctrl_alt_del().unwrap_err();
+        assert!(matches!(err, VmmBackendError::InvalidState(_)));
+
+        // Running with a VM: requests stop.
+        let (vm, _, _, _) = FakeVm::boxed();
+        let mut backend = VzBackend::new("test".into());
+        backend.vm = Some(vm);
+        backend.state = VmState::Running;
+        backend.send_ctrl_alt_del().unwrap();
+
+        // Paused: rejected (matches Firecracker — only valid while running).
+        backend.state = VmState::Paused;
+        let err = backend.send_ctrl_alt_del().unwrap_err();
+        assert!(matches!(err, VmmBackendError::InvalidState(_)));
     }
 
     #[test]

@@ -1683,6 +1683,36 @@ public func hb_vz_long_pause(
     }
 }
 
+/// Request a graceful guest shutdown — the VZ analog of Firecracker's
+/// `SendCtrlAltDel`. `requestStop()` delivers an ACPI-style stop request;
+/// the guest shuts down asynchronously. Returns an error if the VM can't
+/// accept a stop request in its current state (e.g. not running).
+@_cdecl("hb_vz_long_request_stop")
+public func hb_vz_long_request_stop(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrowVz(vm, outErr) else { return Status.invalidArgument }
+    let box = ErrorBox()
+    var canStop = false
+    handle.queue.sync {
+        guard let vm = handle.holder.vm else { return }
+        canStop = vm.canRequestStop
+        guard canStop else { return }
+        do { try vm.requestStop() } catch { box.value = error }
+    }
+    if !canStop {
+        writeError(outErr, "VM cannot accept a stop request in its current state")
+        return Status.swiftError
+    }
+    if let error = box.value {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+    outErr?.pointee = nil
+    return Status.ok
+}
+
 @_cdecl("hb_vz_long_resume")
 public func hb_vz_long_resume(
     vm: UnsafeMutablePointer<HbVzVm>?,

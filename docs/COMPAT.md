@@ -88,7 +88,10 @@ Legend:
 - `action_type: "InstanceStart"` cold-boots/restores the VM.
 - `action_type: "FlushMetrics"` forces an immediate metrics JSON flush when
   `PUT /metrics` has configured a sink.
-- `action_type: "SendCtrlAltDel"` returns `NotSupported`.
+- `action_type: "SendCtrlAltDel"` requests a graceful guest shutdown via
+  VZ `requestStop()` (ACPI-style stop). The guest powers off rather
+  than reboots — the closest VZ analog — and it's only valid while the
+  VM is `Running`, matching upstream.
 
 ### `PATCH /vm`
 
@@ -208,8 +211,11 @@ migration between hephaestus processes).
   `GET/PATCH /balloon/statistics`, `PATCH /balloon/hinting/start`,
   `GET /balloon/hinting/status`, `PATCH /balloon/hinting/stop`** —
   routed but return `NotSupported`; VZ doesn't expose a balloon device.
-- **`PUT /entropy`** — routed but returns `NotSupported`; no
-  configurable virtio-rng device.
+- **`PUT /entropy`** — ✓ accepted (pre-boot). The direct-VZ config
+  always attaches a virtio-rng (`VZVirtioEntropyDeviceConfiguration`),
+  so the guest always has an entropy source; the request is accepted
+  and confirmed. Any `rate_limiter` is ignored (VZ exposes no rng rate
+  knob).
 - **`PUT/PATCH /cpu-config`, CPU templates** — routed/rejected with
   `NotSupported`; Apple Silicon CPU templates are not configurable.
 - **`PUT /pmem/{id}`** — routed but returns `NotSupported`; VZ's direct

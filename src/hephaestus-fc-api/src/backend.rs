@@ -127,6 +127,18 @@ pub trait VmmBackend {
     /// `PATCH /machine-config`
     fn patch_machine_config(&mut self, update: MachineConfigUpdate) -> Result<(), VmmBackendError>;
 
+    /// `PUT /entropy` — configure a virtio-rng device. Default impl is
+    /// `NotSupported` so backends opt in.
+    fn configure_entropy(&mut self) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("entropy".into()))
+    }
+
+    /// `PUT /actions` with `SendCtrlAltDel` — request a graceful guest
+    /// shutdown. Default impl is `NotSupported` so backends opt in.
+    fn send_ctrl_alt_del(&mut self) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("SendCtrlAltDel".into()))
+    }
+
     /// `PUT /actions` with `InstanceStart` — boot the microVM.
     fn start_micro_vm(&mut self) -> Result<(), VmmBackendError>;
 
