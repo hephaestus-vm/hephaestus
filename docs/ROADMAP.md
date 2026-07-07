@@ -179,9 +179,10 @@ target shrinks resident memory).
 Separate track: no new API surface, but it's what lets us drop the
 "don't run untrusted guests" caveat. Builds on the sandbox hardening
 just landed (`--id` validation, private work-root, least-privilege pool
-grant). Process-group ownership + signal forwarding are done. See
-[DEV_ENV.md](DEV_ENV.md) for the privilege-drop / rlimit / launchd test
-setup (uid-drop needs a service user + `sudo`; rlimits test without root).
+grant). **Done:** process-group ownership + signal forwarding, and
+`--rlimit-*` resource caps on the daemon (`just jailer-rlimit-check`).
+**Remaining:** uid/gid drop (needs a service user + `sudo` to verify) and a
+launchd supervisor. See [DEV_ENV.md](DEV_ENV.md) for the setup.
 
 - Finish `JAILER_MMDS_PLAN.md`: uid/gid drop, per-VM resource limits,
   launchd/process-group ownership so a killed jailer reaps its daemon

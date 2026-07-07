@@ -477,3 +477,21 @@ sign-vmnet:
       HEPHAESTUS_SIGN_IDENTITY="$id" \
       cargo build -p hephaestus-firecracker
     echo "signed hephaestus-firecracker with vmnet entitlement ($id)"
+
+# --- M4 (jailer productionization) ----------------------------------------
+# Verify the jailer's --rlimit-* caps reach the exec'd daemon. Root-free,
+# VM-free (uses a stand-in binary that prints its own ulimits).
+jailer-rlimit-check: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    j="./build/cargo_target/debug/hephaestus-jailer"
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    touch "$tmp/vmlinux" "$tmp/rootfs.ext4"
+    printf '#!/bin/sh\necho "NOFILE=$(ulimit -n)"\nexit 0\n' > "$tmp/fake-fc"
+    chmod +x "$tmp/fake-fc"
+    out="$("$j" --id rl-check --work-dir "$tmp/work" --kernel "$tmp/vmlinux" \
+        --rootfs "$tmp/rootfs.ext4" --firecracker-binary "$tmp/fake-fc" \
+        --rlimit-nofile 64 2>/dev/null)"
+    [[ "$out" == "NOFILE=64" ]] \
+        && echo "OK: jailer applied RLIMIT_NOFILE=64 to the daemon" \
+        || { echo "FAIL: got '$out'"; exit 1; }

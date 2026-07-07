@@ -23,10 +23,10 @@
 //!   child runs as a sibling process under the sandbox. A later iteration
 //!   can wrap this in a launchd plist or a longer-lived supervisor that
 //!   owns N VMs.
-//! - Not a full Firecracker jailer replacement. No uid/gid drop, no
-//!   chroot, no cgroup pinning. The sandbox profile is the only isolation
-//!   boundary today; macOS sandbox profiles are file/network-scoped, not
-//!   process-scoped.
+//! - Not a full Firecracker jailer replacement yet. Isolation today is the
+//!   sandbox profile (file/network-scoped) plus optional `--rlimit-*` resource
+//!   caps on the daemon. Still missing: uid/gid drop and chroot (macOS has no
+//!   cgroups; per-VM cpu/memory caps are enforced by VZ itself).
 //! - Not entitlement-aware. The child still needs to be ad-hoc signed with
 //!   `com.apple.security.virtualization`; the jailer cannot grant that
 //!   for you. See `docs/JAILER_MMDS_PLAN.md` for the entitlement roadmap.
@@ -118,6 +118,21 @@ struct Args {
     /// allowlist.
     #[arg(long)]
     deny_probe: Option<PathBuf>,
+
+    /// Cap the daemon's open file descriptors (`RLIMIT_NOFILE`). Opt-in
+    /// hardening; unset leaves the inherited limit. Only lowers, so it needs
+    /// no privilege.
+    #[arg(long)]
+    rlimit_nofile: Option<u64>,
+
+    /// Cap the daemon's process/thread count (`RLIMIT_NPROC`). Opt-in.
+    #[arg(long)]
+    rlimit_nproc: Option<u64>,
+
+    /// Cap the size (bytes) of any file the daemon can create (`RLIMIT_FSIZE`).
+    /// Opt-in.
+    #[arg(long)]
+    rlimit_fsize: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -316,18 +331,45 @@ fn build_command(plan: &Plan, args: &Args) -> Command {
     if let Some(probe) = args.deny_probe.as_deref() {
         cmd.arg("--sandbox-deny-probe").arg(probe);
     }
-    // Run the daemon as its own process-group leader so the jailer can signal
-    // the whole subtree (daemon + anything it spawns) on teardown.
-    // SAFETY: `setpgid(0, 0)` is async-signal-safe and touches no Rust state.
+    // Capture the (Copy) resource caps so the child closure is self-contained.
+    let nofile = args.rlimit_nofile;
+    let nproc = args.rlimit_nproc;
+    let fsize = args.rlimit_fsize;
+    // Run the daemon as its own process-group leader (so the jailer can signal
+    // the whole subtree on teardown) and apply any resource caps before exec.
+    // SAFETY: `setpgid`/`setrlimit` are async-signal-safe and touch no Rust
+    // heap state; the closure only reads captured Copy values.
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            apply_rlimit(libc::RLIMIT_NOFILE, nofile)?;
+            apply_rlimit(libc::RLIMIT_NPROC, nproc)?;
+            apply_rlimit(libc::RLIMIT_FSIZE, fsize)?;
             Ok(())
         });
     }
     cmd
+}
+
+/// Lower a resource limit (both soft and hard) to `value`, if set. Lowering is
+/// always permitted, so no privilege is required; raising above the current
+/// hard limit would need root and is not attempted here. Called from the
+/// child's `pre_exec`, so it must stay async-signal-safe (`setrlimit` is).
+fn apply_rlimit(resource: libc::c_int, value: Option<u64>) -> std::io::Result<()> {
+    let Some(v) = value else {
+        return Ok(());
+    };
+    let rl = libc::rlimit {
+        rlim_cur: v as libc::rlim_t,
+        rlim_max: v as libc::rlim_t,
+    };
+    // SAFETY: `rl` is fully initialized; setrlimit is async-signal-safe.
+    if unsafe { libc::setrlimit(resource, &rl) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn run(args: Args) -> Result<u8, JailerError> {
@@ -493,6 +535,9 @@ mod tests {
             initramfs: None,
             pool_dir: None,
             deny_probe: None,
+            rlimit_nofile: None,
+            rlimit_nproc: None,
+            rlimit_fsize: None,
         }
     }
 

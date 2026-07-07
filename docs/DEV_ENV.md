@@ -111,13 +111,14 @@ When *not* root (the common dev case), the drop should be a validated no-op
 (warn if `--user` names a different uid than the current one) so the code path
 is still exercisable without sudo.
 
-### Resource limits
+### Resource limits — ✅ done
 
-`setrlimit` (RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_AS/CPU) in the same `pre_exec`
-that does `setpgid`. **Testable without root** — a process may always lower its
-own soft limits. Verify with a probe command that tries to exceed the limit and
-expects failure. (macOS has no cgroups; per-VM cpu/memory caps are already
-enforced by VZ's `cpuCount`/`memorySize`.)
+The jailer takes `--rlimit-nofile`, `--rlimit-nproc`, and `--rlimit-fsize` and
+applies them via `setrlimit` in the same `pre_exec` as `setpgid` (async-signal-
+safe; only lowers, so no privilege needed). Verified root-free by
+`just jailer-rlimit-check` (a stand-in daemon reports the applied `ulimit`).
+(macOS has no cgroups; per-VM cpu/memory caps are already enforced by VZ's
+`cpuCount`/`memorySize`.)
 
 ### launchd supervisor
 
