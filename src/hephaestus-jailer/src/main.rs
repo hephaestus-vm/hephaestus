@@ -12,6 +12,12 @@
 //! 3. Execs `hephaestus-firecracker` with `--sandbox-profile <profile>`
 //!    and `--api-sock <work_dir>/api.sock`. The child inherits the jail.
 //!
+//! The daemon is launched as its own process-group leader, and the jailer
+//! forwards `SIGTERM`/`SIGINT` to that group — so terminating the jailer
+//! reaps the daemon (and its VM) rather than orphaning it to launchd. A hard
+//! `SIGKILL` to the jailer can still orphan the daemon (macOS has no
+//! `PR_SET_PDEATHSIG`); a launchd-owned supervisor is the eventual fix.
+//!
 //! What this is NOT (yet):
 //! - Not a launchd job. The user runs `hephaestus-jailer` directly; the
 //!   child runs as a sibling process under the sandbox. A later iteration
@@ -26,13 +32,45 @@
 //!   for you. See `docs/JAILER_MMDS_PLAN.md` for the entitlement roadmap.
 
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use clap::Parser;
 use thiserror::Error;
 
 mod profile;
+
+/// Process-group id of the launched `hephaestus-firecracker` child (equal to
+/// its pid, since we make it a group leader). Read from a signal handler, so
+/// it lives in an atomic. `0` means "no child yet".
+static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+
+/// Forward a termination signal to the child's whole process group so the
+/// daemon (and the VM it owns) dies with the jailer instead of reparenting to
+/// launchd and leaking. Async-signal-safe: an atomic load + `kill(2)`.
+extern "C" fn forward_termination(_sig: libc::c_int) {
+    let pgid = CHILD_PGID.load(Ordering::SeqCst);
+    if pgid > 0 {
+        // SAFETY: kill(2) is async-signal-safe; negative pid targets the group.
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
+    }
+}
+
+/// Install `SIGTERM`/`SIGINT` forwarders. Best-effort — `SIGKILL` can't be
+/// caught, so a hard-killed jailer can still orphan its daemon (no macOS
+/// `PR_SET_PDEATHSIG` equivalent); the common graceful-kill path is covered.
+fn install_signal_forwarding() {
+    let handler = forward_termination as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: registering a signal handler; the handler is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "hephaestus-jailer", version)]
@@ -262,8 +300,10 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
     })
 }
 
-/// Build the `hephaestus-firecracker` command line from a prepared plan. Pure
-/// (no side effects, no exec) so a test can assert the args/env it produces.
+/// Build the `hephaestus-firecracker` command line from a prepared plan. No
+/// side effects at call time (a test can assert the args/env it produces); it
+/// does register a `pre_exec` hook that runs in the child at spawn to put it in
+/// its own process group.
 fn build_command(plan: &Plan, args: &Args) -> Command {
     let mut cmd = Command::new(&plan.binary);
     cmd.env("HEPHAESTUS_FC_WORK_DIR", &plan.work_dir);
@@ -275,6 +315,17 @@ fn build_command(plan: &Plan, args: &Args) -> Command {
     }
     if let Some(probe) = args.deny_probe.as_deref() {
         cmd.arg("--sandbox-deny-probe").arg(probe);
+    }
+    // Run the daemon as its own process-group leader so the jailer can signal
+    // the whole subtree (daemon + anything it spawns) on teardown.
+    // SAFETY: `setpgid(0, 0)` is async-signal-safe and touches no Rust state.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
     cmd
 }
@@ -294,7 +345,16 @@ fn run(args: Args) -> Result<u8, JailerError> {
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let status = cmd.status().map_err(|source| JailerError::Exec {
+    // Spawn (not `status()`) so we can forward termination signals: the child
+    // is its own process-group leader, so a `SIGTERM`/`SIGINT` to the jailer
+    // is relayed to the whole daemon+VM subtree instead of orphaning it.
+    let mut child = cmd.spawn().map_err(|source| JailerError::Exec {
+        binary: plan.binary.clone(),
+        source,
+    })?;
+    CHILD_PGID.store(child.id() as i32, Ordering::SeqCst);
+    install_signal_forwarding();
+    let status = child.wait().map_err(|source| JailerError::Exec {
         binary: plan.binary.clone(),
         source,
     })?;
