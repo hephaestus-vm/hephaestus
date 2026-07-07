@@ -22,6 +22,16 @@ because VZ has no equivalent — they can only ever be documented
 So the target is: **close every gap VZ can actually express.** The
 milestones below are that list, highest leverage first.
 
+## Status at a glance
+
+| Milestone | State |
+| :-- | :-- |
+| M1a — NAT networking on the HTTP path | ✅ Done |
+| M2 — device breadth (data drives, entropy, SendCtrlAltDel, balloon) | ✅ Done |
+| M3 — metrics fidelity & operability | ▶ In progress |
+| M1b — MMDS over the guest NIC (vmnet, restricted entitlement) | ⬜ Not started |
+| M4 — multi-tenant / jailer productionization | ⬜ Not started |
+
 ---
 
 ## Milestone 1 — Guest networking (the headline gap)
@@ -34,7 +44,14 @@ already proves VZ NAT works with only the base
 `com.apple.security.virtualization` entitlement, so the base tier needs
 no new entitlements.
 
-### M1a — NAT networking on the HTTP path (base entitlement)
+### M1a — NAT networking on the HTTP path (base entitlement) — ✅ Done
+
+Delivered: `PUT /network-interfaces/{id}` now attaches a
+`VZNATNetworkDeviceAttachment` NIC (honoring `guest_mac`) via
+`enable_networking`/`mac` threaded through `hb_vz_long_new`/`_restore`;
+the once-dead `iface` field drives it. Verified by `just
+fc-compat-net-e2e` (guest sees a non-loopback netdev). The original plan
+is kept below as design history.
 
 Give HTTP-API VMs outbound IPv4 + a stable NAT address, honoring
 `PUT /network-interfaces/{id}` instead of accept-and-ignore.
@@ -85,9 +102,28 @@ requires bridged `VZVmnetNetworkDeviceAttachment` + the restricted
 
 ---
 
-## Milestone 2 — Device breadth (independent, mostly small wins)
+## Milestone 2 — Device breadth — ✅ Done
 
-Each is separately shippable; no ordering dependency.
+All four items shipped, each with a real-VM smoke and a
+firectl-harness/COMPAT update:
+
+- **Secondary / data drives** — done. Backend tracks a root + ordered
+  secondary drive list keyed by `drive_id`; the FFI carries a
+  `(paths, readonly)` array; the guest sees `/dev/vdb…`. Pool fast-path
+  skipped when secondaries are configured.
+- **`PUT /entropy` → supported** — done (device was already attached;
+  endpoint now confirms).
+- **`SendCtrlAltDel` → graceful stop** — done via
+  `hb_vz_long_request_stop` → VZ `requestStop()`.
+- **Memory balloon** — done. VZ traditional balloon always attached;
+  `PUT`/`GET`/`PATCH /balloon` map `amount_mib` onto
+  `targetVirtualMachineMemorySize`; validated at boot; save/restore
+  verified compatible. `/balloon/statistics` + hinting stay
+  `NotSupported`.
+
+The original plan is kept below as design history.
+
+### Original plan (design history)
 
 - **Secondary / data drives** — VZ supports multiple
   `VZVirtioBlockDeviceConfiguration` attachments. Replace the single
@@ -114,13 +150,14 @@ target shrinks resident memory).
 
 ---
 
-## Milestone 3 — Fidelity & operability
+## Milestone 3 — Fidelity & operability — ▶ In progress
 
-- **Real metrics counters** — today most `flush_metrics` fields are
-  hardcoded `0` and `instance_info_count` is fed *all* GETs. Track the
-  per-endpoint counts the shape advertises. Also stop reopening the
-  metrics file on every request (hold the handle; flush on timer +
-  lifecycle).
+- **Real metrics counters** *(current focus)* — today most
+  `flush_metrics` fields are hardcoded `0` and `instance_info_count` is
+  fed *all* GETs. Track the per-endpoint counts the shape advertises
+  (per-method + per-endpoint), and label them correctly. Also stop
+  reopening the metrics file on every request (hold the handle; flush on
+  timer + lifecycle).
 - **Rate limiters** — `drive` / `net` `rate_limiter` are accepted-and-
   ignored. VZ has no token-bucket knob; either approximate in the vsock/
   data path or keep documented-noop. *Likely defer — low value, high
@@ -148,9 +185,9 @@ grant).
 
 ## Suggested execution order
 
-1. **M1a** (NAT networking) — unblocks the core use case, base entitlement.
-2. **M2 quick wins** (entropy, SendCtrlAltDel, data drives) — cheap breadth.
-3. **M2 balloon** + **M3 metrics** — fidelity.
+1. ~~**M1a** (NAT networking)~~ — ✅ done.
+2. ~~**M2** (entropy, SendCtrlAltDel, data drives, balloon)~~ — ✅ done.
+3. **M3 metrics** — fidelity *(current)*.
 4. **M1b** (vmnet MMDS) + **M4** (jailer) — the entitlement/security track.
 
 Every milestone lands with: unit tests, a COMPAT.md status update, a
