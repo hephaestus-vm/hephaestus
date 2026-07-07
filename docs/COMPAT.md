@@ -61,16 +61,26 @@ Legend:
 
 ### `PUT /network-interfaces/{id}`, `PATCH /network-interfaces/{id}`
 
-- **Status:** ⚠︎ Partial — accept-and-ignore on the HTTP API path.
-- The `hephaestus-firecracker` HTTP daemon (the direct-VZ
-  `hb_vz_long_*` path) does **not** attach a guest network device.
-  The config is validated and stored but no NIC is wired, so a VM
-  booted over the HTTP API has no guest network. `iface_id`, MAC
-  address, host tap name, and rate-limiter settings are all ignored.
-- Built-in VZ NAT (`192.168.64.0/24`) is attached only on the
-  **`hephaestus` CLI** container path (`run` / `vz-exec`), not on the
-  HTTP API. Wiring NAT into the HTTP path is tracked as future work.
-- `PATCH` is likewise an accept-noop.
+- **Status:** ⚠︎ Partial — NIC attached, L3 config is the guest's job.
+- `PUT /network-interfaces/{id}` on the HTTP API path attaches a
+  guest NIC backed by VZ's built-in NAT (`192.168.64.0/24`, gateway
+  `.1`). NAT only needs the base `com.apple.security.virtualization`
+  entitlement, so it works under ad-hoc signing. `guest_mac` is
+  honored (VZ assigns a random MAC when omitted).
+- Like Firecracker, hephaestus provides the *device*; the guest
+  configures L3 (DHCP / `ip=` boot arg / cloud-init). VZ NAT runs a
+  DHCP server, so a guest with a DHCP client gets a `192.168.64.0/24`
+  lease automatically.
+- **Ignored**: `host_dev_name` (VZ manages the host side), and
+  `rx_rate_limiter` / `tx_rate_limiter` (VZ exposes no I/O rate knob).
+- Guest-visible link-local MMDS (`169.254.169.254`) still rides the
+  `hephaestus-agent` shim, not the NAT NIC — VZ NAT is a black box we
+  can't inject an MMDS responder into. Reaching MMDS over the NIC
+  without the agent needs bridged `VZVmnet` + the restricted
+  `com.apple.vm.networking` entitlement (tracked in ROADMAP M1b).
+- `PATCH` is an accept-noop (VZ attachments aren't hot-swappable).
+- Verified by `just fc-compat-net-e2e` (boots with a NIC, confirms a
+  non-loopback netdev appears in the guest).
 
 ### `PUT /actions`
 

@@ -141,7 +141,7 @@ per-endpoint notes and known deviations.
 | `GET/PUT/PATCH /machine-config`       | ✓          | CPU templates rejected on Apple Silicon     |
 | `PUT /boot-source`                    | ✓          | kernel + boot args + optional initrd       |
 | `PUT/PATCH /drives/{id}`              | ⚠︎         | `PATCH` pre-boot only (VZ can't hot-swap)  |
-| `PUT /network-interfaces/{id}`        | ⚠︎         | Accepted + noop; VZ NAT attached on boot   |
+| `PUT /network-interfaces/{id}`        | ⚠︎         | VZ NAT NIC attached; `guest_mac` honored, L3 up to guest |
 | `PATCH /network-interfaces/{id}`      | ⚠︎         | Accept-noop (rate-limiter ignored)         |
 | `PUT /logger`                         | ✓          | Firecracker-style text logs + debug access |
 | `PUT /metrics`                        | ⚠︎         | Firecracker-style JSON; Linux counters zero |

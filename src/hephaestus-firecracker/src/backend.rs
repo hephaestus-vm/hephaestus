@@ -274,6 +274,16 @@ impl VzBackend {
         self.state = VmState::NotStarted;
     }
 
+    /// The guest MAC (Firecracker `guest_mac`) as a string, if a network
+    /// interface was configured with one. `None` lets VZ assign a random
+    /// locally-administered address.
+    fn configured_mac(&self) -> Option<String> {
+        self.iface
+            .as_ref()
+            .and_then(|i| i.guest_mac.as_ref())
+            .map(|m| m.to_string())
+    }
+
     fn serial_log_path(&self) -> PathBuf {
         std::env::var_os("HEPHAESTUS_FC_WORK_DIR")
             .map(PathBuf::from)
@@ -764,7 +774,9 @@ impl VmmBackend for VzBackend {
         let mut spec = VzSpec::new(&kernel, &rootfs, &log, boot_args)
             .cpus(cpu)
             .memory_mib(memory)
-            .read_only(self.root_drive_read_only);
+            .read_only(self.root_drive_read_only)
+            .networking(self.iface.is_some())
+            .mac(self.configured_mac());
         if let Some(initrd) = boot.initrd_path.as_ref() {
             spec = spec.initrd(std::path::Path::new(initrd));
         }
@@ -869,6 +881,8 @@ impl VmmBackend for VzBackend {
         let log = self.serial_log_path();
 
         let initrd = boot.initrd_path.as_ref().map(PathBuf::from);
+        let networking = self.iface.is_some();
+        let mac = self.configured_mac();
         let (vm, timings) = vz_long_restore(
             &kernel,
             &rootfs,
@@ -879,6 +893,8 @@ impl VmmBackend for VzBackend {
             cpu,
             memory,
             self.root_drive_read_only,
+            networking,
+            mac.as_deref(),
             params.resume_vm,
         )
         .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
@@ -1477,6 +1493,46 @@ mod tests {
             })
             .unwrap();
         assert!(backend.root_drive_read_only);
+    }
+
+    #[test]
+    fn network_interface_config_drives_spec_networking_and_mac() {
+        use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
+
+        // No NIC configured → no networking, no MAC.
+        let mut backend = VzBackend::new("test".into());
+        assert!(backend.iface.is_none());
+        assert_eq!(backend.configured_mac(), None);
+
+        // A configured guest_mac round-trips (Display is lowercase).
+        backend
+            .insert_network_device(NetworkInterfaceConfig {
+                iface_id: "eth0".into(),
+                host_dev_name: "tap0".into(),
+                guest_mac: Some("AA:BB:CC:DD:EE:FF".parse().unwrap()),
+                rx_rate_limiter: None,
+                tx_rate_limiter: None,
+            })
+            .unwrap();
+        assert!(backend.iface.is_some());
+        assert_eq!(
+            backend.configured_mac().as_deref(),
+            Some("aa:bb:cc:dd:ee:ff")
+        );
+
+        // A NIC without an explicit MAC still enables networking (VZ assigns one).
+        let mut backend = VzBackend::new("test".into());
+        backend
+            .insert_network_device(NetworkInterfaceConfig {
+                iface_id: "eth0".into(),
+                host_dev_name: "tap0".into(),
+                guest_mac: None,
+                rx_rate_limiter: None,
+                tx_rate_limiter: None,
+            })
+            .unwrap();
+        assert!(backend.iface.is_some());
+        assert_eq!(backend.configured_mac(), None);
     }
 
     #[test]

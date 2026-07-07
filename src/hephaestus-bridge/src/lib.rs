@@ -235,6 +235,8 @@ unsafe extern "C" {
         cpu_count: u32,
         memory_mib: u64,
         read_only: bool,
+        enable_networking: bool,
+        mac: *const c_char,
         out_vm: *mut *mut HbVzVm,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
@@ -294,6 +296,8 @@ unsafe extern "C" {
         cpu_count: u32,
         memory_mib: u64,
         read_only: bool,
+        enable_networking: bool,
+        mac: *const c_char,
         resume: bool,
         out_vm: *mut *mut HbVzVm,
         out_timings: *mut HbRestoreTimings,
@@ -550,6 +554,13 @@ pub struct VzSpec {
     /// `drive.is_read_only`; when a client marks a shared/golden rootfs
     /// read-only, the guest must not be able to mutate it.
     pub read_only: bool,
+    /// Attach a guest NIC backed by VZ's built-in NAT (192.168.64.0/24).
+    /// NAT only needs the base virtualization entitlement. `false` boots
+    /// with no network device.
+    pub networking: bool,
+    /// Optional guest MAC address (from Firecracker's `guest_mac`). `None`
+    /// lets VZ assign a random locally-administered address.
+    pub mac: Option<String>,
 }
 
 impl VzSpec {
@@ -570,6 +581,16 @@ impl VzSpec {
 
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    pub fn networking(mut self, networking: bool) -> Self {
+        self.networking = networking;
+        self
+    }
+
+    pub fn mac(mut self, mac: Option<String>) -> Self {
+        self.mac = mac;
         self
     }
 
@@ -613,6 +634,8 @@ impl VzVm {
         let boot_args_c = CString::new(spec.boot_args)?;
         let initrd_c = opt_path_cstring(spec.initrd_path.as_deref(), "initrd")?;
         let initrd_ptr = initrd_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let mac_c = spec.mac.as_deref().map(CString::new).transpose()?;
+        let mac_ptr = mac_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
         let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
         let mut out_err: *mut c_char = std::ptr::null_mut();
@@ -626,6 +649,8 @@ impl VzVm {
                 spec.cpus,
                 spec.memory_mib,
                 spec.read_only,
+                spec.networking,
+                mac_ptr,
                 &mut out_vm,
                 &mut out_err,
             )
@@ -1113,6 +1138,8 @@ pub fn vz_long_restore(
     cpu_count: u32,
     memory_mib: u64,
     read_only: bool,
+    networking: bool,
+    mac: Option<&str>,
     resume: bool,
 ) -> Result<(VzVm, HbRestoreTimings), VmError> {
     let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
@@ -1122,6 +1149,8 @@ pub fn vz_long_restore(
     let save_c = CString::new(path_to_str(save, "save")?)?;
     let initrd_c = opt_path_cstring(initrd, "initrd")?;
     let initrd_ptr = initrd_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    let mac_c = mac.map(CString::new).transpose()?;
+    let mac_ptr = mac_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
     let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
     let mut out_err: *mut c_char = std::ptr::null_mut();
@@ -1137,6 +1166,8 @@ pub fn vz_long_restore(
             cpu_count,
             memory_mib,
             read_only,
+            networking,
+            mac_ptr,
             resume,
             &mut out_vm,
             &mut timings,

@@ -288,6 +288,11 @@ fc-compat boot='1': build fc-harness-build
 fc-compat-vsock-e2e:
     scripts/fc-compat-vsock-e2e.sh
 
+# Real-VM headless e2e for guest networking (PUT /network-interfaces -> VZ NAT
+# NIC). Requires apple/container kernel/rootfs artifacts; not CI-safe.
+fc-compat-net-e2e:
+    scripts/fc-compat-net-e2e.sh
+
 # Real-VM e2e for vz-exec --stdin, stderr split, and hephaestus-jailer.
 # Requires apple/container kernel/rootfs artifacts; not CI-safe.
 e2e-new-features:

@@ -1517,7 +1517,9 @@ private func buildLongRunningConfig(
     cpuCount: Int,
     memoryBytes: UInt64,
     commandLine: String,
-    readOnly: Bool
+    readOnly: Bool,
+    enableNetworking: Bool,
+    macAddress: String?
 ) throws -> VZVirtualMachineConfiguration {
     let config = VZVirtualMachineConfiguration()
     config.cpuCount = cpuCount
@@ -1555,6 +1557,19 @@ private func buildLongRunningConfig(
     config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
     config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
 
+    // Guest networking via VZ's built-in NAT. NAT only needs the base
+    // com.apple.security.virtualization entitlement (unlike vmnet's
+    // restricted com.apple.vm.networking), so it works under ad-hoc
+    // signing. VZ hands the guest a DHCP lease in 192.168.64.0/24.
+    if enableNetworking {
+        let netDevice = VZVirtioNetworkDeviceConfiguration()
+        netDevice.attachment = VZNATNetworkDeviceAttachment()
+        if let macAddress, let mac = VZMACAddress(string: macAddress) {
+            netDevice.macAddress = mac
+        }
+        config.networkDevices = [netDevice]
+    }
+
     try config.validate()
     if #available(macOS 14.0, *) {
         try config.validateSaveRestoreSupport()
@@ -1572,6 +1587,8 @@ public func hb_vz_long_new(
     cpuCount: UInt32,
     memoryMib: UInt64,
     readOnly: Bool,
+    enableNetworking: Bool,
+    macAddress: UnsafePointer<CChar>?,
     outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
     outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
@@ -1585,6 +1602,7 @@ public func hb_vz_long_new(
     let log = URL(fileURLWithPath: String(cString: logPath))
     let initrd: URL? = initrdPath.map { URL(fileURLWithPath: String(cString: $0)) }
     let commandLine = String(cString: bootArgs)
+    let mac: String? = macAddress.map { String(cString: $0) }
 
     // Machine-id file lives next to the log. Persisted across calls so a
     // future "snapshot this long-running VM" feature doesn't trip over
@@ -1601,7 +1619,9 @@ public func hb_vz_long_new(
             cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
             memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
             commandLine: commandLine,
-            readOnly: readOnly
+            readOnly: readOnly,
+            enableNetworking: enableNetworking,
+            macAddress: mac
         )
 
         let queue = DispatchQueue(label: "com.hephaestus.vz-long-\(UUID().uuidString)")
@@ -2082,6 +2102,8 @@ public func hb_vz_long_restore(
     cpuCount: UInt32,
     memoryMib: UInt64,
     readOnly: Bool,
+    enableNetworking: Bool,
+    macAddress: UnsafePointer<CChar>?,
     resume: Bool,
     outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
     outTimings: UnsafeMutablePointer<HbRestoreTimings>?,
@@ -2100,6 +2122,7 @@ public func hb_vz_long_restore(
     let commandLine = String(cString: bootArgs)
     let save = URL(fileURLWithPath: String(cString: savePath))
     let machineId = machineIdURL(forSavePath: save)
+    let mac: String? = macAddress.map { String(cString: $0) }
 
     do {
         let configStart = DispatchTime.now()
@@ -2112,7 +2135,9 @@ public func hb_vz_long_restore(
             cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
             memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
             commandLine: commandLine,
-            readOnly: readOnly
+            readOnly: readOnly,
+            enableNetworking: enableNetworking,
+            macAddress: mac
         )
         let configElapsed = DispatchTime.now().uptimeNanoseconds - configStart.uptimeNanoseconds
 
