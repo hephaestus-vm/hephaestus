@@ -24,9 +24,12 @@ Legend:
 
 - **Status:** ✓
 - `vcpu_count` and `mem_size_mib` map to Swift defaults when unset
-  (2 / 512 per VZ conventions). `cpu_template` is accepted by the
-  serde wire layer but rejected with `NotSupported` when present —
-  Apple Silicon CPU feature control isn't client-configurable in VZ.
+  (2 / 512 per VZ conventions). `vcpu_count` must be in `1..=32`
+  (Firecracker's `MAX_SUPPORTED_VCPUS`); out-of-range values are
+  rejected with `InvalidConfig` like upstream. `cpu_template` is
+  accepted by the serde wire layer but rejected with `NotSupported`
+  when present — Apple Silicon CPU feature control isn't
+  client-configurable in VZ.
 - `PATCH` pre-boot only; post-boot returns `InvalidState`.
 
 ### `PUT /boot-source`
@@ -39,8 +42,15 @@ Legend:
 ### `PUT /drives/{id}`, `PATCH /drives/{id}`
 
 - **Status:** ⚠︎ Partial
-- `PUT` fully honored: `drive_id`, `path_on_host`, `is_root_device`,
-  `is_read_only`, `cache_type`, `io_engine`.
+- Only the **root device** is supported. `PUT` with
+  `is_root_device: false` (a secondary/data drive) returns
+  `NotSupported` — VZ attaches a single backing rootfs on this path.
+- Honored fields: `drive_id`, `path_on_host`, `is_root_device`, and
+  `is_read_only` (a read-only drive is attached read-only, so the
+  guest cannot mutate it).
+- Accepted but **ignored**: `cache_type`, `io_engine`, `partuuid`,
+  `rate_limiter`. VZ's built-in block attachment doesn't expose these
+  knobs.
 - `PATCH` swaps `path_on_host` pre-boot only. VZ's
   `VZVirtioBlockDeviceConfiguration` attachments aren't hot-swappable
   the way Linux virtio-blk + io_uring is. Post-boot `PATCH` returns
@@ -51,12 +61,16 @@ Legend:
 
 ### `PUT /network-interfaces/{id}`, `PATCH /network-interfaces/{id}`
 
-- **Status:** ⚠︎ Partial
-- Accepted + mostly noop. hephaestus attaches VZ's built-in NAT
-  (192.168.64.0/24) to every VM regardless of client config. We
-  don't honor MAC address, host tap name, or rate-limiter settings.
-- `PATCH` is an accept-noop so `firectl` and Kata don't trip on
-  rate-limiter updates.
+- **Status:** ⚠︎ Partial — accept-and-ignore on the HTTP API path.
+- The `hephaestus-firecracker` HTTP daemon (the direct-VZ
+  `hb_vz_long_*` path) does **not** attach a guest network device.
+  The config is validated and stored but no NIC is wired, so a VM
+  booted over the HTTP API has no guest network. `iface_id`, MAC
+  address, host tap name, and rate-limiter settings are all ignored.
+- Built-in VZ NAT (`192.168.64.0/24`) is attached only on the
+  **`hephaestus` CLI** container path (`run` / `vz-exec`), not on the
+  HTTP API. Wiring NAT into the HTTP path is tracked as future work.
+- `PATCH` is likewise an accept-noop.
 
 ### `PUT /actions`
 

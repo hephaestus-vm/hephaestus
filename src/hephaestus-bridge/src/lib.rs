@@ -22,7 +22,7 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use std::ffi::{CStr, CString, NulError};
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::FromRawFd;
 use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -234,6 +234,7 @@ unsafe extern "C" {
         boot_args: *const c_char,
         cpu_count: u32,
         memory_mib: u64,
+        read_only: bool,
         out_vm: *mut *mut HbVzVm,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
@@ -292,6 +293,7 @@ unsafe extern "C" {
         save_path: *const c_char,
         cpu_count: u32,
         memory_mib: u64,
+        read_only: bool,
         resume: bool,
         out_vm: *mut *mut HbVzVm,
         out_timings: *mut HbRestoreTimings,
@@ -544,6 +546,10 @@ pub struct VzSpec {
     pub cpus: u32,
     /// `0` → framework default (512).
     pub memory_mib: u64,
+    /// Attach the rootfs block device read-only. Mirrors Firecracker's
+    /// `drive.is_read_only`; when a client marks a shared/golden rootfs
+    /// read-only, the guest must not be able to mutate it.
+    pub read_only: bool,
 }
 
 impl VzSpec {
@@ -559,6 +565,11 @@ impl VzSpec {
 
     pub fn initrd(mut self, path: &Path) -> Self {
         self.initrd_path = Some(path.into());
+        self
+    }
+
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
         self
     }
 
@@ -600,11 +611,7 @@ impl VzVm {
         let rootfs_c = CString::new(path_to_str(&spec.rootfs_path, "rootfs")?)?;
         let log_c = CString::new(path_to_str(&spec.log_path, "log")?)?;
         let boot_args_c = CString::new(spec.boot_args)?;
-        let initrd_c = spec
-            .initrd_path
-            .as_deref()
-            .map(|p| CString::new(path_to_str(p, "initrd").unwrap_or("")))
-            .transpose()?;
+        let initrd_c = opt_path_cstring(spec.initrd_path.as_deref(), "initrd")?;
         let initrd_ptr = initrd_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
         let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
@@ -618,6 +625,7 @@ impl VzVm {
                 boot_args_c.as_ptr(),
                 spec.cpus,
                 spec.memory_mib,
+                spec.read_only,
                 &mut out_vm,
                 &mut out_err,
             )
@@ -659,16 +667,22 @@ impl VzVm {
     }
 
     /// Connect to a guest vsock port and return a UnixStream for the bridged
-    /// host-side file descriptor.
+    /// host-side file descriptor. Borrows `&self`, so the VZ handle is
+    /// guaranteed to outlive the connect — callers that need to connect from
+    /// another thread should share an `Arc<VzVm>` rather than a raw address.
     pub fn connect_vsock(&self, port: u32) -> Result<UnixStream, VmError> {
-        connect_vsock_handle(self.handle.cast::<()>() as usize, port)
-    }
-
-    /// Return an opaque raw handle address for helper threads that need to
-    /// initiate host-side vsock connects while the owning `VzVm` remains in
-    /// the backend. The address is only valid for the VM handle's lifetime.
-    pub fn handle_addr(&self) -> usize {
-        self.handle.cast::<()>() as usize
+        let mut out_fd: c_int = -1;
+        let mut out_err: *mut c_char = std::ptr::null_mut();
+        let status = unsafe { hb_vz_long_connect(self.handle, port, &mut out_fd, &mut out_err) };
+        status.into_result(out_err)?;
+        if out_fd < 0 {
+            return Err(VmError::Swift(
+                "vz_long_connect reported success but returned no file descriptor".into(),
+            ));
+        }
+        // SAFETY: hb_vz_long_connect returns a freshly dup(2)'d descriptor whose
+        // ownership is transferred to Rust.
+        Ok(unsafe { UnixStream::from_raw_fd(out_fd) })
     }
 
     /// Request graceful stop, then force-stop. Idempotent.
@@ -691,21 +705,6 @@ impl VzVm {
         let status = unsafe { hb_vz_long_save(self.handle, save_c.as_ptr(), &mut out_err) };
         status.into_result(out_err)
     }
-}
-
-/// Connect to a guest vsock port using an opaque handle address returned by
-/// [`VzVm::handle_addr`].
-pub fn connect_vsock_handle(handle_addr: usize, port: u32) -> Result<UnixStream, VmError> {
-    let handle = handle_addr as *mut HbVzVm;
-    let mut out_fd: c_int = -1;
-    let mut out_err: *mut c_char = std::ptr::null_mut();
-    let status = unsafe { hb_vz_long_connect(handle, port, &mut out_fd, &mut out_err) };
-    status.into_result(out_err)?;
-    debug_assert!(out_fd >= 0);
-    let fd: RawFd = out_fd;
-    // SAFETY: hb_vz_long_connect returns a freshly dup(2)'d descriptor whose
-    // ownership is transferred to Rust.
-    Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
 impl Drop for VzVm {
@@ -832,6 +831,16 @@ fn path_to_str<'a>(p: &'a Path, label: &str) -> Result<&'a str, VmError> {
         .ok_or_else(|| VmError::InvalidArgument(format!("{label} path is not UTF-8")))
 }
 
+/// `CString` for an optional path, propagating a non-UTF-8 or interior-NUL
+/// error instead of silently substituting an empty path. Used for optional
+/// inputs (`log`, `initrd`) where the previous `.unwrap_or("")` turned a bad
+/// path into `""` — disabling logging or yielding a confusing downstream VZ
+/// error rather than a clear "not UTF-8" at the boundary.
+fn opt_path_cstring(p: Option<&Path>, label: &str) -> Result<Option<CString>, VmError> {
+    p.map(|p| Ok::<_, VmError>(CString::new(path_to_str(p, label)?)?))
+        .transpose()
+}
+
 // =============================================================================
 // Rootfs helpers — produce an ext4 block device from a tar archive.
 // =============================================================================
@@ -938,9 +947,7 @@ pub fn vz_exec(
     let initramfs_c = CString::new(path_to_str(initramfs, "initramfs")?)?;
     let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
     let cmd_c = CString::new(command)?;
-    let log_c = log
-        .map(|p| CString::new(path_to_str(p, "log").unwrap_or("")))
-        .transpose()?;
+    let log_c = opt_path_cstring(log, "log")?;
     let log_ptr = log_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
     let mut out_err: *mut c_char = std::ptr::null_mut();
     let mut exit_code: i32 = -1;
@@ -980,9 +987,7 @@ pub fn vz_exec_snapshot_save(
     let initramfs_c = CString::new(path_to_str(initramfs, "initramfs")?)?;
     let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
     let save_c = CString::new(path_to_str(save, "save")?)?;
-    let log_c = log
-        .map(|p| CString::new(path_to_str(p, "log").unwrap_or("")))
-        .transpose()?;
+    let log_c = opt_path_cstring(log, "log")?;
     let log_ptr = log_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
     let mut out_err: *mut c_char = std::ptr::null_mut();
     let status = unsafe {
@@ -1019,9 +1024,7 @@ pub fn vz_exec_snapshot_restore(
     let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
     let save_c = CString::new(path_to_str(save, "save")?)?;
     let cmd_c = CString::new(command)?;
-    let log_c = log
-        .map(|p| CString::new(path_to_str(p, "log").unwrap_or("")))
-        .transpose()?;
+    let log_c = opt_path_cstring(log, "log")?;
     let log_ptr = log_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
     let mut out_err: *mut c_char = std::ptr::null_mut();
     let mut exit_code: i32 = -1;
@@ -1065,9 +1068,7 @@ pub fn vz_pool_restore_long(
     let initramfs_c = CString::new(path_to_str(initramfs, "initramfs")?)?;
     let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
     let save_c = CString::new(path_to_str(save, "save")?)?;
-    let log_c = log
-        .map(|p| CString::new(path_to_str(p, "log").unwrap_or("")))
-        .transpose()?;
+    let log_c = opt_path_cstring(log, "log")?;
     let log_ptr = log_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
     let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
@@ -1111,6 +1112,7 @@ pub fn vz_long_restore(
     save: &Path,
     cpu_count: u32,
     memory_mib: u64,
+    read_only: bool,
     resume: bool,
 ) -> Result<(VzVm, HbRestoreTimings), VmError> {
     let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
@@ -1118,9 +1120,7 @@ pub fn vz_long_restore(
     let log_c = CString::new(path_to_str(log, "log")?)?;
     let boot_args_c = CString::new(boot_args)?;
     let save_c = CString::new(path_to_str(save, "save")?)?;
-    let initrd_c = initrd
-        .map(|p| CString::new(path_to_str(p, "initrd").unwrap_or("")))
-        .transpose()?;
+    let initrd_c = opt_path_cstring(initrd, "initrd")?;
     let initrd_ptr = initrd_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
     let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
@@ -1136,6 +1136,7 @@ pub fn vz_long_restore(
             save_c.as_ptr(),
             cpu_count,
             memory_mib,
+            read_only,
             resume,
             &mut out_vm,
             &mut timings,
@@ -1163,9 +1164,7 @@ pub fn vz_stock_pool_restore_long(
     let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
     let rootfs_c = CString::new(path_to_str(rootfs, "rootfs")?)?;
     let save_c = CString::new(path_to_str(save, "save")?)?;
-    let log_c = log
-        .map(|p| CString::new(path_to_str(p, "log").unwrap_or("")))
-        .transpose()?;
+    let log_c = opt_path_cstring(log, "log")?;
     let log_ptr = log_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
     let mut out_vm: *mut HbVzVm = std::ptr::null_mut();

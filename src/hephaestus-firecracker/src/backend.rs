@@ -7,15 +7,20 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hephaestus_fc_api::vmm_config::boot_source::{BootSourceConfig, DEFAULT_KERNEL_CMDLINE};
 use hephaestus_fc_api::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
 use hephaestus_fc_api::vmm_config::instance_info::{InstanceInfo, VmState};
 use hephaestus_fc_api::vmm_config::logger::LoggerConfig;
-use hephaestus_fc_api::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
+use hephaestus_fc_api::vmm_config::machine_config::{
+    MAX_SUPPORTED_VCPUS, MachineConfig, MachineConfigUpdate,
+};
 use hephaestus_fc_api::vmm_config::metrics::MetricsConfig;
 use hephaestus_fc_api::vmm_config::mmds::MmdsConfig;
 use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
@@ -25,7 +30,7 @@ use hephaestus_fc_api::vmm_config::snapshot::{
 use hephaestus_fc_api::vmm_config::vsock::VsockConfig;
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
 use hephaestus_pool::{ClaimedSlot, Pool, PoolMatchSpec};
-use hephaestus_vmm::{VzSpec, VzVm, connect_vsock_handle, vz_long_restore};
+use hephaestus_vmm::{VzSpec, VzVm, vz_long_restore};
 use serde_json::Value;
 
 /// Guest-initiated vsock port for hephaestus' practical MMDS transport.
@@ -139,9 +144,15 @@ impl Default for MetricsState {
     }
 }
 
-trait VzVmHandle: std::fmt::Debug + Send {
+// `Sync` is required because the vsock bridge shares the handle with its
+// accept-loop thread via `Arc<dyn VzVmHandle>`; `VzVm` is soundly `Sync`
+// (Swift serializes all handle access on the per-VM dispatch queue).
+trait VzVmHandle: std::fmt::Debug + Send + Sync {
     fn serve_mmds_vsock(&self, port: u32, json: &[u8]) -> Result<(), VmmBackendError>;
-    fn handle_addr(&self) -> usize;
+    /// Open a host-side connection to a guest vsock port. Replaces the old
+    /// raw-`usize` handle-address API: because the caller holds an
+    /// `Arc<dyn VzVmHandle>`, the VZ handle provably outlives the connect.
+    fn connect_vsock(&self, port: u32) -> Result<UnixStream, VmmBackendError>;
     fn save_state(&self, path: &std::path::Path) -> Result<(), VmmBackendError>;
     fn pause(&self) -> Result<(), VmmBackendError>;
     fn resume(&self) -> Result<(), VmmBackendError>;
@@ -153,8 +164,9 @@ impl VzVmHandle for VzVm {
             .map_err(|err| VmmBackendError::Internal(err.to_string()))
     }
 
-    fn handle_addr(&self) -> usize {
-        self.handle_addr()
+    fn connect_vsock(&self, port: u32) -> Result<UnixStream, VmmBackendError> {
+        self.connect_vsock(port)
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))
     }
 
     fn save_state(&self, path: &std::path::Path) -> Result<(), VmmBackendError> {
@@ -179,6 +191,10 @@ pub struct VzBackend {
     state: VmState,
     boot_source: Option<BootSourceConfig>,
     root_drive: Option<PathBuf>,
+    /// Whether the root drive was configured `is_read_only: true`. Honored by
+    /// attaching the VZ block device read-only so the guest cannot mutate a
+    /// shared/golden rootfs the client marked immutable.
+    root_drive_read_only: bool,
     iface: Option<NetworkInterfaceConfig>,
     machine_config: MachineConfig,
     mmds: Value,
@@ -186,10 +202,14 @@ pub struct VzBackend {
     vsock: Option<VsockConfig>,
     logger: LoggerState,
     metrics: MetricsState,
-    /// Drop order matters: `vm` is dropped before `pool_slot` so the
-    /// VM tears down before the slot's `Drop` deletes the rootfs the VM
-    /// was reading from.
-    vm: Option<Box<dyn VzVmHandle>>,
+    /// Drop order matters and is encoded by field order below:
+    /// `vsock_bridge` drops first (its `Drop` stops the accept loop and
+    /// releases its `Arc` clone of the VM), then `vm` (last `Arc` → frees the
+    /// Swift handle), then `pool_slot` (its `Drop` deletes the rootfs clone).
+    /// Reordering these can delete a rootfs out from under a live VM or leave
+    /// the bridge holding a freed handle.
+    vsock_bridge: Option<VsockBridge>,
+    vm: Option<Arc<dyn VzVmHandle>>,
     pool_slot: Option<ClaimedSlot>,
     pool: Option<Pool>,
     /// Set once start_micro_vm or load_snapshot succeeds. None
@@ -204,6 +224,7 @@ impl VzBackend {
             state: VmState::NotStarted,
             boot_source: None,
             root_drive: None,
+            root_drive_read_only: false,
             iface: None,
             machine_config: MachineConfig::default(),
             mmds: Value::Object(Default::default()),
@@ -211,6 +232,7 @@ impl VzBackend {
             vsock: None,
             logger: LoggerState::default(),
             metrics: MetricsState::default(),
+            vsock_bridge: None,
             vm: None,
             pool_slot: None,
             pool: None,
@@ -235,6 +257,21 @@ impl VzBackend {
                 "operation not supported post-boot".into(),
             ))
         }
+    }
+
+    /// Roll the backend back to pre-boot after a post-start failure (e.g. the
+    /// vsock bridge couldn't bind its UDS). Tears down the VM, bridge, and any
+    /// claimed pool slot in the correct order and clears `origin`/state, so the
+    /// caller sees a clean failure rather than an orphaned `Running` VM it can
+    /// neither drive nor restart. Pre-boot config (boot source, drives,
+    /// machine config) is untouched, so the client can fix the offending
+    /// setting and retry `InstanceStart`.
+    fn abort_boot(&mut self) {
+        self.vsock_bridge = None;
+        self.vm = None;
+        self.pool_slot = None;
+        self.origin = None;
+        self.state = VmState::NotStarted;
     }
 
     fn serial_log_path(&self) -> PathBuf {
@@ -349,7 +386,7 @@ impl VzBackend {
         vm.serve_mmds_vsock(MMDS_VSOCK_PORT, &json)
     }
 
-    fn start_vsock_bridge(&self) -> Result<(), VmmBackendError> {
+    fn start_vsock_bridge(&mut self) -> Result<(), VmmBackendError> {
         let Some(cfg) = self.vsock.clone() else {
             // Stock-init pool snapshots intentionally have no virtio-vsock device.
             // MMDS-over-vsock is best-effort unless the client explicitly
@@ -360,49 +397,12 @@ impl VzBackend {
             return Ok(());
         };
         self.refresh_mmds_vsock_service()?;
-        let handle_addr = self
+        let vm = self
             .vm
             .as_ref()
             .ok_or_else(|| VmmBackendError::Internal("vsock bridge without VM".into()))?
-            .handle_addr();
-        let _ = std::fs::remove_file(&cfg.uds_path);
-        let listener = UnixListener::bind(&cfg.uds_path).map_err(|err| {
-            VmmBackendError::InvalidConfig(format!(
-                "cannot bind vsock uds_path {}: {err}",
-                cfg.uds_path.display()
-            ))
-        })?;
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut host) = stream else { continue };
-                std::thread::spawn(move || {
-                    let Some(line) = read_connect_line(&mut host) else {
-                        let _ = host.write_all(b"ERR invalid CONNECT line\n");
-                        return;
-                    };
-                    let Some(port) = parse_connect_line(&line) else {
-                        let _ = host.write_all(b"ERR invalid CONNECT line\n");
-                        return;
-                    };
-                    let Ok(mut guest) = connect_vsock_handle(handle_addr, port) else {
-                        let _ = host.write_all(b"ERR connect failed\n");
-                        return;
-                    };
-                    let Ok(mut host_to_guest) = host.try_clone() else {
-                        return;
-                    };
-                    let Ok(mut guest_to_host) = guest.try_clone() else {
-                        return;
-                    };
-                    let a =
-                        std::thread::spawn(move || std::io::copy(&mut host_to_guest, &mut guest));
-                    let b =
-                        std::thread::spawn(move || std::io::copy(&mut guest_to_host, &mut host));
-                    let _ = a.join();
-                    let _ = b.join();
-                });
-            }
-        });
+            .clone();
+        self.vsock_bridge = Some(VsockBridge::start(vm, cfg.uds_path)?);
         Ok(())
     }
 
@@ -487,6 +487,8 @@ impl VmmBackend for VzBackend {
             )));
         }
         self.root_drive = Some(path);
+        // Firecracker defaults an omitted is_read_only to false (writable).
+        self.root_drive_read_only = cfg.is_read_only.unwrap_or(false);
         Ok(())
     }
 
@@ -628,6 +630,11 @@ impl VmmBackend for VzBackend {
                 "vcpu_count must be >= 1".into(),
             ));
         }
+        if cfg.vcpu_count > MAX_SUPPORTED_VCPUS {
+            return Err(VmmBackendError::InvalidConfig(format!(
+                "vcpu_count must be <= {MAX_SUPPORTED_VCPUS}"
+            )));
+        }
         if cfg.mem_size_mib == 0 {
             return Err(VmmBackendError::InvalidConfig(
                 "mem_size_mib must be > 0".into(),
@@ -724,12 +731,15 @@ impl VmmBackend for VzBackend {
                             ms(breakdown.vz.restore_nanos),
                             ms(breakdown.vz.resume_nanos),
                         );
-                        self.vm = Some(Box::new(vm));
+                        self.vm = Some(Arc::new(vm));
                         self.pool_slot = Some(slot);
                         self.state = VmState::Running;
                         self.origin = Some(RunOrigin::Pool);
                         self.metrics.pool_hits = self.metrics.pool_hits.saturating_add(1);
-                        self.start_vsock_bridge()?;
+                        if let Err(err) = self.start_vsock_bridge() {
+                            self.abort_boot();
+                            return Err(err);
+                        }
                         self.flush_metrics();
                         return Ok(());
                     }
@@ -753,7 +763,8 @@ impl VmmBackend for VzBackend {
 
         let mut spec = VzSpec::new(&kernel, &rootfs, &log, boot_args)
             .cpus(cpu)
-            .memory_mib(memory);
+            .memory_mib(memory)
+            .read_only(self.root_drive_read_only);
         if let Some(initrd) = boot.initrd_path.as_ref() {
             spec = spec.initrd(std::path::Path::new(initrd));
         }
@@ -763,10 +774,13 @@ impl VmmBackend for VzBackend {
         vm.start()
             .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
 
-        self.vm = Some(Box::new(vm));
+        self.vm = Some(Arc::new(vm));
         self.state = VmState::Running;
         self.origin = Some(RunOrigin::ColdBoot);
-        self.start_vsock_bridge()?;
+        if let Err(err) = self.start_vsock_bridge() {
+            self.abort_boot();
+            return Err(err);
+        }
         self.log_info("vmm", "Vmm is running.");
         Ok(())
     }
@@ -864,6 +878,7 @@ impl VmmBackend for VzBackend {
             &params.snapshot_path,
             cpu,
             memory,
+            self.root_drive_read_only,
             params.resume_vm,
         )
         .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
@@ -884,14 +899,17 @@ impl VmmBackend for VzBackend {
             params.resume_vm,
         );
 
-        self.vm = Some(Box::new(vm));
+        self.vm = Some(Arc::new(vm));
         self.state = if params.resume_vm {
             VmState::Running
         } else {
             VmState::Paused
         };
         self.origin = Some(RunOrigin::SnapshotLoad);
-        self.start_vsock_bridge()?;
+        if let Err(err) = self.start_vsock_bridge() {
+            self.abort_boot();
+            return Err(err);
+        }
         self.metrics.snapshot_loads = self.metrics.snapshot_loads.saturating_add(1);
         self.flush_metrics();
         self.log_info("vmm", "Snapshot loaded.");
@@ -937,6 +955,119 @@ impl VmmBackend for VzBackend {
         self.log_info("vmm", "Vmm is resumed.");
         Ok(())
     }
+}
+
+/// Owns the host-side vsock bridge: a UDS listener whose accept loop proxies
+/// `CONNECT <port>` clients to guest vsock ports. Its `Drop` stops the accept
+/// loop, joins it, and removes the socket file, so the bridge's lifetime is
+/// tied to the backend rather than leaking a detached thread that could later
+/// touch a freed VM handle. Declared before `vm` in [`VzBackend`] so it tears
+/// down first.
+#[derive(Debug)]
+struct VsockBridge {
+    running: Arc<AtomicBool>,
+    accept: Option<JoinHandle<()>>,
+    uds_path: PathBuf,
+}
+
+impl VsockBridge {
+    /// Bind `uds_path` and spawn the accept loop. The loop holds an `Arc`
+    /// clone of the VM handle, so the VZ handle provably outlives every
+    /// `connect_vsock` it issues.
+    fn start(vm: Arc<dyn VzVmHandle>, uds_path: PathBuf) -> Result<Self, VmmBackendError> {
+        let _ = std::fs::remove_file(&uds_path);
+        let listener = UnixListener::bind(&uds_path).map_err(|err| {
+            VmmBackendError::InvalidConfig(format!(
+                "cannot bind vsock uds_path {}: {err}",
+                uds_path.display()
+            ))
+        })?;
+        // Blocking accept: zero per-connection latency (a polling loop added
+        // up to its poll interval of latency, which broke handshakes with
+        // clients that briefly wait for an early error reply) and no idle
+        // wakeups for a long-lived VM. Shutdown wakes the blocked `accept`
+        // via a self-connect in `Drop`.
+        let running = Arc::new(AtomicBool::new(true));
+        let accept = {
+            let running = running.clone();
+            std::thread::spawn(move || accept_loop(&listener, &vm, &running))
+        };
+        Ok(Self {
+            running,
+            accept: Some(accept),
+            uds_path,
+        })
+    }
+}
+
+impl Drop for VsockBridge {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        // Wake the blocked `accept` by connecting to our own socket; the loop
+        // then observes `running == false` and returns. Reliable because the
+        // listener is still bound (we remove the file only after the join).
+        if let Ok(stream) = UnixStream::connect(&self.uds_path) {
+            drop(stream);
+        }
+        if let Some(handle) = self.accept.take() {
+            let _ = handle.join();
+        }
+        let _ = std::fs::remove_file(&self.uds_path);
+    }
+}
+
+/// Accept loop for [`VsockBridge`]. Blocks in `accept`, spawning a short-lived
+/// proxy thread per accepted connection, until a self-connect on teardown wakes
+/// it with `running` cleared.
+fn accept_loop(listener: &UnixListener, vm: &Arc<dyn VzVmHandle>, running: &AtomicBool) {
+    for stream in listener.incoming() {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+        let Ok(host) = stream else { continue };
+        let vm = vm.clone();
+        std::thread::spawn(move || bridge_connection(host, vm));
+    }
+}
+
+/// Proxy one accepted host connection to a guest vsock port. Reads the
+/// `CONNECT <port>` handshake under a read timeout (so a client that never
+/// sends it can't park this thread forever), connects to the guest, then
+/// releases the VM `Arc` before the long-lived byte-copy so a stalled proxy
+/// never keeps the VM handle alive past its owner.
+fn bridge_connection(mut host: UnixStream, vm: Arc<dyn VzVmHandle>) {
+    let _ = host.set_read_timeout(Some(Duration::from_secs(5)));
+    let Some(line) = read_connect_line(&mut host) else {
+        let _ = host.write_all(b"ERR invalid CONNECT line\n");
+        return;
+    };
+    let Some(port) = parse_connect_line(&line) else {
+        let _ = host.write_all(b"ERR invalid CONNECT line\n");
+        return;
+    };
+    let mut guest = match vm.connect_vsock(port) {
+        Ok(guest) => guest,
+        Err(_) => {
+            let _ = host.write_all(b"ERR connect failed\n");
+            return;
+        }
+    };
+    // The vsock fd is now independent of the VM handle; drop the Arc so a
+    // long-lived copy can't pin the VM past teardown.
+    drop(vm);
+    // Restore blocking semantics for the streaming copy (legit vsock proxy
+    // connections are long-lived).
+    let _ = host.set_read_timeout(None);
+    let Ok(mut host_to_guest) = host.try_clone() else {
+        return;
+    };
+    let Ok(mut guest_to_host) = guest.try_clone() else {
+        return;
+    };
+    let a = std::thread::spawn(move || std::io::copy(&mut host_to_guest, &mut guest));
+    let b = std::thread::spawn(move || std::io::copy(&mut guest_to_host, &mut host));
+    let _ = a.join();
+    let _ = b.join();
 }
 
 fn read_connect_line(stream: &mut std::os::unix::net::UnixStream) -> Option<String> {
@@ -1005,7 +1136,7 @@ mod tests {
 
     impl FakeVm {
         fn boxed() -> (
-            Box<dyn VzVmHandle>,
+            Arc<dyn VzVmHandle>,
             Arc<AtomicU32>,
             Arc<AtomicU32>,
             Arc<AtomicU32>,
@@ -1014,7 +1145,7 @@ mod tests {
             let resumes = Arc::new(AtomicU32::new(0));
             let mmds = Arc::new(AtomicU32::new(0));
             (
-                Box::new(Self {
+                Arc::new(Self {
                     pauses: pauses.clone(),
                     resumes: resumes.clone(),
                     mmds_refreshes: mmds.clone(),
@@ -1032,8 +1163,10 @@ mod tests {
             Ok(())
         }
 
-        fn handle_addr(&self) -> usize {
-            0
+        fn connect_vsock(&self, _port: u32) -> Result<UnixStream, VmmBackendError> {
+            Err(VmmBackendError::Internal(
+                "connect_vsock unsupported in tests".into(),
+            ))
         }
 
         fn save_state(&self, path: &Path) -> Result<(), VmmBackendError> {
@@ -1122,6 +1255,16 @@ mod tests {
         let err = backend
             .put_machine_config(MachineConfig {
                 vcpu_count: 0,
+                ..MachineConfig::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, VmmBackendError::InvalidConfig(_)));
+
+        // Above the Firecracker cap (32) is rejected like upstream, not
+        // silently accepted and passed to VZ.
+        let err = backend
+            .put_machine_config(MachineConfig {
+                vcpu_count: MAX_SUPPORTED_VCPUS + 1,
                 ..MachineConfig::default()
             })
             .unwrap_err();
@@ -1275,5 +1418,107 @@ mod tests {
             serde_json::json!({"meta": {"a": 1, "c": 3}})
         );
         assert_eq!(mmds_refreshes.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn vsock_bridge_binds_reports_connect_errors_and_cleans_up_on_drop() {
+        let (vm, _, _, _) = FakeVm::boxed();
+        let uds = temp_path("vsock-bridge.sock");
+        let bridge = VsockBridge::start(vm, uds.clone()).unwrap();
+        assert!(uds.exists(), "bridge should bind the uds path");
+
+        // FakeVm::connect_vsock errors, so a well-formed CONNECT should get an
+        // ERR reply (and not hang) rather than a proxied stream.
+        let mut client = UnixStream::connect(&uds).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(b"CONNECT 5\n").unwrap();
+        let mut reply = String::new();
+        let _ = client.read_to_string(&mut reply);
+        assert!(
+            reply.starts_with("ERR"),
+            "expected ERR reply, got {reply:?}"
+        );
+
+        // Drop stops the accept loop, joins it, and removes the socket file.
+        drop(bridge);
+        assert!(!uds.exists(), "Drop should remove the uds file");
+    }
+
+    #[test]
+    fn insert_block_device_records_is_read_only() {
+        use hephaestus_fc_api::vmm_config::drive::BlockDeviceConfig;
+        let rootfs = temp_path("ro-rootfs.ext4");
+        std::fs::write(&rootfs, b"rootfs").unwrap();
+
+        // Omitted is_read_only defaults to writable (matches Firecracker).
+        let mut backend = VzBackend::new("test".into());
+        backend
+            .insert_block_device(BlockDeviceConfig {
+                drive_id: "root".into(),
+                is_root_device: true,
+                path_on_host: Some(rootfs.display().to_string()),
+                is_read_only: None,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!backend.root_drive_read_only);
+
+        // is_read_only: true is retained so the boot path attaches read-only.
+        let mut backend = VzBackend::new("test".into());
+        backend
+            .insert_block_device(BlockDeviceConfig {
+                drive_id: "root".into(),
+                is_root_device: true,
+                path_on_host: Some(rootfs.display().to_string()),
+                is_read_only: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(backend.root_drive_read_only);
+    }
+
+    #[test]
+    fn abort_boot_rolls_back_to_preboot_but_keeps_config() {
+        let (vm, _, _, _) = FakeVm::boxed();
+        let mut backend = VzBackend::new("test".into());
+        backend.vm = Some(vm);
+        backend.state = VmState::Running;
+        backend.origin = Some(RunOrigin::ColdBoot);
+        backend.machine_config = MachineConfig {
+            vcpu_count: 2,
+            mem_size_mib: 256,
+            ..MachineConfig::default()
+        };
+
+        backend.abort_boot();
+
+        assert!(backend.vm.is_none());
+        assert!(backend.vsock_bridge.is_none());
+        assert!(backend.pool_slot.is_none());
+        assert_eq!(backend.origin, None);
+        assert_eq!(backend.state, VmState::NotStarted);
+        // Pre-boot config survives so the client can retry InstanceStart.
+        assert_eq!(backend.machine_config.vcpu_count, 2);
+    }
+
+    #[test]
+    fn start_vsock_bridge_surfaces_unbindable_uds_path() {
+        let (vm, _, _, _) = FakeVm::boxed();
+        let mut backend = VzBackend::new("test".into());
+        backend.vm = Some(vm);
+        backend.state = VmState::Running;
+        backend.vsock = Some(VsockConfig {
+            guest_cid: 3,
+            uds_path: PathBuf::from("/no/such/dir/hephaestus-vsock.sock"),
+            vsock_id: None,
+        });
+
+        // A bind failure must be a surfaced error (which start_micro_vm turns
+        // into an abort_boot rollback), not a silently-running VM.
+        let err = backend.start_vsock_bridge().unwrap_err();
+        assert!(matches!(err, VmmBackendError::InvalidConfig(_)));
+        assert!(backend.vsock_bridge.is_none());
     }
 }

@@ -646,6 +646,19 @@ public func hb_vz_exec(
             }
         }
 
+        // Tear the VM + serial pipes + observer down on every exit path.
+        // Previously this ran only on success, so a thrown error (agent
+        // connect timeout, short read) leaked the running VM and left the
+        // pipe readabilityHandlers firing guest output after we returned.
+        defer {
+            session.close()
+            _ = blockingStop(queue: queue, holder: holder)
+            queue.sync {
+                observerBox.observation?.invalidate()
+                observerBox.observation = nil
+            }
+        }
+
         try blockingStart(queue: queue, holder: holder)
 
         // Connect to the agent's vsock listener, send the command, read the
@@ -656,19 +669,13 @@ public func hb_vz_exec(
             queue: queue,
             command: command,
             forwardStdin: forwardStdin != 0,
-            stdinFd: FileHandle.standardInput.fileDescriptor
+            stdinFd: FileHandle.standardInput.fileDescriptor,
+            exitReadTimeoutSeconds: timeoutSeconds == 0 ? 30 : timeoutSeconds
         )
 
         // Agent halts after responding, so wait for the clean VZ shutdown.
         let timeout = DispatchTime.now() + .seconds(Int(timeoutSeconds == 0 ? 30 : timeoutSeconds))
         _ = stopSem.wait(timeout: timeout)
-
-        session.close()
-        _ = blockingStop(queue: queue, holder: holder)
-        queue.sync {
-            observerBox.observation?.invalidate()
-            observerBox.observation = nil
-        }
 
         outExitCode?.pointee = exitCode
         outErr?.pointee = nil
@@ -817,12 +824,15 @@ public func hb_vz_exec_snapshot_restore(
         let restoreElapsed = DispatchTime.now().uptimeNanoseconds - restoreStart.uptimeNanoseconds
         outRestoreNanos?.pointee = restoreElapsed
 
+        // The snapshot-restore FFI has no timeout argument; apply a generous
+        // backstop so a hung guest command still can't block the call forever.
         let exitCode = try sendCommandAndAwaitExit(
             holder: holder,
             queue: queue,
             command: command,
             forwardStdin: false,
-            stdinFd: -1
+            stdinFd: -1,
+            exitReadTimeoutSeconds: 300
         )
 
         // Give the agent a beat to halt the VM cleanly.
@@ -1028,6 +1038,8 @@ private enum VsockError: Error, CustomStringConvertible {
     case shortRead
     case connect(Error)
     case write(Error)
+    case read(Error)
+    case readTimedOut(seconds: UInt32)
     var description: String {
         switch self {
         case .noSocketDevice: return "VM has no virtio-vsock device configured"
@@ -1035,6 +1047,9 @@ private enum VsockError: Error, CustomStringConvertible {
         case .shortRead: return "short read on vsock exit-code response"
         case .connect(let e): return "vsock connect failed: \(e)"
         case .write(let e): return "vsock write failed: \(e)"
+        case .read(let e): return "vsock read failed: \(e)"
+        case .readTimedOut(let s):
+            return "timed out after \(s)s waiting for the guest command's exit code over vsock"
         }
     }
 }
@@ -1053,7 +1068,8 @@ private func sendCommandAndAwaitExit(
     queue: DispatchQueue,
     command: String,
     forwardStdin: Bool,
-    stdinFd: Int32
+    stdinFd: Int32,
+    exitReadTimeoutSeconds: UInt32
 ) throws -> Int32 {
     let connection = try connectToAgent(holder: holder, queue: queue)
     defer { connection.close() }
@@ -1092,10 +1108,18 @@ private func sendCommandAndAwaitExit(
         }
     }
 
-    // Response: i32 LE exit code.
+    // Response: i32 LE exit code. Bound the read so a guest command that
+    // hangs (and so never writes its exit code, and never EOFs the way a
+    // crash would) can't park this call forever — that would defeat the
+    // caller's `timeout_seconds`.
+    setRecvTimeout(fd: fd, seconds: exitReadTimeoutSeconds)
     var codeBytes = [UInt8](repeating: 0, count: 4)
-    try codeBytes.withUnsafeMutableBufferPointer { buf in
-        try readAll(fd: fd, into: UnsafeMutableRawBufferPointer(buf))
+    do {
+        try codeBytes.withUnsafeMutableBufferPointer { buf in
+            try readAll(fd: fd, into: UnsafeMutableRawBufferPointer(buf))
+        }
+    } catch VsockError.readTimedOut {
+        throw VsockError.readTimedOut(seconds: exitReadTimeoutSeconds)
     }
     let code = Int32(bitPattern:
         UInt32(codeBytes[0])
@@ -1227,20 +1251,43 @@ private final class MmdsSocketService: NSObject, VZVirtioSocketListenerDelegate,
         let fd = connection.fileDescriptor
         let fallbackBody = body
         DispatchQueue.global(qos: .utility).async { [weak self, weak connection] in
+            // Read to end-of-headers, not a single one-shot read: virtio-vsock
+            // gives no single-segment delivery guarantee, so the guest's
+            // request can arrive split across reads. A one-shot read that
+            // catches only the request line silently drops the Accept header —
+            // the difference between Firecracker's JSON and IMDS output
+            // formats. The receive timeout bounds a guest that stalls
+            // mid-request so this pool thread can't be pinned forever.
+            setRecvTimeout(fd: fd, seconds: 2)
+            let endOfHeaders = Data("\r\n\r\n".utf8)
+            var requestBytes = Data()
             var scratch = [UInt8](repeating: 0, count: 4096)
-            let n = scratch.withUnsafeMutableBufferPointer { buf in
-                read(fd, buf.baseAddress, buf.count)
+            while requestBytes.count < 8192, requestBytes.range(of: endOfHeaders) == nil {
+                let n = scratch.withUnsafeMutableBufferPointer { buf in
+                    read(fd, buf.baseAddress, buf.count)
+                }
+                if n < 0 && errno == EINTR { continue }
+                // EOF, error, or recv-timeout: parse whatever we have.
+                if n <= 0 { break }
+                requestBytes.append(contentsOf: scratch.prefix(n))
             }
-            let requestBytes = n > 0 ? Data(scratch.prefix(n)) : Data()
             let response = MmdsSocketService.response(
                 fallbackBody: fallbackBody,
                 requestBytes: requestBytes
             )
             let header = "HTTP/1.1 \(response.status)\r\nContent-Type: \(response.contentType)\r\nContent-Length: \(response.body.count)\r\nConnection: close\r\n\r\n"
-            _ = header.withCString { ptr in write(fd, ptr, strlen(ptr)) }
-            response.body.withUnsafeBytes { raw in
-                if let base = raw.baseAddress {
-                    _ = write(fd, base, raw.count)
+            var out = Data(header.utf8)
+            out.append(response.body)
+            // Full-write loop: a single write(2) may write short, which would
+            // truncate the JSON body the guest sees.
+            out.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                guard let base = raw.baseAddress else { return }
+                var offset = 0
+                while offset < raw.count {
+                    let n = write(fd, base.advanced(by: offset), raw.count - offset)
+                    if n < 0 && errno == EINTR { continue }
+                    if n <= 0 { break }
+                    offset += n
                 }
             }
             connection?.close()
@@ -1287,8 +1334,13 @@ private final class MmdsSocketService: NSObject, VZVirtioSocketListenerDelegate,
 
     private static func parseRequest(_ data: Data) -> MmdsHttpRequest? {
         guard let text = String(data: data, encoding: .utf8) else { return nil }
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map {
-            String($0).trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+        // Split with components(separatedBy:), NOT split(separator: "\n"):
+        // Swift treats "\r\n" as a single grapheme-cluster Character, so a
+        // Character-based split on "\n" never matches inside CRLF-delimited
+        // HTTP headers — the request parses as one giant line and every
+        // header (notably Accept) is silently dropped.
+        let lines = text.components(separatedBy: "\n").map {
+            $0.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
         }
         guard let requestLine = lines.first else { return nil }
         let parts = requestLine.split(separator: " ", omittingEmptySubsequences: true)
@@ -1377,13 +1429,33 @@ private func readAll(fd: Int32, into buf: UnsafeMutableRawBufferPointer) throws 
     while remaining > 0 {
         let n = read(fd, buf.baseAddress!.advanced(by: offset), remaining)
         if n < 0 {
-            throw VsockError.write(POSIXError(.init(rawValue: errno) ?? .EIO))
+            let err = errno
+            if err == EINTR { continue }
+            // With SO_RCVTIMEO set, a lapsed deadline surfaces as EAGAIN/
+            // EWOULDBLOCK — report it as a timeout so the caller's
+            // `timeout_seconds` is honored instead of blocking forever.
+            if err == EAGAIN || err == EWOULDBLOCK {
+                throw VsockError.readTimedOut(seconds: 0)
+            }
+            throw VsockError.read(POSIXError(.init(rawValue: err) ?? .EIO))
         }
         if n == 0 {
             throw VsockError.shortRead
         }
         offset += n
         remaining -= n
+    }
+}
+
+/// Best-effort receive timeout on a socket fd via `SO_RCVTIMEO`, so a blocked
+/// `read` (e.g. a guest command that hangs without ever writing its exit
+/// code) can't park the caller indefinitely. `seconds == 0` clears the
+/// timeout (blocking). Failures are ignored: the timeout is a backstop, not a
+/// correctness dependency.
+private func setRecvTimeout(fd: Int32, seconds: UInt32) {
+    var tv = timeval(tv_sec: Int(seconds), tv_usec: 0)
+    _ = withUnsafePointer(to: &tv) { ptr in
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, ptr, socklen_t(MemoryLayout<timeval>.size))
     }
 }
 
@@ -1444,7 +1516,8 @@ private func buildLongRunningConfig(
     machineIdURL: URL,
     cpuCount: Int,
     memoryBytes: UInt64,
-    commandLine: String
+    commandLine: String,
+    readOnly: Bool
 ) throws -> VZVirtualMachineConfiguration {
     let config = VZVirtualMachineConfiguration()
     config.cpuCount = cpuCount
@@ -1470,7 +1543,7 @@ private func buildLongRunningConfig(
 
     let rootfsAttachment = try VZDiskImageStorageDeviceAttachment(
         url: rootfs,
-        readOnly: false
+        readOnly: readOnly
     )
     config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)]
 
@@ -1498,6 +1571,7 @@ public func hb_vz_long_new(
     bootArgs: UnsafePointer<CChar>?,
     cpuCount: UInt32,
     memoryMib: UInt64,
+    readOnly: Bool,
     outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
     outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
@@ -1526,7 +1600,8 @@ public func hb_vz_long_new(
             machineIdURL: machineId,
             cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
             memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
-            commandLine: commandLine
+            commandLine: commandLine,
+            readOnly: readOnly
         )
 
         let queue = DispatchQueue(label: "com.hephaestus.vz-long-\(UUID().uuidString)")
@@ -2006,6 +2081,7 @@ public func hb_vz_long_restore(
     savePath: UnsafePointer<CChar>?,
     cpuCount: UInt32,
     memoryMib: UInt64,
+    readOnly: Bool,
     resume: Bool,
     outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
     outTimings: UnsafeMutablePointer<HbRestoreTimings>?,
@@ -2035,7 +2111,8 @@ public func hb_vz_long_restore(
             machineIdURL: machineId,
             cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
             memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
-            commandLine: commandLine
+            commandLine: commandLine,
+            readOnly: readOnly
         )
         let configElapsed = DispatchTime.now().uptimeNanoseconds - configStart.uptimeNanoseconds
 

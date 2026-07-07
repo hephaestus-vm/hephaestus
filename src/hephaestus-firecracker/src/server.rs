@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -273,16 +273,29 @@ enum ActionType {
     SendCtrlAltDel,
 }
 
+/// Upstream Firecracker's `HTTP_MAX_PAYLOAD_SIZE` (vmm/src/lib.rs). Requests
+/// larger than this are rejected before buffering, so a client (or a buggy
+/// orchestrator) can't force the daemon to hold an unbounded body in memory.
+const MAX_BODY_BYTES: usize = 51_200;
+
 async fn parse_body<T: serde::de::DeserializeOwned>(
     req: Request<Incoming>,
 ) -> Result<T, Response<BoxBody>> {
-    let bytes = match req.into_body().collect().await {
+    let bytes = match Limited::new(req.into_body(), MAX_BODY_BYTES)
+        .collect()
+        .await
+    {
         Ok(b) => b.to_bytes(),
         Err(err) => {
-            return Err(fault(
-                StatusCode::BAD_REQUEST,
-                &format!("failed to read body: {err}"),
-            ));
+            let msg = if err
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                format!("request body exceeds the {MAX_BODY_BYTES}-byte limit")
+            } else {
+                format!("failed to read body: {err}")
+            };
+            return Err(fault(StatusCode::BAD_REQUEST, &msg));
         }
     };
     serde_json::from_slice::<T>(&bytes).map_err(|err| {
