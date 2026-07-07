@@ -375,9 +375,13 @@ fc-compat-snapshot: build fc-harness-build
     rm -f "$sock_a" "$sock_b" "$log_a" "$log_b"
 
     # Phase 1: cold boot, pause, snapshot.
+    # Pre-declare both PIDs so the EXIT trap (set -u) doesn't abort on an
+    # unbound $server_b if phase 1 fails before phase 2 assigns it — which
+    # would otherwise leak the phase-1 server.
+    server_a="" server_b=""
     {{bin}}-firecracker --api-sock "$sock_a" --id fc-snap-a &
     server_a=$!
-    trap 'kill $server_a $server_b 2>/dev/null || true' EXIT
+    trap 'kill ${server_a:-} ${server_b:-} 2>/dev/null || true' EXIT
     for _ in $(seq 1 20); do [[ -S "$sock_a" ]] && break; sleep 0.1; done
     compat/firectl-harness/firectl-harness \
         -sock "$sock_a" -kernel "$kernel" -rootfs "$rootfs" \

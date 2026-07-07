@@ -484,8 +484,9 @@ public func hb_vz_sh(
                 // The panic message follows PID 1 exiting; user has seen
                 // their shell end, and the kernel noise after isn't
                 // interesting output. Swallow it and signal shutdown.
-                exitBox.signalled = true
-                exitSem.signal()
+                if exitBox.signalOnce() {
+                    exitSem.signal()
+                }
             }
         }
 
@@ -526,8 +527,7 @@ public func hb_vz_sh(
             guard let vm = holder.vm else { return }
             observerBox.observation = vm.observe(\.state, options: [.new]) { vm, _ in
                 if vm.state == .stopped || vm.state == .error {
-                    if !exitBox.signalled {
-                        exitBox.signalled = true
+                    if exitBox.signalOnce() {
                         exitSem.signal()
                     }
                 }
@@ -561,8 +561,27 @@ private final class ObservationBox: @unchecked Sendable {
     var observation: NSKeyValueObservation?
 }
 
+/// Set once from either the serial-sniffer thread or the KVO observer thread,
+/// so access is lock-guarded. `signalOnce()` is an atomic test-and-set: it
+/// returns true exactly once (to the winner), which callers use to signal the
+/// exit semaphore a single time.
 private final class ExitFlagBox: @unchecked Sendable {
-    var signalled = false
+    private let lock = NSLock()
+    private var value = false
+
+    func signalOnce() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if value { return false }
+        value = true
+        return true
+    }
+
+    var signalled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
 }
 
 private final class ExitCodeBox: @unchecked Sendable {
@@ -1878,9 +1897,12 @@ public func hb_vz_long_connect(
         case nil: throw VsockError.noSocketDevice
         }
         let fd = dup(conn.fileDescriptor)
+        // Capture errno before conn.close() — close(2) can overwrite it, which
+        // would misreport the dup failure.
+        let dupErrno = errno
         conn.close()
         if fd < 0 {
-            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+            throw POSIXError(.init(rawValue: dupErrno) ?? .EIO)
         }
         outFd.pointee = fd
         return Status.ok
