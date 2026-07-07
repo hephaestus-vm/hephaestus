@@ -49,6 +49,15 @@ enum RunOrigin {
     SnapshotLoad,
 }
 
+/// A configured secondary (non-root) block device. Attached after the rootfs
+/// so the guest sees them as `/dev/vdb`, `/dev/vdc`, … in insertion order.
+#[derive(Clone, Debug)]
+struct ExtraDrive {
+    id: String,
+    path: PathBuf,
+    read_only: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum LogLevel {
     Error,
@@ -201,6 +210,8 @@ pub struct VzBackend {
     /// attaching the VZ block device read-only so the guest cannot mutate a
     /// shared/golden rootfs the client marked immutable.
     root_drive_read_only: bool,
+    /// Secondary (non-root) drives in insertion order, keyed by drive_id.
+    extra_drives: Vec<ExtraDrive>,
     iface: Option<NetworkInterfaceConfig>,
     machine_config: MachineConfig,
     mmds: Value,
@@ -231,6 +242,7 @@ impl VzBackend {
             boot_source: None,
             root_drive: None,
             root_drive_read_only: false,
+            extra_drives: Vec::new(),
             iface: None,
             machine_config: MachineConfig::default(),
             mmds: Value::Object(Default::default()),
@@ -288,6 +300,15 @@ impl VzBackend {
             .as_ref()
             .and_then(|i| i.guest_mac.as_ref())
             .map(|m| m.to_string())
+    }
+
+    /// Secondary drives as `(path, read_only)` pairs for the bridge, in
+    /// insertion order (attached after the rootfs as `/dev/vdb`, …).
+    fn extra_drive_specs(&self) -> Vec<(PathBuf, bool)> {
+        self.extra_drives
+            .iter()
+            .map(|d| (d.path.clone(), d.read_only))
+            .collect()
     }
 
     fn serial_log_path(&self) -> PathBuf {
@@ -487,24 +508,32 @@ impl VmmBackend for VzBackend {
 
     fn insert_block_device(&mut self, cfg: BlockDeviceConfig) -> Result<(), VmmBackendError> {
         self.require_preboot()?;
-        if !cfg.is_root_device {
-            return Err(VmmBackendError::NotSupported(
-                "only root block devices are supported on macOS".into(),
-            ));
-        }
         let path = cfg.path_on_host.ok_or_else(|| {
             VmmBackendError::InvalidConfig("drive.path_on_host is required".into())
         })?;
         let path = PathBuf::from(path);
         if !path.exists() {
             return Err(VmmBackendError::InvalidConfig(format!(
-                "rootfs not found at {}",
+                "drive not found at {}",
                 path.display()
             )));
         }
-        self.root_drive = Some(path);
         // Firecracker defaults an omitted is_read_only to false (writable).
-        self.root_drive_read_only = cfg.is_read_only.unwrap_or(false);
+        let read_only = cfg.is_read_only.unwrap_or(false);
+        if cfg.is_root_device {
+            self.root_drive = Some(path);
+            self.root_drive_read_only = read_only;
+        } else if let Some(existing) = self.extra_drives.iter_mut().find(|d| d.id == cfg.drive_id) {
+            // Re-PUT of the same drive_id updates it in place.
+            existing.path = path;
+            existing.read_only = read_only;
+        } else {
+            self.extra_drives.push(ExtraDrive {
+                id: cfg.drive_id,
+                path,
+                read_only,
+            });
+        }
         Ok(())
     }
 
@@ -519,11 +548,17 @@ impl VmmBackend for VzBackend {
             let path = PathBuf::from(path);
             if !path.exists() {
                 return Err(VmmBackendError::InvalidConfig(format!(
-                    "rootfs not found at {}",
+                    "drive not found at {}",
                     path.display()
                 )));
             }
-            self.root_drive = Some(path);
+            // Target the drive by id: a secondary drive if one matches,
+            // otherwise the root drive (drive_id "root"/rootfs, back-compat).
+            if let Some(existing) = self.extra_drives.iter_mut().find(|d| d.id == cfg.drive_id) {
+                existing.path = path;
+            } else {
+                self.root_drive = Some(path);
+            }
         }
         // rate_limiter: accept-and-ignore, we don't enforce rate limits
         // on macOS VZ's built-in block attachment.
@@ -760,7 +795,11 @@ impl VmmBackend for VzBackend {
         // (no pool, config mismatch, all slots busy, restore failure)
         // we silently fall through to cold boot — same client-visible
         // contract.
-        if let Some(pool) = self.pool.as_ref() {
+        // Pool snapshots are single-rootfs; a VM needing secondary drives
+        // can't be served from one, so skip the pool when any are configured.
+        if self.extra_drives.is_empty()
+            && let Some(pool) = self.pool.as_ref()
+        {
             let spec = PoolMatchSpec {
                 kernel: kernel.clone(),
                 rootfs: rootfs.clone(),
@@ -818,7 +857,8 @@ impl VmmBackend for VzBackend {
             .memory_mib(memory)
             .read_only(self.root_drive_read_only)
             .networking(self.iface.is_some())
-            .mac(self.configured_mac());
+            .mac(self.configured_mac())
+            .extra_drives(self.extra_drive_specs());
         if let Some(initrd) = boot.initrd_path.as_ref() {
             spec = spec.initrd(std::path::Path::new(initrd));
         }
@@ -925,6 +965,7 @@ impl VmmBackend for VzBackend {
         let initrd = boot.initrd_path.as_ref().map(PathBuf::from);
         let networking = self.iface.is_some();
         let mac = self.configured_mac();
+        let extra_drives = self.extra_drive_specs();
         let (vm, timings) = vz_long_restore(
             &kernel,
             &rootfs,
@@ -937,6 +978,7 @@ impl VmmBackend for VzBackend {
             self.root_drive_read_only,
             networking,
             mac.as_deref(),
+            &extra_drives,
             params.resume_vm,
         )
         .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
@@ -1579,6 +1621,46 @@ mod tests {
             .unwrap();
         assert!(backend.iface.is_some());
         assert_eq!(backend.configured_mac(), None);
+    }
+
+    #[test]
+    fn secondary_drives_tracked_in_order_and_upserted() {
+        use hephaestus_fc_api::vmm_config::drive::BlockDeviceConfig;
+        let root = temp_path("root.ext4");
+        let data = temp_path("data.ext4");
+        let data2 = temp_path("data2.ext4");
+        for p in [&root, &data, &data2] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let put = |backend: &mut VzBackend, id: &str, is_root: bool, p: &Path, ro: Option<bool>| {
+            backend.insert_block_device(BlockDeviceConfig {
+                drive_id: id.into(),
+                is_root_device: is_root,
+                path_on_host: Some(p.display().to_string()),
+                is_read_only: ro,
+                ..Default::default()
+            })
+        };
+
+        let mut backend = VzBackend::new("test".into());
+        put(&mut backend, "root", true, &root, None).unwrap();
+        put(&mut backend, "data", false, &data, Some(true)).unwrap();
+        put(&mut backend, "data2", false, &data2, None).unwrap();
+
+        // Root tracked separately; secondaries kept in insertion order with
+        // their read-only flags (they become /dev/vdb, /dev/vdc).
+        assert_eq!(backend.root_drive, Some(root));
+        let specs = backend.extra_drive_specs();
+        assert_eq!(specs, vec![(data, true), (data2.clone(), false)]);
+
+        // Re-PUT of an existing drive_id updates in place, no duplicate.
+        let data_new = temp_path("data-new.ext4");
+        std::fs::write(&data_new, b"x").unwrap();
+        put(&mut backend, "data", false, &data_new, None).unwrap();
+        assert_eq!(
+            backend.extra_drive_specs(),
+            vec![(data_new, false), (data2, false)]
+        );
     }
 
     #[test]

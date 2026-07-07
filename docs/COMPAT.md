@@ -42,22 +42,27 @@ Legend:
 ### `PUT /drives/{id}`, `PATCH /drives/{id}`
 
 - **Status:** ⚠︎ Partial
-- Only the **root device** is supported. `PUT` with
-  `is_root_device: false` (a secondary/data drive) returns
-  `NotSupported` — VZ attaches a single backing rootfs on this path.
+- **Root + secondary drives supported.** The root device
+  (`is_root_device: true`) boots as `/dev/vda`; additional drives
+  (`is_root_device: false`) attach in insertion order as `/dev/vdb`,
+  `/dev/vdc`, … Re-`PUT` of an existing `drive_id` updates it in place.
 - Honored fields: `drive_id`, `path_on_host`, `is_root_device`, and
-  `is_read_only` (a read-only drive is attached read-only, so the
-  guest cannot mutate it).
+  `is_read_only` (per-drive; a read-only drive is attached read-only,
+  so the guest cannot mutate it).
 - Accepted but **ignored**: `cache_type`, `io_engine`, `partuuid`,
   `rate_limiter`. VZ's built-in block attachment doesn't expose these
   knobs.
-- `PATCH` swaps `path_on_host` pre-boot only. VZ's
+- The warm pool serves single-rootfs VMs only, so configuring a
+  secondary drive skips the pool fast-path and cold-boots.
+- `PATCH` swaps `path_on_host` pre-boot only (by `drive_id`). VZ's
   `VZVirtioBlockDeviceConfiguration` attachments aren't hot-swappable
   the way Linux virtio-blk + io_uring is. Post-boot `PATCH` returns
   `InvalidState`. `firectl` and Kata both patch drives before
   `InstanceStart`, so pre-boot-only covers the real usage. If a
   client needs post-boot drive patching, stop-and-restart is the
   escape hatch.
+- Verified by a real-VM smoke: a secondary drive appears as
+  `/dev/vdb` in the guest.
 
 ### `PUT /network-interfaces/{id}`, `PATCH /network-interfaces/{id}`
 

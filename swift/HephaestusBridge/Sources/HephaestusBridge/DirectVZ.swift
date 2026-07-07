@@ -1508,6 +1508,23 @@ private final class VzVmHandle: @unchecked Sendable {
 /// Differs from `buildConfig` in that the caller supplies the command
 /// line verbatim (no kernel cmdline defaults baked in) and an optional
 /// initrd path.
+/// Decode the parallel `(paths, readonly)` FFI arrays into secondary drive
+/// specs. `count` elements are read from each; a null path entry is skipped.
+private func decodeExtraDrives(
+    count: Int,
+    paths: UnsafePointer<UnsafePointer<CChar>?>?,
+    readonly: UnsafePointer<Bool>?
+) -> [(url: URL, readOnly: Bool)] {
+    guard count > 0, let paths else { return [] }
+    var out: [(url: URL, readOnly: Bool)] = []
+    for i in 0..<count {
+        guard let p = paths[i] else { continue }
+        let ro = readonly?[i] ?? false
+        out.append((URL(fileURLWithPath: String(cString: p)), ro))
+    }
+    return out
+}
+
 private func buildLongRunningConfig(
     kernel: URL,
     rootfs: URL,
@@ -1519,7 +1536,8 @@ private func buildLongRunningConfig(
     commandLine: String,
     readOnly: Bool,
     enableNetworking: Bool,
-    macAddress: String?
+    macAddress: String?,
+    extraDrives: [(url: URL, readOnly: Bool)]
 ) throws -> VZVirtualMachineConfiguration {
     let config = VZVirtualMachineConfiguration()
     config.cpuCount = cpuCount
@@ -1543,11 +1561,23 @@ private func buildLongRunningConfig(
     }
     config.bootLoader = bootloader
 
+    // Root device first (guest boots it as /dev/vda), then any secondary
+    // data drives in order (/dev/vdb, /dev/vdc, ...).
     let rootfsAttachment = try VZDiskImageStorageDeviceAttachment(
         url: rootfs,
         readOnly: readOnly
     )
-    config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)]
+    var storage: [VZStorageDeviceConfiguration] = [
+        VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)
+    ]
+    for drive in extraDrives {
+        let attachment = try VZDiskImageStorageDeviceAttachment(
+            url: drive.url,
+            readOnly: drive.readOnly
+        )
+        storage.append(VZVirtioBlockDeviceConfiguration(attachment: attachment))
+    }
+    config.storageDevices = storage
 
     FileManager.default.createFile(atPath: logURL.path, contents: nil)
     let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
@@ -1589,6 +1619,9 @@ public func hb_vz_long_new(
     readOnly: Bool,
     enableNetworking: Bool,
     macAddress: UnsafePointer<CChar>?,
+    extraDriveCount: Int,
+    extraDrivePaths: UnsafePointer<UnsafePointer<CChar>?>?,
+    extraDriveReadonly: UnsafePointer<Bool>?,
     outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
     outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
@@ -1603,6 +1636,8 @@ public func hb_vz_long_new(
     let initrd: URL? = initrdPath.map { URL(fileURLWithPath: String(cString: $0)) }
     let commandLine = String(cString: bootArgs)
     let mac: String? = macAddress.map { String(cString: $0) }
+    let extraDrives = decodeExtraDrives(
+        count: extraDriveCount, paths: extraDrivePaths, readonly: extraDriveReadonly)
 
     // Machine-id file lives next to the log. Persisted across calls so a
     // future "snapshot this long-running VM" feature doesn't trip over
@@ -1621,7 +1656,8 @@ public func hb_vz_long_new(
             commandLine: commandLine,
             readOnly: readOnly,
             enableNetworking: enableNetworking,
-            macAddress: mac
+            macAddress: mac,
+            extraDrives: extraDrives
         )
 
         let queue = DispatchQueue(label: "com.hephaestus.vz-long-\(UUID().uuidString)")
@@ -2134,6 +2170,9 @@ public func hb_vz_long_restore(
     readOnly: Bool,
     enableNetworking: Bool,
     macAddress: UnsafePointer<CChar>?,
+    extraDriveCount: Int,
+    extraDrivePaths: UnsafePointer<UnsafePointer<CChar>?>?,
+    extraDriveReadonly: UnsafePointer<Bool>?,
     resume: Bool,
     outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
     outTimings: UnsafeMutablePointer<HbRestoreTimings>?,
@@ -2153,6 +2192,8 @@ public func hb_vz_long_restore(
     let save = URL(fileURLWithPath: String(cString: savePath))
     let machineId = machineIdURL(forSavePath: save)
     let mac: String? = macAddress.map { String(cString: $0) }
+    let extraDrives = decodeExtraDrives(
+        count: extraDriveCount, paths: extraDrivePaths, readonly: extraDriveReadonly)
 
     do {
         let configStart = DispatchTime.now()
@@ -2167,7 +2208,8 @@ public func hb_vz_long_restore(
             commandLine: commandLine,
             readOnly: readOnly,
             enableNetworking: enableNetworking,
-            macAddress: mac
+            macAddress: mac,
+            extraDrives: extraDrives
         )
         let configElapsed = DispatchTime.now().uptimeNanoseconds - configStart.uptimeNanoseconds
 

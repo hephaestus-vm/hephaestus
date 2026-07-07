@@ -237,6 +237,9 @@ unsafe extern "C" {
         read_only: bool,
         enable_networking: bool,
         mac: *const c_char,
+        extra_drive_count: usize,
+        extra_drive_paths: *const *const c_char,
+        extra_drive_readonly: *const bool,
         out_vm: *mut *mut HbVzVm,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
@@ -299,6 +302,9 @@ unsafe extern "C" {
         read_only: bool,
         enable_networking: bool,
         mac: *const c_char,
+        extra_drive_count: usize,
+        extra_drive_paths: *const *const c_char,
+        extra_drive_readonly: *const bool,
         resume: bool,
         out_vm: *mut *mut HbVzVm,
         out_timings: *mut HbRestoreTimings,
@@ -562,6 +568,9 @@ pub struct VzSpec {
     /// Optional guest MAC address (from Firecracker's `guest_mac`). `None`
     /// lets VZ assign a random locally-administered address.
     pub mac: Option<String>,
+    /// Secondary (non-root) drives, attached after the rootfs in order as
+    /// `/dev/vdb`, `/dev/vdc`, … Each is `(path, read_only)`.
+    pub extra_drives: Vec<(std::path::PathBuf, bool)>,
 }
 
 impl VzSpec {
@@ -592,6 +601,11 @@ impl VzSpec {
 
     pub fn mac(mut self, mac: Option<String>) -> Self {
         self.mac = mac;
+        self
+    }
+
+    pub fn extra_drives(mut self, drives: Vec<(std::path::PathBuf, bool)>) -> Self {
+        self.extra_drives = drives;
         self
     }
 
@@ -637,6 +651,7 @@ impl VzVm {
         let initrd_ptr = initrd_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let mac_c = spec.mac.as_deref().map(CString::new).transpose()?;
         let mac_ptr = mac_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let drives = DriveArrays::new(&spec.extra_drives)?;
 
         let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
         let mut out_err: *mut c_char = std::ptr::null_mut();
@@ -652,6 +667,9 @@ impl VzVm {
                 spec.read_only,
                 spec.networking,
                 mac_ptr,
+                drives.count(),
+                drives.paths_ptr(),
+                drives.readonly_ptr(),
                 &mut out_vm,
                 &mut out_err,
             )
@@ -873,6 +891,53 @@ fn path_to_str<'a>(p: &'a Path, label: &str) -> Result<&'a str, VmError> {
 fn opt_path_cstring(p: Option<&Path>, label: &str) -> Result<Option<CString>, VmError> {
     p.map(|p| Ok::<_, VmError>(CString::new(path_to_str(p, label)?)?))
         .transpose()
+}
+
+/// Owns the C-side storage for a secondary-drive list passed across the FFI as
+/// parallel `(paths, readonly)` arrays. Keep it alive for the duration of the
+/// `hb_vz_long_*` call — the returned pointers borrow its buffers.
+struct DriveArrays {
+    // Kept alive so `ptrs` stays valid; the heap buffers outlive Vec moves.
+    _paths: Vec<CString>,
+    ptrs: Vec<*const c_char>,
+    readonly: Vec<bool>,
+}
+
+impl DriveArrays {
+    fn new(drives: &[(std::path::PathBuf, bool)]) -> Result<Self, VmError> {
+        let mut paths = Vec::with_capacity(drives.len());
+        let mut readonly = Vec::with_capacity(drives.len());
+        for (path, ro) in drives {
+            paths.push(CString::new(path_to_str(path, "drive")?)?);
+            readonly.push(*ro);
+        }
+        let ptrs: Vec<*const c_char> = paths.iter().map(|c| c.as_ptr()).collect();
+        Ok(Self {
+            _paths: paths,
+            ptrs,
+            readonly,
+        })
+    }
+
+    fn count(&self) -> usize {
+        self.ptrs.len()
+    }
+
+    fn paths_ptr(&self) -> *const *const c_char {
+        if self.ptrs.is_empty() {
+            std::ptr::null()
+        } else {
+            self.ptrs.as_ptr()
+        }
+    }
+
+    fn readonly_ptr(&self) -> *const bool {
+        if self.readonly.is_empty() {
+            std::ptr::null()
+        } else {
+            self.readonly.as_ptr()
+        }
+    }
 }
 
 // =============================================================================
@@ -1149,6 +1214,7 @@ pub fn vz_long_restore(
     read_only: bool,
     networking: bool,
     mac: Option<&str>,
+    extra_drives: &[(std::path::PathBuf, bool)],
     resume: bool,
 ) -> Result<(VzVm, HbRestoreTimings), VmError> {
     let kernel_c = CString::new(path_to_str(kernel, "kernel")?)?;
@@ -1160,6 +1226,7 @@ pub fn vz_long_restore(
     let initrd_ptr = initrd_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
     let mac_c = mac.map(CString::new).transpose()?;
     let mac_ptr = mac_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    let drives = DriveArrays::new(extra_drives)?;
 
     let mut out_vm: *mut HbVzVm = std::ptr::null_mut();
     let mut out_err: *mut c_char = std::ptr::null_mut();
@@ -1177,6 +1244,9 @@ pub fn vz_long_restore(
             read_only,
             networking,
             mac_ptr,
+            drives.count(),
+            drives.paths_ptr(),
+            drives.readonly_ptr(),
             resume,
             &mut out_vm,
             &mut timings,
