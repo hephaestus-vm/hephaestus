@@ -28,9 +28,9 @@ milestones below are that list, highest leverage first.
 | :-- | :-- |
 | M1a — NAT networking on the HTTP path | ✅ Done |
 | M2 — device breadth (data drives, entropy, SendCtrlAltDel, balloon) | ✅ Done |
-| M3 — metrics fidelity & operability | ▶ In progress |
+| M3 — metrics fidelity & operability | ✅ Done (rate limiters deferred) |
 | M1b — MMDS over the guest NIC (vmnet, restricted entitlement) | ⬜ Not started |
-| M4 — multi-tenant / jailer productionization | ⬜ Not started |
+| M4 — multi-tenant / jailer productionization | ▶ In progress |
 
 ---
 
@@ -150,20 +150,21 @@ target shrinks resident memory).
 
 ---
 
-## Milestone 3 — Fidelity & operability — ▶ In progress
+## Milestone 3 — Fidelity & operability — ✅ Done
 
-- **Real metrics counters** *(current focus)* — today most
-  `flush_metrics` fields are hardcoded `0` and `instance_info_count` is
-  fed *all* GETs. Track the per-endpoint counts the shape advertises
-  (per-method + per-endpoint), and label them correctly. Also stop
-  reopening the metrics file on every request (hold the handle; flush on
-  timer + lifecycle).
-- **Rate limiters** — `drive` / `net` `rate_limiter` are accepted-and-
-  ignored. VZ has no token-bucket knob; either approximate in the vsock/
-  data path or keep documented-noop. *Likely defer — low value, high
-  effort on VZ.*
-- Close the smaller review nits (guest-agent read timeout, Swift
-  `errno`-after-close, `ExitFlagBox` race, script hygiene).
+- **Real metrics counters** — done. `ApiCounters` classifies each
+  request by `(method, path)` so every `*_api_requests.*` field is real;
+  device/hypervisor counters with no VZ equivalent stay zero. The metrics
+  sink handle is held open (no per-request reopen). Locked in by the
+  firectl-harness (asserts counters are non-zero).
+- **Review nits** — done: guest-agent handshake read timeout (a stalled
+  probe no longer wedges the serial accept loop), Swift `errno`-before-
+  `close`, `ExitFlagBox` lock-guarded test-and-set, and the
+  snapshot-recipe EXIT-trap unbound-var leak.
+- **Rate limiters** — *deferred, documented-noop.* `drive` / `net`
+  `rate_limiter` are accepted and ignored; VZ exposes no token-bucket
+  knob, so this is low value / high effort. Revisit only if a data-path
+  shaper becomes worthwhile.
 
 ---
 
@@ -187,8 +188,9 @@ grant).
 
 1. ~~**M1a** (NAT networking)~~ — ✅ done.
 2. ~~**M2** (entropy, SendCtrlAltDel, data drives, balloon)~~ — ✅ done.
-3. **M3 metrics** — fidelity *(current)*.
-4. **M1b** (vmnet MMDS) + **M4** (jailer) — the entitlement/security track.
+3. ~~**M3** (metrics fidelity + review nits)~~ — ✅ done (rate limiters deferred).
+4. **M4** (jailer) — process ownership + isolation *(current)*.
+5. **M1b** (vmnet MMDS) — the restricted-entitlement track.
 
 Every milestone lands with: unit tests, a COMPAT.md status update, a
 firectl-harness case, and — for anything that boots — a real-VM e2e
