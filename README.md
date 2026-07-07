@@ -144,7 +144,7 @@ per-endpoint notes and known deviations.
 | `PUT /network-interfaces/{id}`        | ⚠︎         | VZ NAT NIC attached; `guest_mac` honored, L3 up to guest |
 | `PATCH /network-interfaces/{id}`      | ⚠︎         | Accept-noop (rate-limiter ignored)         |
 | `PUT /logger`                         | ✓          | Firecracker-style text logs + debug access |
-| `PUT /metrics`                        | ⚠︎         | Firecracker-style JSON; Linux counters zero |
+| `PUT /metrics`                        | ⚠︎         | Firecracker-style JSON; real per-endpoint API counts; device counters zero |
 | `PUT /actions` (`InstanceStart`, `FlushMetrics`, `SendCtrlAltDel`) | ✓ | Boot/restore, force metrics flush, or graceful guest stop |
 | `PUT /entropy`                        | ✓          | virtio-rng always attached; request confirmed |
 | `PUT/PATCH/GET /balloon`              | ⚠︎         | VZ traditional balloon; live target adjust; no stats |

@@ -121,16 +121,87 @@ impl Default for LoggerState {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Per-endpoint API request counters matching Firecracker's
+/// `get`/`put`/`patch_api_requests` metric groups. Populated by classifying
+/// each request's `(method, path)` so the emitted counts are real rather than
+/// stubbed zeros.
+#[derive(Debug, Default)]
+struct ApiCounters {
+    // GET
+    instance_info: u64,
+    machine_cfg_get: u64,
+    mmds_get: u64,
+    vmm_version: u64,
+    // PUT
+    actions: u64,
+    boot_source: u64,
+    drive_put: u64,
+    logger: u64,
+    machine_cfg_put: u64,
+    metrics: u64,
+    mmds_put: u64,
+    net_put: u64,
+    snapshot_create: u64,
+    snapshot_load: u64,
+    // PATCH
+    drive_patch: u64,
+    machine_cfg_patch: u64,
+    mmds_patch: u64,
+    net_patch: u64,
+    vm_patch: u64,
+}
+
+impl ApiCounters {
+    /// Increment the counter for a served request, mirroring the router's
+    /// `(method, path)` dispatch so each metric maps to the right endpoint.
+    fn record(&mut self, method: &str, path: &str) {
+        fn bump(c: &mut u64) {
+            *c = c.saturating_add(1);
+        }
+        match method {
+            "GET" => match path {
+                "/" => bump(&mut self.instance_info),
+                "/machine-config" => bump(&mut self.machine_cfg_get),
+                "/version" => bump(&mut self.vmm_version),
+                "/mmds" => bump(&mut self.mmds_get),
+                _ => {}
+            },
+            "PUT" => match path {
+                "/actions" => bump(&mut self.actions),
+                "/boot-source" => bump(&mut self.boot_source),
+                "/logger" => bump(&mut self.logger),
+                "/machine-config" => bump(&mut self.machine_cfg_put),
+                "/metrics" => bump(&mut self.metrics),
+                "/snapshot/create" => bump(&mut self.snapshot_create),
+                "/snapshot/load" => bump(&mut self.snapshot_load),
+                "/mmds" | "/mmds/config" => bump(&mut self.mmds_put),
+                p if p.starts_with("/drives/") => bump(&mut self.drive_put),
+                p if p.starts_with("/network-interfaces/") => bump(&mut self.net_put),
+                _ => {}
+            },
+            "PATCH" => match path {
+                "/machine-config" => bump(&mut self.machine_cfg_patch),
+                "/vm" => bump(&mut self.vm_patch),
+                "/mmds" => bump(&mut self.mmds_patch),
+                p if p.starts_with("/drives/") => bump(&mut self.drive_patch),
+                p if p.starts_with("/network-interfaces/") => bump(&mut self.net_patch),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug)]
 struct MetricsState {
-    path: Option<PathBuf>,
+    /// Open append handle to the metrics sink, held for the process lifetime
+    /// so we don't reopen the file on every control-plane request.
+    file: Option<std::fs::File>,
     started_at: Instant,
     flush_count: u64,
     api_requests: u64,
     api_request_fails: u64,
-    get_requests: u64,
-    put_requests: u64,
-    patch_requests: u64,
+    counters: ApiCounters,
     pool_hits: u64,
     pool_misses: u64,
     snapshot_loads: u64,
@@ -139,14 +210,12 @@ struct MetricsState {
 impl Default for MetricsState {
     fn default() -> Self {
         Self {
-            path: None,
+            file: None,
             started_at: Instant::now(),
             flush_count: 0,
             api_requests: 0,
             api_request_fails: 0,
-            get_requests: 0,
-            put_requests: 0,
-            patch_requests: 0,
+            counters: ApiCounters::default(),
             pool_hits: 0,
             pool_misses: 0,
             snapshot_loads: 0,
@@ -372,12 +441,7 @@ impl VzBackend {
         if status >= 400 {
             self.metrics.api_request_fails = self.metrics.api_request_fails.saturating_add(1);
         }
-        match method {
-            "GET" => self.metrics.get_requests = self.metrics.get_requests.saturating_add(1),
-            "PUT" => self.metrics.put_requests = self.metrics.put_requests.saturating_add(1),
-            "PATCH" => self.metrics.patch_requests = self.metrics.patch_requests.saturating_add(1),
-            _ => {}
-        }
+        self.metrics.counters.record(method, path);
         if self.logger.level.enabled(LogLevel::Debug) {
             self.write_log(
                 LogLevel::Debug,
@@ -390,71 +454,75 @@ impl VzBackend {
     }
 
     pub fn flush_metrics(&mut self) {
-        let Some(path) = self.metrics.path.clone() else {
+        if self.metrics.file.is_none() {
             return;
-        };
+        }
         self.metrics.flush_count = self.metrics.flush_count.saturating_add(1);
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let uptime_us = self.metrics.started_at.elapsed().as_micros();
-        let payload = serde_json::json!({
-            "utc_timestamp_ms": timestamp_ms,
-            "api_server": {
-                "process_startup_time_us": uptime_us,
-                "sync_response_fails": self.metrics.api_request_fails,
-            },
-            "get_api_requests": {
-                "instance_info_count": self.metrics.get_requests,
-                "machine_cfg_count": 0,
-                "mmds_count": 0,
-                "vmm_version_count": 0,
-            },
-            "put_api_requests": {
-                "actions_count": 0,
-                "boot_source_count": 0,
-                "drive_count": 0,
-                "logger_count": 0,
-                "machine_cfg_count": 0,
-                "metrics_count": 0,
-                "mmds_count": 0,
-                "net_count": 0,
-                "snapshot_create_count": 0,
-                "snapshot_load_count": self.metrics.snapshot_loads,
-            },
-            "patch_api_requests": {
-                "drive_count": 0,
-                "machine_cfg_count": 0,
-                "mmds_count": 0,
-                "net_count": 0,
-                "vm_count": 0,
-            },
-            "logger": {
-                "missed_log_count": 0,
-                "missed_metrics_count": 0,
-                "flush_count": self.metrics.flush_count,
-            },
-            "vmm": {
-                "panic_count": 0,
-            },
-            "vcpu": {
-                "exit_io_in": 0,
-                "exit_io_out": 0,
-                "failures": 0,
-            },
-            "seccomp": {
-                "num_faults": 0,
-            },
-            "hephaestus": {
-                "api_requests": self.metrics.api_requests,
-                "api_request_fails": self.metrics.api_request_fails,
-                "pool_hits": self.metrics.pool_hits,
-                "pool_misses": self.metrics.pool_misses,
-                "snapshot_loads": self.metrics.snapshot_loads,
-            },
-        });
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let payload = {
+            let m = &self.metrics;
+            let c = &m.counters;
+            serde_json::json!({
+                "utc_timestamp_ms": timestamp_ms,
+                "api_server": {
+                    "process_startup_time_us": uptime_us,
+                    "sync_response_fails": m.api_request_fails,
+                },
+                "get_api_requests": {
+                    "instance_info_count": c.instance_info,
+                    "machine_cfg_count": c.machine_cfg_get,
+                    "mmds_count": c.mmds_get,
+                    "vmm_version_count": c.vmm_version,
+                },
+                "put_api_requests": {
+                    "actions_count": c.actions,
+                    "boot_source_count": c.boot_source,
+                    "drive_count": c.drive_put,
+                    "logger_count": c.logger,
+                    "machine_cfg_count": c.machine_cfg_put,
+                    "metrics_count": c.metrics,
+                    "mmds_count": c.mmds_put,
+                    "net_count": c.net_put,
+                    "snapshot_create_count": c.snapshot_create,
+                    "snapshot_load_count": c.snapshot_load,
+                },
+                "patch_api_requests": {
+                    "drive_count": c.drive_patch,
+                    "machine_cfg_count": c.machine_cfg_patch,
+                    "mmds_count": c.mmds_patch,
+                    "net_count": c.net_patch,
+                    "vm_count": c.vm_patch,
+                },
+                "logger": {
+                    "missed_log_count": 0,
+                    "missed_metrics_count": 0,
+                    "flush_count": m.flush_count,
+                },
+                "vmm": {
+                    "panic_count": 0,
+                },
+                "vcpu": {
+                    "exit_io_in": 0,
+                    "exit_io_out": 0,
+                    "failures": 0,
+                },
+                "seccomp": {
+                    "num_faults": 0,
+                },
+                "hephaestus": {
+                    "api_requests": m.api_requests,
+                    "api_request_fails": m.api_request_fails,
+                    "pool_hits": m.pool_hits,
+                    "pool_misses": m.pool_misses,
+                    "snapshot_loads": m.snapshot_loads,
+                },
+            })
+        };
+        if let Some(file) = self.metrics.file.as_mut() {
             let _ = writeln!(file, "{payload}");
         }
     }
@@ -663,7 +731,7 @@ impl VmmBackend for VzBackend {
     }
 
     fn configure_metrics(&mut self, cfg: MetricsConfig) -> Result<(), VmmBackendError> {
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&cfg.metrics_path)
@@ -673,7 +741,7 @@ impl VmmBackend for VzBackend {
                     cfg.metrics_path.display()
                 ))
             })?;
-        self.metrics.path = Some(cfg.metrics_path);
+        self.metrics.file = Some(file);
         self.flush_metrics();
         Ok(())
     }
@@ -1763,6 +1831,41 @@ mod tests {
             backend.extra_drive_specs(),
             vec![(data_new, false), (data2, false)]
         );
+    }
+
+    #[test]
+    fn metrics_count_real_per_endpoint_requests() {
+        let path = temp_path("metrics.json");
+        let mut backend = VzBackend::new("test".into());
+        backend
+            .configure_metrics(MetricsConfig {
+                metrics_path: path.clone(),
+            })
+            .unwrap();
+
+        // Simulate served requests across endpoints (one a failure).
+        backend.observe_request(1, "GET", "/", 200);
+        backend.observe_request(2, "GET", "/machine-config", 200);
+        backend.observe_request(3, "PUT", "/boot-source", 204);
+        backend.observe_request(4, "PUT", "/drives/rootfs", 204);
+        backend.observe_request(5, "PATCH", "/vm", 204);
+        backend.observe_request(6, "PUT", "/actions", 400);
+
+        // Parse the last flushed JSON record.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let last = content.lines().next_back().unwrap();
+        let v: serde_json::Value = serde_json::from_str(last).unwrap();
+
+        // Counts map to the right endpoint (not stubbed zeros, not all-GETs).
+        assert_eq!(v["get_api_requests"]["instance_info_count"], 1);
+        assert_eq!(v["get_api_requests"]["machine_cfg_count"], 1);
+        assert_eq!(v["put_api_requests"]["boot_source_count"], 1);
+        assert_eq!(v["put_api_requests"]["drive_count"], 1);
+        assert_eq!(v["put_api_requests"]["actions_count"], 1);
+        assert_eq!(v["patch_api_requests"]["vm_count"], 1);
+        assert_eq!(v["hephaestus"]["api_requests"], 6);
+        assert_eq!(v["hephaestus"]["api_request_fails"], 1);
+        assert_eq!(v["api_server"]["sync_response_fails"], 1);
     }
 
     #[test]

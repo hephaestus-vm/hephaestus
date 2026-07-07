@@ -121,13 +121,17 @@ Legend:
 ### `PUT /metrics`
 
 - **Status:** ⚠︎ Partial
-- Opens `metrics_path` append-mode and writes newline-delimited JSON.
-  Flushes happen at configure time, after each API request/lifecycle event,
-  and from a 60s background timer (matching Firecracker's default cadence).
-  The shape includes Firecracker-compatible top-level groups such as
-  `api_server`, `get_api_requests`, `put_api_requests`, `patch_api_requests`,
-  `logger`, `vmm`, `vcpu`, and `seccomp`. Linux/KVM-only counters are emitted
-  as numeric zeros; macOS/hephaestus-specific counters live under the
+- Opens `metrics_path` append-mode (handle held for the process lifetime,
+  not reopened per request) and writes newline-delimited JSON. Flushes
+  happen at configure time, after each API request/lifecycle event, and
+  from a 60s background timer (matching Firecracker's default cadence).
+  The shape includes Firecracker-compatible top-level groups: `api_server`,
+  `get_api_requests`, `put_api_requests`, `patch_api_requests`, `logger`,
+  `vmm`, `vcpu`, and `seccomp`. The **`*_api_requests` counters are real**
+  — each served request is classified by `(method, path)` into the matching
+  per-endpoint counter. Device/hypervisor counters with no VZ equivalent
+  (`vmm.panic_count`, `vcpu.*`, `seccomp.num_faults`, `logger.missed_*`) are
+  emitted as zeros. macOS/hephaestus-specific counters live under the
   `hephaestus` object (`api_requests`, failures, pool hits/misses, snapshot
   loads). It is intentionally not byte-for-byte identical to Firecracker's
   full metrics set because most device counters do not exist in VZ.

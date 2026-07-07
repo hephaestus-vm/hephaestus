@@ -580,7 +580,18 @@ func assertMetricsJSON(path string) error {
 			return fmt.Errorf("metrics %s missing key %q", path, key)
 		}
 	}
-	fmt.Printf("    metrics=%s lines=%d bytes=%d\n", path, len(lines), len(payload))
+	// The per-endpoint API counters must be real, not stubbed zeros: by now
+	// the harness has served GET / and PUT /boot-source at least once.
+	get, _ := record["get_api_requests"].(map[string]interface{})
+	put, _ := record["put_api_requests"].(map[string]interface{})
+	if n, _ := get["instance_info_count"].(float64); n < 1 {
+		return fmt.Errorf("metrics %s: get_api_requests.instance_info_count=%v, want >=1 (GET / was served)", path, get["instance_info_count"])
+	}
+	if n, _ := put["boot_source_count"].(float64); n < 1 {
+		return fmt.Errorf("metrics %s: put_api_requests.boot_source_count=%v, want >=1 (PUT /boot-source was served)", path, put["boot_source_count"])
+	}
+	fmt.Printf("    metrics=%s lines=%d bytes=%d instance_info=%v boot_source=%v\n",
+		path, len(lines), len(payload), get["instance_info_count"], put["boot_source_count"])
 	return nil
 }
 
