@@ -98,14 +98,25 @@ SDK.
 
 ## How it works
 
-```text
-Firecracker clients ── HTTP/1.1 over UDS ──> hephaestus-firecracker
-                                                     │
-hephaestus CLI ──────────────────────────────────────┤
-                                                     ▼
-                                      Virtualization.framework
-                                                     ▼
-                                                 Linux VM
+```mermaid
+flowchart TB
+    Clients["Firecracker clients"]
+    CLI["hephaestus CLI"]
+    API["hephaestus-firecracker<br/>HTTP/1.1 over a UNIX socket"]
+    Backend["Firecracker lifecycle backend"]
+    Containerization["Apple Containerization"]
+    Bridge["Rust ↔ Swift bridge"]
+    VZ["Apple Virtualization.framework"]
+    Guest["arm64 Linux VM"]
+
+    Clients --> API
+    API --> Backend
+    Backend --> Bridge
+    CLI -->|run| Containerization
+    CLI -->|vz-*| Bridge
+    Containerization --> Bridge
+    Bridge --> VZ
+    VZ --> Guest
 ```
 
 Hephaestus has two VM paths:
@@ -168,11 +179,13 @@ the methodology, phase breakdown, and reproduction commands.
 
 ## Releases
 
-Source archives and pre-built binaries are published on the
-[GitHub Releases](https://github.com/hephaestus-vm/hephaestus/releases) page.
-Hephaestus follows Semantic Versioning, with additional instability allowed
-while the major version is zero. See the [release policy](docs/project/release-policy.md)
-and [changelog](CHANGELOG.md).
+Release artifacts are published through the
+[GitHub Releases](https://github.com/hephaestus-vm/hephaestus/releases) page;
+until the first release appears, build from source. Hephaestus follows Semantic
+Versioning, with additional instability allowed
+while the major version is zero. See the [release policy](docs/project/release-policy.md),
+[automation plan](docs/project/release-automation.md), and
+[changelog](CHANGELOG.md).
 
 ## Contributing
 
