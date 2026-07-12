@@ -29,7 +29,7 @@
 //!   cgroups; per-VM cpu/memory caps are enforced by VZ itself).
 //! - Not entitlement-aware. The child still needs to be ad-hoc signed with
 //!   `com.apple.security.virtualization`; the jailer cannot grant that
-//!   for you. See `docs/JAILER_MMDS_PLAN.md` for the entitlement roadmap.
+//!   for you. See `docs/guides/jailer.md` for the entitlement roadmap.
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;

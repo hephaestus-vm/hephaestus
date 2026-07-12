@@ -36,9 +36,7 @@ and what remains valid after the call returns.
 
 ### Fail closed at isolation boundaries
 
-Sandbox and jailer code should deny by default. Add permissions only when a real e2e proves they are
-needed. Prefer narrow files and per-VM work directories over broad temp-directory grants. If a broad
-grant is temporarily necessary, document why and what will remove it.
+Sandbox and jailer code should deny by default. Add permissions only when a real e2e proves they are needed. Prefer narrow files and per-VM work directories over broad temp-directory grants. If a broad grant is temporarily necessary, document why and what will remove it.
 
 ### Assert and validate invariants near the boundary
 
@@ -50,58 +48,43 @@ Use Rust types where possible, but do not rely on types alone for external data.
 - Snapshot and pool match preconditions before restore.
 - FFI return status and out-parameters immediately after calls.
 
-Assertions are for programmer errors; user/API errors must become structured Firecracker-shaped
-errors where possible.
+Assertions are for programmer errors; user/API errors must become structured Firecracker-shaped errors where possible.
 
 ### Separate operating errors from programmer errors
 
-Expected failures include missing files, invalid API state, unsupported Firecracker features,
-sandbox denials, VM configuration errors, and entitlement failures. Return or report these with
-context. Unexpected invariant violations should crash tests or fail fast.
+Expected failures include missing files, invalid API state, unsupported Firecracker features, sandbox denials, VM configuration errors, and entitlement failures. Return or report these with context. Unexpected invariant violations should crash tests or fail fast.
 
 ### Keep resource lifetimes obvious
 
-VM handles, pool slots, sockets, file descriptors, serial attachments, and spawned tasks are
-resources. Their ownership and cleanup must be visible. In scripts, use `trap` immediately after
-resource creation. In Rust/Swift, prefer RAII/defer-style cleanup and keep resource variables in the
-smallest useful scope.
+VM handles, pool slots, sockets, file descriptors, serial attachments, and spawned tasks are resources. Their ownership and cleanup must be visible. In scripts, use `trap` immediately after resource creation. In Rust/Swift, prefer RAII/defer-style cleanup and keep resource variables in the smallest useful scope.
 
 ### Avoid hidden blocking and deadlocks
 
-Anything involving stdin, vsock, Unix sockets, HTTP serving, VM pause/resume, or process shutdown can
-hang. Always consider EOF, half-close semantics, read/write ordering, and teardown races. E2e tests
-must exercise these paths with timeouts.
+Anything involving stdin, vsock, Unix sockets, HTTP serving, VM pause/resume, or process shutdown can hang. Always consider EOF, half-close semantics, read/write ordering, and teardown races. E2e tests must exercise these paths with timeouts.
 
 ## Compatibility
 
 ### Firecracker compatibility is a contract
 
-The Go SDK harness is a first-class test, not a convenience. Wire-shape drift is a bug unless the
-compat docs explicitly call out a partial or unsupported behavior.
+The Go SDK harness is a first-class test, not a convenience. Wire-shape drift is a bug unless the compat docs explicitly call out a partial or unsupported behavior.
 
 ### Deviations are documented where users look
 
-When behavior differs from Firecracker, update the compatibility table and endpoint notes in the
-same change. For architecture-level deviations, update `docs/ARCHITECTURE.md`.
+When behavior differs from Firecracker, update the compatibility table and endpoint notes in the same change. For architecture-level deviations, update `docs/design/architecture.md`.
 
 ### Path and state semantics matter
 
-Firecracker clients configure resources before `InstanceStart`. Preserve pre-boot/post-boot rules,
-error shapes, and idempotency. If VZ cannot support a Firecracker behavior, accept-noop only when
-real clients rely on that behavior being accepted.
+Firecracker clients configure resources before `InstanceStart`. Preserve pre-boot/post-boot rules, error shapes, and idempotency. If VZ cannot support a Firecracker behavior, accept-noop only when real clients rely on that behavior being accepted.
 
 ## Operability
 
 ### Every failure needs a next clue
 
-Errors should tell the operator what failed and where to look next: path, socket, VM id, entitlement,
-sandbox profile, or recipe. For entitlement-sensitive features, include the missing entitlement or
-platform condition in the message.
+Errors should tell the operator what failed and where to look next: path, socket, VM id, entitlement, sandbox profile, or recipe. For entitlement-sensitive features, include the missing entitlement or platform condition in the message.
 
 ### Logs live under ownership
 
-Per-VM logs, metrics, sockets, profiles, snapshots, and sidecars should live under a per-VM work
-directory whenever possible. This keeps sandbox profiles narrow and cleanup simple.
+Per-VM logs, metrics, sockets, profiles, snapshots, and sidecars should live under a per-VM work directory whenever possible. This keeps sandbox profiles narrow and cleanup simple.
 
 ### Recipes are part of the product
 
@@ -139,8 +122,7 @@ Where loops are intentionally unbounded servers, keep the per-connection work bo
 ### Names carry domain meaning
 
 Prefer names that match the architecture: `backend`, `work_dir`, `api_sock`, `rootfs`, `initramfs`,
-`mmds`, `vsock`, `snapshot`, `pool`, `jailer`, `profile`. Avoid abbreviations unless they are domain
-terms (`VZ`, `MMDS`, `UDS`, `FFI`).
+`mmds`, `vsock`, `snapshot`, `pool`, `jailer`, `profile`. Avoid abbreviations unless they are domain terms (`VZ`, `MMDS`, `UDS`, `FFI`).
 
 ### Say why, not only what
 

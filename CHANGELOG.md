@@ -49,6 +49,13 @@ numbers follow [Semantic Versioning](https://semver.org/).
   replacement — no uid/gid drop, no chroot, no cgroup pinning. The
   sandbox profile is the only isolation boundary.
 
+### Changed
+
+- **User guides are binary-first.** Operator workflows now document
+  `hephaestus`, `hephaestus-firecracker`, and `hephaestus-jailer` commands
+  directly, with `just` recipes identified as source-tree shortcuts or test
+  harnesses.
+
 ### Fixed
 
 - **Xcode 27 beta SPM regression with header-only C target.** Added

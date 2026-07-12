@@ -13,7 +13,7 @@
 //! to the VM's network config (requires `com.apple.vm.networking` and a
 //! Developer ID signed binary). Without that entitlement the listener
 //! still binds successfully on the host but no guest traffic reaches it.
-//! See `docs/JAILER_MMDS_PLAN.md` for the full plan.
+//! See `docs/guides/networking.md` for the full plan.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
