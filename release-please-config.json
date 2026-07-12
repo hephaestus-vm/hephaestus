@@ -1,5 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "signoff": "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>",
   "packages": {
     ".": {
       "release-type": "simple",
@@ -27,11 +28,6 @@
           "type": "toml",
           "path": "src/hephaestus-jailer/Cargo.toml",
           "jsonpath": "$.package.version"
-        },
-        {
-          "type": "toml",
-          "path": "Cargo.lock",
-          "jsonpath": "$.package[?(@.name == 'hephaestus-cli' || @.name == 'hephaestus-firecracker' || @.name == 'hephaestus-jailer')].version"
         }
       ]
     }

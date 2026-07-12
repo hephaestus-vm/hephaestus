@@ -31,8 +31,43 @@ jobs:
             echo "Release Please starts after the one-time v0.4.0-alpha.1 bootstrap."
           fi
       - uses: googleapis/release-please-action@v5
+        id: release
         if: steps.bootstrap.outputs.ready == 'true'
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      - name: Check out release branch
+        if: steps.release.outputs.prs_created == 'true'
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          fetch-depth: 0
+
+      - name: Synchronize release lockfile
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="$(gh pr list \
+            --state open \
+            --label 'autorelease: pending' \
+            --json headRefName \
+            --jq '.[0].headRefName')"
+          if [[ -z "$branch" || "$branch" == "null" ]]; then
+            echo "Release Please reported a PR but no release branch was found" >&2
+            exit 1
+          fi
+          git fetch origin "$branch"
+          git switch --force-create "$branch" "origin/$branch"
+          python3 scripts/sync-release-lock.py
+          if git diff --quiet -- Cargo.lock; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.lock
+          git commit -s -m "chore(release): synchronize Cargo.lock"
+          git push origin "HEAD:$branch"
