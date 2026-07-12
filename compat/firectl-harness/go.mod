@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/firecracker-microvm/firecracker-go-sdk v1.0.0
 	github.com/go-openapi/runtime v0.32.4
-	github.com/go-openapi/strfmt v0.26.3
+	github.com/go-openapi/strfmt v0.26.4
 )
 
 require (
@@ -40,8 +40,8 @@ require (
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
