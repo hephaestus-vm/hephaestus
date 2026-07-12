@@ -11,7 +11,20 @@ use hephaestus_vmm::{
 use hephaestus_pool as pool;
 
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(help) = help_text(&raw_args) {
+        println!("{help}");
+        return ExitCode::SUCCESS;
+    }
+    if matches!(
+        raw_args.first().map(String::as_str),
+        Some("-V" | "--version")
+    ) {
+        println!("hephaestus {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+
+    let mut args = raw_args.into_iter();
     match args.next().as_deref() {
         Some("ping") => {
             println!("{}", hephaestus_vmm::ping());
@@ -125,29 +138,127 @@ fn main() -> ExitCode {
         },
         Some(other) => {
             eprintln!("hephaestus: unknown subcommand `{other}`");
-            eprintln!(
-                "usage: hephaestus <ping|run|rootfs|vz-boot|vz-exec|vz-sh|vz-snapshot|vz-warm|pool>"
-            );
+            eprintln!("{TOP_HELP}");
             ExitCode::from(2)
         }
         None => {
-            eprintln!(
-                "usage: hephaestus <ping|run|rootfs|vz-boot|vz-exec|vz-sh|vz-snapshot|vz-warm|pool>"
-            );
+            eprintln!("{TOP_HELP}");
             ExitCode::from(2)
         }
     }
 }
 
+const TOP_HELP: &str = "\
+Run Linux microVMs on Apple Silicon.
+
+Usage: hephaestus <COMMAND>
+
+Commands:
+  ping         Test the Rust/Swift bridge
+  run          Run a process using the Containerization path
+  rootfs       Build an ext4 root filesystem from a tar archive
+  vz-boot      Boot a VM through Virtualization.framework directly
+  vz-exec      Run a command through the direct-VZ guest agent
+  vz-sh        Open a direct-VZ guest shell
+  vz-snapshot  Save or restore stock guest state
+  vz-warm      Save or run an agent-ready VM snapshot
+  pool         Manage persistent warm-pool slots
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+Use `hephaestus <COMMAND> --help` for command-specific help.";
+
+const PING_HELP: &str = "\
+Test the Rust/Swift bridge.
+
+Usage: hephaestus ping
+
+Options:
+  -h, --help  Print help";
+
+fn help_text(args: &[String]) -> Option<&'static str> {
+    let first = args.first().map(String::as_str);
+    if matches!(first, Some("-h" | "--help")) {
+        return Some(TOP_HELP);
+    }
+
+    match first? {
+        "ping" if contains_help(&args[1..]) => Some(PING_HELP),
+        "run" if contains_help(&args[1..]) => Some(RUN_USAGE),
+        "rootfs" if contains_help(&args[1..]) => Some(ROOTFS_USAGE),
+        "vz-boot" if contains_help(&args[1..]) => Some(VZ_BOOT_USAGE),
+        "vz-exec" if contains_help(&args[1..]) => Some(VZ_EXEC_USAGE),
+        "vz-sh" if contains_help(&args[1..]) => Some(VZ_SH_USAGE),
+        "pool" => nested_help(
+            &args[1..],
+            POOL_USAGE,
+            &[
+                ("init", POOL_INIT_HELP),
+                ("run", POOL_RUN_HELP),
+                ("stats", POOL_STATS_HELP),
+                ("destroy", POOL_DESTROY_HELP),
+            ],
+        ),
+        "vz-warm" => nested_help(
+            &args[1..],
+            VZ_WARM_USAGE,
+            &[("save", VZ_WARM_SAVE_HELP), ("run", VZ_WARM_RUN_HELP)],
+        ),
+        "vz-snapshot" => nested_help(
+            &args[1..],
+            VZ_SNAP_USAGE,
+            &[
+                ("save", VZ_SNAP_SAVE_HELP),
+                ("restore", VZ_SNAP_RESTORE_HELP),
+            ],
+        ),
+        _ => None,
+    }
+}
+
+fn contains_help(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+}
+
+fn nested_help(
+    args: &[String],
+    group_help: &'static str,
+    commands: &[(&str, &'static str)],
+) -> Option<&'static str> {
+    let command = args.first().map(String::as_str);
+    if matches!(command, Some("-h" | "--help")) {
+        return Some(group_help);
+    }
+    if !contains_help(args.get(1..).unwrap_or_default()) {
+        return None;
+    }
+    commands
+        .iter()
+        .find_map(|(name, help)| (*name == command?).then_some(*help))
+        .or(Some(group_help))
+}
+
 const RUN_USAGE: &str = "\
-usage: hephaestus run \\
-    --id <id> \\
-    --kernel <path> \\
-    --initfs <path-to-ext4> \\
-    --rootfs <path-to-ext4> \\
-    [--cpus N] [--memory-mib N] [--cwd <path>] \\
-    [--network [--ip OCTET]] [--tty] \\
-    -- <argv...>";
+Run a guest process using Apple's Containerization path.
+
+Usage: hephaestus run --kernel <PATH> --initfs <PATH> --rootfs <PATH> [OPTIONS] -- <ARGV>...
+
+Options:
+      --id <ID>              VM identifier [default: hephaestus-vm]
+      --kernel <PATH>        Guest kernel image
+      --initfs <PATH>        Containerization init filesystem
+      --rootfs <PATH>        Writable guest ext4 root filesystem
+      --cpus <N>             vCPU count [default: VZ default]
+      --memory-mib <N>       Guest memory in MiB [default: VZ default]
+      --cwd <PATH>           Guest working directory
+      --network              Attach VZ NAT networking
+      --ip <OCTET|ADDRESS>   Guest address in 192.168.64.0/24
+      --tty                  Attach an interactive terminal
+  -h, --help                 Print help";
 
 #[derive(Debug)]
 struct RunOptions {
@@ -319,8 +430,16 @@ fn run(opts: RunOptions) -> ExitCode {
 }
 
 const ROOTFS_USAGE: &str = "\
-usage: hephaestus rootfs --from-tar <path> --output <path.ext4> \\
-    [--size-mib N] [--compression auto|none|gzip|zstd]";
+Build an ext4 root filesystem from a tar archive.
+
+Usage: hephaestus rootfs --from-tar <PATH> --output <PATH> [OPTIONS]
+
+Options:
+      --from-tar <PATH>       Input tar archive
+      --output <PATH>         Output ext4 image
+      --size-mib <N>          Filesystem size in MiB [default: 512]
+      --compression <FORMAT>  none, gzip, or zstd [default: auto-detect]
+  -h, --help                  Print help";
 
 #[derive(Debug)]
 struct RootfsOptions {
@@ -417,11 +536,18 @@ fn rootfs(opts: RootfsOptions) -> ExitCode {
 // =============================================================================
 
 const VZ_BOOT_USAGE: &str = "\
-usage: hephaestus vz-boot \\
-    --kernel <path> \\
-    --rootfs <path> \\
-    --log <output-path> \\
-    [--cpus N] [--memory-mib N] [--run-seconds N]";
+Boot a VM directly through Virtualization.framework.
+
+Usage: hephaestus vz-boot --kernel <PATH> --rootfs <PATH> --log <PATH> [OPTIONS]
+
+Options:
+      --kernel <PATH>       Guest kernel image
+      --rootfs <PATH>       Guest ext4 root filesystem
+      --log <PATH>          Guest serial log
+      --cpus <N>            vCPU count [default: VZ default]
+      --memory-mib <N>      Guest memory in MiB [default: VZ default]
+      --run-seconds <N>     Time to run before stopping [default: bridge default]
+  -h, --help                Print help";
 
 #[derive(Debug)]
 struct VzBootOptions {
@@ -535,20 +661,21 @@ fn vz_boot_cmd(opts: VzBootOptions) -> ExitCode {
 // =============================================================================
 
 const VZ_EXEC_USAGE: &str = "\
-usage: hephaestus vz-exec \\
-    --kernel <path> --rootfs <path> --cmd <shell-command> \\
-    [--initramfs <path>] [--log <path>] \\
-    [--cpus N] [--memory-mib N] [--timeout-seconds N] \\
-    [--stdin]
+Run a command through the direct-VZ guest agent.
 
---initramfs defaults to `./build/agent.cpio.gz`. Build it with
-    scripts/build-agent.sh  (requires rustup + the
-    aarch64-unknown-linux-musl target, and zig ≥ 0.15).
+Usage: hephaestus vz-exec --kernel <PATH> --rootfs <PATH> --cmd <COMMAND> [OPTIONS]
 
---stdin forwards the host's stdin to the guest command's stdin. When
-    set, `--cmd` is wrapped with a sentinel so the agent knows to pump
-    vsock bytes into the child's stdin instead of treating the channel
-    as one-shot. Lets `vz-exec` cover interactive command delivery too.";
+Options:
+      --kernel <PATH>          Guest kernel image
+      --rootfs <PATH>          Guest ext4 root filesystem
+      --cmd <COMMAND>          Shell command to run in the guest
+      --initramfs <PATH>       Agent initramfs [default: build/agent.cpio.gz]
+      --log <PATH>             Guest serial log
+      --cpus <N>               vCPU count [default: VZ default]
+      --memory-mib <N>         Guest memory in MiB [default: VZ default]
+      --timeout-seconds <N>    Agent connection timeout [default: bridge default]
+      --stdin                  Forward host stdin to the guest command
+  -h, --help                   Print help";
 
 #[derive(Debug)]
 struct VzExecOptions {
@@ -684,17 +811,70 @@ fn vz_exec_cmd(opts: VzExecOptions) -> ExitCode {
 // =============================================================================
 
 const POOL_USAGE: &str = "\
-usage:
-  hephaestus pool init --dir D --kernel K --rootfs R \\
-      [--size N] [--initramfs build/agent.cpio.gz] \\
-      [--cpus N] [--memory-mib N]
-  hephaestus pool run --dir D --cmd CMD
-  hephaestus pool stats --dir D
-  hephaestus pool destroy --dir D
+Manage a disk-persistent pool of pre-warmed VMs.
 
-`pool run` never blocks; when every slot is busy it exits non-zero so
-the caller owns retry/queueing. Set HEPHAESTUS_POOL_LOG=PATH to capture
-guest serial output for a run.";
+Usage: hephaestus pool <COMMAND>
+
+Commands:
+  init     Create and warm a pool
+  run      Claim a slot and run a guest command
+  stats    Show ready and busy slot counts
+  destroy  Remove a pool
+
+Options:
+  -h, --help  Print help
+
+Use `hephaestus pool <COMMAND> --help` for command-specific help.";
+
+const POOL_INIT_HELP: &str = "\
+Create and warm a persistent VM pool.
+
+Usage: hephaestus pool init --dir <DIR> --kernel <PATH> --rootfs <PATH> [OPTIONS]
+
+Required:
+      --dir <DIR>              Pool directory
+      --kernel <PATH>          Guest kernel image
+      --rootfs <PATH>          Guest ext4 root filesystem
+
+Options:
+      --initramfs <PATH>       Agent initramfs [default: build/agent.cpio.gz]
+      --size <N>               Number of slots [default: 4]
+      --cpus <N>               vCPU count [default: VZ default]
+      --memory-mib <N>         Guest memory in MiB [default: VZ default]
+      --stock-init             Boot the rootfs init instead of the guest agent
+      --settle-seconds <N>     Stock-init delay before save [default: 3]
+  -h, --help                   Print help";
+
+const POOL_RUN_HELP: &str = "\
+Claim an agent-flavor pool slot and run a guest command.
+
+Usage: hephaestus pool run --dir <DIR> --cmd <COMMAND>
+
+Options:
+      --dir <DIR>      Pool directory
+      --cmd <COMMAND>  Shell command to run in the guest
+  -h, --help           Print help
+
+Returns status 75 when every slot is busy. Set HEPHAESTUS_POOL_LOG=<PATH>
+to capture guest serial output.";
+
+const POOL_STATS_HELP: &str = "\
+Show ready and busy pool slot counts.
+
+Usage: hephaestus pool stats --dir <DIR>
+
+Options:
+      --dir <DIR>  Pool directory
+  -h, --help       Print help";
+
+const POOL_DESTROY_HELP: &str = "\
+Remove a persistent VM pool.
+
+Usage: hephaestus pool destroy --dir <DIR>
+
+Options:
+      --dir <DIR>  Pool directory
+  -h, --help       Print help";
 
 fn pool_usage_err(msg: &str) -> ExitCode {
     eprintln!("hephaestus: {msg}");
@@ -968,19 +1148,51 @@ fn pool_destroy_cmd(dir: &Path) -> ExitCode {
 // =============================================================================
 
 const VZ_WARM_USAGE: &str = "\
-usage:
-  hephaestus vz-warm save \\
-      --kernel K --rootfs R --save PATH \\
-      [--initramfs build/agent.cpio.gz] [--log PATH]
-      [--cpus N] [--memory-mib N]
-  hephaestus vz-warm run \\
-      --kernel K --rootfs R --save PATH --cmd CMD \\
-      [--initramfs build/agent.cpio.gz] [--log PATH]
-      [--cpus N] [--memory-mib N]
+Save or run an agent-ready VM snapshot.
 
-The config at `run` time MUST structurally match what was used at `save`
-time (same kernel, same initramfs, same cpu/memory counts) — the sibling
-.machineid file pins the VZ machine identifier for you.";
+Usage: hephaestus vz-warm <COMMAND>
+
+Commands:
+  save  Boot the agent and save it while ready for a command
+  run   Restore an agent-ready save and run a command
+
+Options:
+  -h, --help  Print help
+
+Use `hephaestus vz-warm <COMMAND> --help` for command-specific help.";
+
+const VZ_WARM_SAVE_HELP: &str = "\
+Boot the guest agent and save the VM while it is ready for a command.
+
+Usage: hephaestus vz-warm save --kernel <PATH> --rootfs <PATH> --save <PATH> [OPTIONS]
+
+Options:
+      --kernel <PATH>       Guest kernel image
+      --rootfs <PATH>       Guest ext4 root filesystem
+      --save <PATH>         Output VZ save file
+      --initramfs <PATH>    Agent initramfs [default: build/agent.cpio.gz]
+      --log <PATH>          Guest serial log
+      --cpus <N>            vCPU count [default: VZ default]
+      --memory-mib <N>      Guest memory in MiB [default: VZ default]
+  -h, --help                Print help";
+
+const VZ_WARM_RUN_HELP: &str = "\
+Restore an agent-ready VM and run a command.
+
+Usage: hephaestus vz-warm run --kernel <PATH> --rootfs <PATH> --save <PATH> --cmd <COMMAND> [OPTIONS]
+
+Options:
+      --kernel <PATH>       Guest kernel image
+      --rootfs <PATH>       Guest ext4 root filesystem
+      --save <PATH>         Existing VZ save file
+      --cmd <COMMAND>       Shell command to run in the guest
+      --initramfs <PATH>    Agent initramfs [default: build/agent.cpio.gz]
+      --log <PATH>          Guest serial log
+      --cpus <N>            vCPU count [default: VZ default]
+      --memory-mib <N>      Guest memory in MiB [default: VZ default]
+  -h, --help                Print help
+
+Kernel, rootfs, initramfs, CPU, and memory configuration must match the save.";
 
 #[derive(Debug)]
 struct VzWarmOptions {
@@ -1123,9 +1335,17 @@ fn vz_warm_run_cmd(opts: VzWarmOptions) -> ExitCode {
 // =============================================================================
 
 const VZ_SH_USAGE: &str = "\
-usage: hephaestus vz-sh \\
-    --kernel <path> --rootfs <path> \\
-    [--cpus N] [--memory-mib N] [--timeout-seconds N]";
+Open an interactive shell through the direct-VZ path.
+
+Usage: hephaestus vz-sh --kernel <PATH> --rootfs <PATH> [OPTIONS]
+
+Options:
+      --kernel <PATH>          Guest kernel image
+      --rootfs <PATH>          Guest ext4 root filesystem
+      --cpus <N>               vCPU count [default: VZ default]
+      --memory-mib <N>         Guest memory in MiB [default: VZ default]
+      --timeout-seconds <N>    Shell connection timeout [default: bridge default]
+  -h, --help                   Print help";
 
 #[derive(Debug)]
 struct VzShOptions {
@@ -1202,13 +1422,48 @@ fn vz_sh_cmd(opts: VzShOptions) -> ExitCode {
 // =============================================================================
 
 const VZ_SNAP_USAGE: &str = "\
-usage:
-  hephaestus vz-snapshot save \\
-      --kernel <path> --rootfs <path> --log <path> --save <path> \\
-      [--cpus N] [--memory-mib N] [--settle-seconds N]
-  hephaestus vz-snapshot restore \\
-      --kernel <path> --rootfs <path> --log <path> --save <path> \\
-      [--cpus N] [--memory-mib N] [--run-seconds N]";
+Save or restore stock guest state.
+
+Usage: hephaestus vz-snapshot <COMMAND>
+
+Commands:
+  save     Boot and save a stock guest
+  restore  Restore a stock guest save
+
+Options:
+  -h, --help  Print help
+
+Use `hephaestus vz-snapshot <COMMAND> --help` for command-specific help.";
+
+const VZ_SNAP_SAVE_HELP: &str = "\
+Boot and save a stock guest.
+
+Usage: hephaestus vz-snapshot save --kernel <PATH> --rootfs <PATH> --log <PATH> --save <PATH> [OPTIONS]
+
+Options:
+      --kernel <PATH>          Guest kernel image
+      --rootfs <PATH>          Guest ext4 root filesystem
+      --log <PATH>             Guest serial log
+      --save <PATH>            Output VZ save file
+      --cpus <N>               vCPU count [default: VZ default]
+      --memory-mib <N>         Guest memory in MiB [default: VZ default]
+      --settle-seconds <N>     Delay before save [default: 3]
+  -h, --help                   Print help";
+
+const VZ_SNAP_RESTORE_HELP: &str = "\
+Restore a stock guest save.
+
+Usage: hephaestus vz-snapshot restore --kernel <PATH> --rootfs <PATH> --log <PATH> --save <PATH> [OPTIONS]
+
+Options:
+      --kernel <PATH>       Guest kernel image
+      --rootfs <PATH>       Guest ext4 root filesystem
+      --log <PATH>          Guest serial log
+      --save <PATH>         Existing VZ save file
+      --cpus <N>            vCPU count [default: VZ default]
+      --memory-mib <N>      Guest memory in MiB [default: VZ default]
+      --run-seconds <N>     Time to run after restore [default: 3]
+  -h, --help                Print help";
 
 #[derive(Debug)]
 struct VzSnapOptions {
@@ -1357,5 +1612,50 @@ impl StdioSink for TerminalSink {
         let mut err = std::io::stderr().lock();
         let _ = err.write_all(bytes);
         let _ = err.flush();
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn top_level_help_supports_short_and_long_flags() {
+        assert_eq!(help_text(&args(&["--help"])), Some(TOP_HELP));
+        assert_eq!(help_text(&args(&["-h"])), Some(TOP_HELP));
+    }
+
+    #[test]
+    fn nested_help_selects_the_leaf_command() {
+        assert_eq!(
+            help_text(&args(&["pool", "init", "--help"])),
+            Some(POOL_INIT_HELP)
+        );
+        assert_eq!(
+            help_text(&args(&["vz-warm", "run", "-h"])),
+            Some(VZ_WARM_RUN_HELP)
+        );
+        assert_eq!(
+            help_text(&args(&["vz-snapshot", "restore", "--help"])),
+            Some(VZ_SNAP_RESTORE_HELP)
+        );
+    }
+
+    #[test]
+    fn group_help_and_flat_command_help_are_available() {
+        assert_eq!(help_text(&args(&["pool", "--help"])), Some(POOL_USAGE));
+        assert_eq!(
+            help_text(&args(&["vz-exec", "--help"])),
+            Some(VZ_EXEC_USAGE)
+        );
+    }
+
+    #[test]
+    fn run_does_not_consume_guest_help_after_argument_separator() {
+        assert_eq!(help_text(&args(&["run", "--", "--help"])), None);
     }
 }
