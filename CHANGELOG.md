@@ -6,6 +6,8 @@ numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0-alpha.1] — 2026-07-12
+
 ### Added
 
 - **Conventional nested CLI help.** `hephaestus`, every top-level command, and
@@ -158,5 +160,6 @@ apple/containerization's `LinuxContainer`; `hephaestus rootfs` builds
 ext4 block devices from tar archives; `--network` uses VZ NAT,
 `--tty` wires a pty.
 
-[Unreleased]: https://github.com/hephaestus-vm/hephaestus/compare/v0.3.0-alpha.1...HEAD
+[Unreleased]: https://github.com/hephaestus-vm/hephaestus/compare/v0.4.0-alpha.1...HEAD
+[0.4.0-alpha.1]: https://github.com/hephaestus-vm/hephaestus/releases/tag/v0.4.0-alpha.1
 [0.3.0-alpha.1]: https://github.com/hephaestus-vm/hephaestus/releases/tag/v0.3.0-alpha.1
