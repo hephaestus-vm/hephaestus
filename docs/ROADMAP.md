@@ -28,9 +28,9 @@ milestones below are that list, highest leverage first.
 | :-- | :-- |
 | M1a — NAT networking on the HTTP path | ✅ Done |
 | M2 — device breadth (data drives, entropy, SendCtrlAltDel, balloon) | ✅ Done |
-| M3 — metrics fidelity & operability | ▶ In progress |
+| M3 — metrics fidelity & operability | ✅ Done (rate limiters deferred) |
 | M1b — MMDS over the guest NIC (vmnet, restricted entitlement) | ⬜ Not started |
-| M4 — multi-tenant / jailer productionization | ⬜ Not started |
+| M4 — multi-tenant / jailer productionization | ▶ In progress |
 
 ---
 
@@ -83,6 +83,12 @@ reuse the vsock command channel (`hephaestus-agent` runs arbitrary
 `scripts/fc-compat-vsock-e2e.sh`.
 
 ### M1b — MMDS over the guest NIC (restricted entitlement, dependent)
+
+> **Environment prerequisite:** M1b needs the restricted
+> `com.apple.vm.networking` entitlement. See [DEV_ENV.md](DEV_ENV.md) for the
+> feasibility probe (`just probe-vmnet`) and the provisioning-profile setup —
+> on the current machine the probe reports `Killed: 9` (blocked until a
+> profile is installed).
 
 Make stock images reach `169.254.169.254` **without** our agent shim.
 This is *not* unblocked by NAT: VZ's NAT is a black box we can't inject
@@ -150,20 +156,21 @@ target shrinks resident memory).
 
 ---
 
-## Milestone 3 — Fidelity & operability — ▶ In progress
+## Milestone 3 — Fidelity & operability — ✅ Done
 
-- **Real metrics counters** *(current focus)* — today most
-  `flush_metrics` fields are hardcoded `0` and `instance_info_count` is
-  fed *all* GETs. Track the per-endpoint counts the shape advertises
-  (per-method + per-endpoint), and label them correctly. Also stop
-  reopening the metrics file on every request (hold the handle; flush on
-  timer + lifecycle).
-- **Rate limiters** — `drive` / `net` `rate_limiter` are accepted-and-
-  ignored. VZ has no token-bucket knob; either approximate in the vsock/
-  data path or keep documented-noop. *Likely defer — low value, high
-  effort on VZ.*
-- Close the smaller review nits (guest-agent read timeout, Swift
-  `errno`-after-close, `ExitFlagBox` race, script hygiene).
+- **Real metrics counters** — done. `ApiCounters` classifies each
+  request by `(method, path)` so every `*_api_requests.*` field is real;
+  device/hypervisor counters with no VZ equivalent stay zero. The metrics
+  sink handle is held open (no per-request reopen). Locked in by the
+  firectl-harness (asserts counters are non-zero).
+- **Review nits** — done: guest-agent handshake read timeout (a stalled
+  probe no longer wedges the serial accept loop), Swift `errno`-before-
+  `close`, `ExitFlagBox` lock-guarded test-and-set, and the
+  snapshot-recipe EXIT-trap unbound-var leak.
+- **Rate limiters** — *deferred, documented-noop.* `drive` / `net`
+  `rate_limiter` are accepted and ignored; VZ exposes no token-bucket
+  knob, so this is low value / high effort. Revisit only if a data-path
+  shaper becomes worthwhile.
 
 ---
 
@@ -172,7 +179,10 @@ target shrinks resident memory).
 Separate track: no new API surface, but it's what lets us drop the
 "don't run untrusted guests" caveat. Builds on the sandbox hardening
 just landed (`--id` validation, private work-root, least-privilege pool
-grant).
+grant). **Done:** process-group ownership + signal forwarding, and
+`--rlimit-*` resource caps on the daemon (`just jailer-rlimit-check`).
+**Remaining:** uid/gid drop (needs a service user + `sudo` to verify) and a
+launchd supervisor. See [DEV_ENV.md](DEV_ENV.md) for the setup.
 
 - Finish `JAILER_MMDS_PLAN.md`: uid/gid drop, per-VM resource limits,
   launchd/process-group ownership so a killed jailer reaps its daemon
@@ -187,8 +197,9 @@ grant).
 
 1. ~~**M1a** (NAT networking)~~ — ✅ done.
 2. ~~**M2** (entropy, SendCtrlAltDel, data drives, balloon)~~ — ✅ done.
-3. **M3 metrics** — fidelity *(current)*.
-4. **M1b** (vmnet MMDS) + **M4** (jailer) — the entitlement/security track.
+3. ~~**M3** (metrics fidelity + review nits)~~ — ✅ done (rate limiters deferred).
+4. **M4** (jailer) — process ownership + isolation *(current)*.
+5. **M1b** (vmnet MMDS) — the restricted-entitlement track.
 
 Every milestone lands with: unit tests, a COMPAT.md status update, a
 firectl-harness case, and — for anything that boots — a real-VM e2e

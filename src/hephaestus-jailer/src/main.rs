@@ -12,27 +12,65 @@
 //! 3. Execs `hephaestus-firecracker` with `--sandbox-profile <profile>`
 //!    and `--api-sock <work_dir>/api.sock`. The child inherits the jail.
 //!
+//! The daemon is launched as its own process-group leader, and the jailer
+//! forwards `SIGTERM`/`SIGINT` to that group — so terminating the jailer
+//! reaps the daemon (and its VM) rather than orphaning it to launchd. A hard
+//! `SIGKILL` to the jailer can still orphan the daemon (macOS has no
+//! `PR_SET_PDEATHSIG`); a launchd-owned supervisor is the eventual fix.
+//!
 //! What this is NOT (yet):
 //! - Not a launchd job. The user runs `hephaestus-jailer` directly; the
 //!   child runs as a sibling process under the sandbox. A later iteration
 //!   can wrap this in a launchd plist or a longer-lived supervisor that
 //!   owns N VMs.
-//! - Not a full Firecracker jailer replacement. No uid/gid drop, no
-//!   chroot, no cgroup pinning. The sandbox profile is the only isolation
-//!   boundary today; macOS sandbox profiles are file/network-scoped, not
-//!   process-scoped.
+//! - Not a full Firecracker jailer replacement yet. Isolation today is the
+//!   sandbox profile (file/network-scoped) plus optional `--rlimit-*` resource
+//!   caps on the daemon. Still missing: uid/gid drop and chroot (macOS has no
+//!   cgroups; per-VM cpu/memory caps are enforced by VZ itself).
 //! - Not entitlement-aware. The child still needs to be ad-hoc signed with
 //!   `com.apple.security.virtualization`; the jailer cannot grant that
 //!   for you. See `docs/JAILER_MMDS_PLAN.md` for the entitlement roadmap.
 
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use clap::Parser;
 use thiserror::Error;
 
 mod profile;
+
+/// Process-group id of the launched `hephaestus-firecracker` child (equal to
+/// its pid, since we make it a group leader). Read from a signal handler, so
+/// it lives in an atomic. `0` means "no child yet".
+static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+
+/// Forward a termination signal to the child's whole process group so the
+/// daemon (and the VM it owns) dies with the jailer instead of reparenting to
+/// launchd and leaking. Async-signal-safe: an atomic load + `kill(2)`.
+extern "C" fn forward_termination(_sig: libc::c_int) {
+    let pgid = CHILD_PGID.load(Ordering::SeqCst);
+    if pgid > 0 {
+        // SAFETY: kill(2) is async-signal-safe; negative pid targets the group.
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
+    }
+}
+
+/// Install `SIGTERM`/`SIGINT` forwarders. Best-effort — `SIGKILL` can't be
+/// caught, so a hard-killed jailer can still orphan its daemon (no macOS
+/// `PR_SET_PDEATHSIG` equivalent); the common graceful-kill path is covered.
+fn install_signal_forwarding() {
+    let handler = forward_termination as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: registering a signal handler; the handler is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "hephaestus-jailer", version)]
@@ -80,6 +118,21 @@ struct Args {
     /// allowlist.
     #[arg(long)]
     deny_probe: Option<PathBuf>,
+
+    /// Cap the daemon's open file descriptors (`RLIMIT_NOFILE`). Opt-in
+    /// hardening; unset leaves the inherited limit. Only lowers, so it needs
+    /// no privilege.
+    #[arg(long)]
+    rlimit_nofile: Option<u64>,
+
+    /// Cap the daemon's process/thread count (`RLIMIT_NPROC`). Opt-in.
+    #[arg(long)]
+    rlimit_nproc: Option<u64>,
+
+    /// Cap the size (bytes) of any file the daemon can create (`RLIMIT_FSIZE`).
+    /// Opt-in.
+    #[arg(long)]
+    rlimit_fsize: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -262,8 +315,10 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
     })
 }
 
-/// Build the `hephaestus-firecracker` command line from a prepared plan. Pure
-/// (no side effects, no exec) so a test can assert the args/env it produces.
+/// Build the `hephaestus-firecracker` command line from a prepared plan. No
+/// side effects at call time (a test can assert the args/env it produces); it
+/// does register a `pre_exec` hook that runs in the child at spawn to put it in
+/// its own process group.
 fn build_command(plan: &Plan, args: &Args) -> Command {
     let mut cmd = Command::new(&plan.binary);
     cmd.env("HEPHAESTUS_FC_WORK_DIR", &plan.work_dir);
@@ -276,7 +331,45 @@ fn build_command(plan: &Plan, args: &Args) -> Command {
     if let Some(probe) = args.deny_probe.as_deref() {
         cmd.arg("--sandbox-deny-probe").arg(probe);
     }
+    // Capture the (Copy) resource caps so the child closure is self-contained.
+    let nofile = args.rlimit_nofile;
+    let nproc = args.rlimit_nproc;
+    let fsize = args.rlimit_fsize;
+    // Run the daemon as its own process-group leader (so the jailer can signal
+    // the whole subtree on teardown) and apply any resource caps before exec.
+    // SAFETY: `setpgid`/`setrlimit` are async-signal-safe and touch no Rust
+    // heap state; the closure only reads captured Copy values.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            apply_rlimit(libc::RLIMIT_NOFILE, nofile)?;
+            apply_rlimit(libc::RLIMIT_NPROC, nproc)?;
+            apply_rlimit(libc::RLIMIT_FSIZE, fsize)?;
+            Ok(())
+        });
+    }
     cmd
+}
+
+/// Lower a resource limit (both soft and hard) to `value`, if set. Lowering is
+/// always permitted, so no privilege is required; raising above the current
+/// hard limit would need root and is not attempted here. Called from the
+/// child's `pre_exec`, so it must stay async-signal-safe (`setrlimit` is).
+fn apply_rlimit(resource: libc::c_int, value: Option<u64>) -> std::io::Result<()> {
+    let Some(v) = value else {
+        return Ok(());
+    };
+    let rl = libc::rlimit {
+        rlim_cur: v as libc::rlim_t,
+        rlim_max: v as libc::rlim_t,
+    };
+    // SAFETY: `rl` is fully initialized; setrlimit is async-signal-safe.
+    if unsafe { libc::setrlimit(resource, &rl) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn run(args: Args) -> Result<u8, JailerError> {
@@ -294,7 +387,16 @@ fn run(args: Args) -> Result<u8, JailerError> {
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let status = cmd.status().map_err(|source| JailerError::Exec {
+    // Spawn (not `status()`) so we can forward termination signals: the child
+    // is its own process-group leader, so a `SIGTERM`/`SIGINT` to the jailer
+    // is relayed to the whole daemon+VM subtree instead of orphaning it.
+    let mut child = cmd.spawn().map_err(|source| JailerError::Exec {
+        binary: plan.binary.clone(),
+        source,
+    })?;
+    CHILD_PGID.store(child.id().cast_signed(), Ordering::SeqCst);
+    install_signal_forwarding();
+    let status = child.wait().map_err(|source| JailerError::Exec {
         binary: plan.binary.clone(),
         source,
     })?;
@@ -433,6 +535,9 @@ mod tests {
             initramfs: None,
             pool_dir: None,
             deny_probe: None,
+            rlimit_nofile: None,
+            rlimit_nproc: None,
+            rlimit_fsize: None,
         }
     }
 
