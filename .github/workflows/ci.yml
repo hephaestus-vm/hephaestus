@@ -16,6 +16,25 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  pr-title:
+    name: conventional PR title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate squash-merge title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: python3 scripts/check-pr-title.py "$PR_TITLE"
+
+  version:
+    name: product version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: scripts/check-product-version.sh
+
   docs:
     name: documentation links
     runs-on: ubuntu-latest
