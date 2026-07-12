@@ -141,7 +141,7 @@ impl std::fmt::Debug for ClaimedSlot {
 /// snapshot's bootloader config is what the guest sees. The client's
 /// supplied cmdline can't take effect on a restored VM. Comparing it
 /// would just shrink the hit rate without changing semantics. See the
-/// "agent-init divergence" design note in `docs/hephaestus-progress.md`.
+/// "agent-init divergence" design note in `docs/guides/warm-pools.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolMatchSpec {
     pub kernel: PathBuf,

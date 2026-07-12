@@ -8,6 +8,9 @@ numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Conventional nested CLI help.** `hephaestus`, every top-level command, and
+  nested `pool`, `vz-warm`, and `vz-snapshot` commands now accept `-h` and
+  `--help`; `-V`/`--version` reports the CLI version.
 - **`vz-exec --stdin` forwards host stdin to the guest command.** The
   CLI wraps `--cmd` with a `__hephaestus_stdin__` sentinel; the guest
   agent strips it and pumps vsock bytes into the child's stdin. The
@@ -45,6 +48,13 @@ numbers follow [Semantic Versioning](https://semver.org/).
   programmatically. Not a launchd job, not a full Firecracker jailer
   replacement — no uid/gid drop, no chroot, no cgroup pinning. The
   sandbox profile is the only isolation boundary.
+
+### Changed
+
+- **User guides are binary-first.** Operator workflows now document
+  `hephaestus`, `hephaestus-firecracker`, and `hephaestus-jailer` commands
+  directly, with `just` recipes identified as source-tree shortcuts or test
+  harnesses.
 
 ### Fixed
 

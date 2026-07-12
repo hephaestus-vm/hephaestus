@@ -1,28 +1,37 @@
 # Firecracker API compatibility
 
-This is the long version of the
-[README's compat table](../README.md#firecracker-api-compat). Per-
-endpoint notes, known deviations, and deferred items.
+This is the canonical record of the Firecracker API version, endpoint
+support, known deviations, and regression coverage. The
+[README](../README.md#capabilities-and-limitations) contains only a summary.
 
-Legend:
+Status vocabulary:
 
-- ✓ **Full** — same wire shape, same semantics.
-- ⚠︎ **Partial** — wire shape accepted, semantics differ or are noop.
-- ✗ **Not supported** — endpoint returns `NotSupported` or 404.
-- `(not routed)` — hephaestus doesn't expose this endpoint yet.
+- **Supported** — compatible wire shape and semantics.
+- **Supported with differences** — the operation works, but documented
+  semantics differ.
+- **Accepted but ignored** — the wire shape is accepted for client
+  interoperability, but the setting has no effect.
+- **Unsupported** — the endpoint or option returns `NotSupported` or is not
+  routed.
+- **Not applicable** — the concept has no Virtualization.framework equivalent.
+
+The current wire target is **Firecracker 1.16.0-dev**, as reported by
+`GET /version`. A status applies only to the behavior described below; fields
+called out as ignored or unsupported are not covered by an endpoint's broader
+status.
 
 ## Core lifecycle
 
 ### `GET /`
 
-- **Status:** ✓
+- **Status:** **Supported**
 - Returns `InstanceInfo` with `app_name`, `id`, `state`,
   `vmm_version`. Required-field markers match upstream; the Go SDK's
   strict deserializer round-trips cleanly.
 
 ### `GET /machine-config`, `PUT /machine-config`, `PATCH /machine-config`
 
-- **Status:** ✓
+- **Status:** **Supported**
 - `vcpu_count` and `mem_size_mib` map to Swift defaults when unset
   (2 / 512 per VZ conventions). `vcpu_count` must be in `1..=32`
   (Firecracker's `MAX_SUPPORTED_VCPUS`); out-of-range values are
@@ -34,14 +43,14 @@ Legend:
 
 ### `PUT /boot-source`
 
-- **Status:** ✓
+- **Status:** **Supported**
 - `kernel_image_path`, `boot_args`, `initrd_path` honored. On pool
   restore, `boot_args` is ignored (VZ resumes from the cmdline
-  encoded at save time; see [ARCHITECTURE.md](ARCHITECTURE.md#match-key)).
+  encoded at save time; see [Warm pools](guides/warm-pools.md#http-api-integration)).
 
 ### `PUT /drives/{id}`, `PATCH /drives/{id}`
 
-- **Status:** ⚠︎ Partial
+- **Status:** **Supported with differences**
 - **Root + secondary drives supported.** The root device
   (`is_root_device: true`) boots as `/dev/vda`; additional drives
   (`is_root_device: false`) attach in insertion order as `/dev/vdb`,
@@ -66,7 +75,7 @@ Legend:
 
 ### `PUT /network-interfaces/{id}`, `PATCH /network-interfaces/{id}`
 
-- **Status:** ⚠︎ Partial — NIC attached, L3 config is the guest's job.
+- **Status:** **Supported with differences** — NIC attached, L3 config is the guest's job.
 - `PUT /network-interfaces/{id}` on the HTTP API path attaches a
   guest NIC backed by VZ's built-in NAT (`192.168.64.0/24`, gateway
   `.1`). NAT only needs the base `com.apple.security.virtualization`
@@ -89,7 +98,7 @@ Legend:
 
 ### `PUT /actions`
 
-- **Status:** ✓
+- **Status:** **Supported**
 - `action_type: "InstanceStart"` cold-boots/restores the VM.
 - `action_type: "FlushMetrics"` forces an immediate metrics JSON flush when
   `PUT /metrics` has configured a sink.
@@ -100,7 +109,7 @@ Legend:
 
 ### `PATCH /vm`
 
-- **Status:** ✓
+- **Status:** **Supported**
 - `{"state": "Paused"}` and `{"state": "Resumed"}` map to
   `VzVm::pause` / `VzVm::resume`. Enforces `Running ↔ Paused`
   transitions; idempotent. Bogus values rejected with serde's
@@ -110,7 +119,7 @@ Legend:
 
 ### `PUT /logger`
 
-- **Status:** ✓
+- **Status:** **Supported**
 - Opens `log_path` append-mode and emits Firecracker-style text records:
   `<timestamp> [<instance-id>:<thread>[:LEVEL][:origin:line]] <message>`.
   The backend honors `level`, `show_level`, `show_log_origin`, and a
@@ -120,7 +129,7 @@ Legend:
 
 ### `PUT /metrics`
 
-- **Status:** ⚠︎ Partial
+- **Status:** **Supported with differences**
 - Opens `metrics_path` append-mode (handle held for the process lifetime,
   not reopened per request) and writes newline-delimited JSON. Flushes
   happen at configure time, after each API request/lifecycle event, and
@@ -138,7 +147,7 @@ Legend:
 
 ### `GET /version`
 
-- **Status:** ✓
+- **Status:** **Supported**
 - Returns Firecracker's wire shape:
   `{"firecracker_version":"1.16.0-dev"}`. The value is a pinned
   compatibility target matching the vendored upstream API snapshot,
@@ -149,7 +158,7 @@ Legend:
 
 ### `PUT /snapshot/create`
 
-- **Status:** ✓ (with caveats)
+- **Status:** **Supported with differences**
 - Requires `Paused` state. Wire accepts `snapshot_path` +
   `mem_file_path`; hephaestus writes the full VZ save blob to
   `snapshot_path` and touches an empty stub at `mem_file_path`
@@ -166,7 +175,7 @@ Legend:
 
 ### `PUT /snapshot/load`
 
-- **Status:** ✓
+- **Status:** **Supported**
 - Requires `NotStarted` + all pre-boot config supplied (kernel,
   rootfs, vcpu_count, mem_size_mib, optional initrd). `resume_vm:
   true` (default) transitions to `Running`; `false` to `Paused`.
@@ -186,7 +195,7 @@ migration between hephaestus processes).
 ## Partial / unsupported device surfaces
 
 - **`PUT /mmds`, `GET /mmds`, `PATCH /mmds`, `PUT /mmds/config`** —
-  ⚠︎ Partial. hephaestus stores and returns arbitrary JSON, including a
+  **Supported with differences.** hephaestus stores and returns arbitrary JSON, including a
   recursive merge-patch-style `PATCH`, so orchestrators can configure
   metadata without hitting 404s. On direct-VZ long-running VMs, the current
   MMDS JSON is also served to guest-initiated vsock connections on reserved
@@ -207,7 +216,7 @@ migration between hephaestus processes).
   networking is wired through `VZVmnetNetworkDeviceAttachment` and a signed
   binary with `com.apple.vm.networking`; without that, arbitrary existing
   guest images should use the agent shim/vsock path.
-- **`PUT /vsock`** — ⚠︎ Partial. Accepts Firecracker's `guest_cid`,
+- **`PUT /vsock`** — **Supported with differences.** Accepts Firecracker's `guest_cid`,
   `uds_path`, and deprecated `vsock_id` fields pre-boot. hephaestus stores
   `guest_cid` for wire compatibility but VZ assigns the actual CID. After
   the VM starts, hephaestus binds `uds_path`; host clients connect and send
@@ -216,7 +225,7 @@ migration between hephaestus processes).
   hephaestus-agent by convention. Config-only CI validates the wire shape;
   `just fc-compat-vsock-e2e` validates the agent/MMDS path, the guest-side
   link-local MMDS shim, and a generic guest-port echo server.
-- **`PUT /balloon`, `PATCH /balloon`, `GET /balloon`** — ⚠︎ supported
+- **`PUT /balloon`, `PATCH /balloon`, `GET /balloon`** — **Supported with differences**
   via VZ's traditional memory balloon. `PUT` (pre-boot) configures the
   reclaim target; `PATCH` live-adjusts it on a running VM. hephaestus
   maps Firecracker's `amount_mib` (memory to reclaim) onto VZ's
@@ -230,7 +239,7 @@ migration between hephaestus processes).
   `GET /balloon/hinting/status`, `PATCH /balloon/hinting/stop`** —
   routed but return `NotSupported`; VZ exposes no balloon statistics or
   free-page hinting.
-- **`PUT /entropy`** — ✓ accepted (pre-boot). The direct-VZ config
+- **`PUT /entropy`** — **Supported** (pre-boot). The direct-VZ config
   always attaches a virtio-rng (`VZVirtioEntropyDeviceConfiguration`),
   so the guest always has an entropy source; the request is accepted
   and confirmed. Any `rate_limiter` is ignored (VZ exposes no rng rate

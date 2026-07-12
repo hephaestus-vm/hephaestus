@@ -7,18 +7,10 @@
 //! `hephaestus-vmm`). Request/response JSON shapes mirror upstream verbatim
 //! via the types in `hephaestus-fc-api`.
 //!
-//! Endpoints wired for v0.3 cold boot:
-//!   GET    /
-//!   GET    /machine-config
-//!   PUT    /machine-config
-//!   PATCH  /machine-config
-//!   PUT    /boot-source
-//!   PUT    /drives/{id}
-//!   PUT    /network-interfaces/{id}
-//!   PUT    /actions            (InstanceStart only)
-//!
-//! Everything else returns 400 with a Firecracker-compat error body until
-//! a client needs it.
+//! The implemented surface includes core lifecycle, devices, observability,
+//! snapshots, vsock, MMDS, and pause/resume. Unsupported VZ concepts return
+//! Firecracker-shaped errors. See `docs/firecracker-compatibility.md` for the
+//! canonical endpoint and field-level support matrix.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,7 +37,7 @@ struct Args {
     id: String,
     /// Optional warm-pool directory built by `hephaestus pool init`.
     /// When set, `InstanceStart` tries to restore from a matching slot
-    /// before falling back to cold boot. See `docs/hephaestus-progress.md`
+    /// before falling back to cold boot. See `docs/guides/warm-pools.md`
     /// for the agent-init divergence note.
     #[arg(long)]
     pool_dir: Option<PathBuf>,
@@ -66,7 +58,7 @@ struct Args {
     /// attachment that routes guest traffic to the host (e.g.
     /// `VZVmnetNetworkDeviceAttachment` + the `com.apple.vm.networking`
     /// entitlement) and a signed binary; bind fails with `EACCES` or
-    /// `EADDRNOTAVAIL` otherwise. See `docs/JAILER_MMDS_PLAN.md`.
+    /// `EADDRNOTAVAIL` otherwise. See `docs/guides/networking.md`.
     #[arg(long)]
     host_mmds: bool,
 }
@@ -151,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "hephaestus-firecracker: --host-mmds listener failed to bind ({err}); \
              this typically means the binary lacks the com.apple.vm.networking entitlement \
-             or the host has no interface on 169.254.169.254. See docs/JAILER_MMDS_PLAN.md."
+             or the host has no interface on 169.254.169.254. See docs/guides/networking.md."
         );
         return Err(err.to_string().into());
     }

@@ -1,261 +1,198 @@
-# hephaestus
+# Hephaestus
 
-> **Firecracker for macOS.** A drop-in replacement for the Firecracker
-> HTTP API on Apple Silicon, built on Apple's Virtualization.framework.
+**Firecracker-compatible microVMs on Apple Silicon.**
+
+Hephaestus implements the Firecracker HTTP API on top of Apple's
+Virtualization.framework. Existing Firecracker clients can configure and run
+Linux microVMs on macOS by pointing at a Hephaestus UNIX socket.
 
 [![CI](https://github.com/hephaestus-vm/hephaestus/actions/workflows/ci.yml/badge.svg)](https://github.com/hephaestus-vm/hephaestus/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![macOS 26+](https://img.shields.io/badge/macOS-26%2B-success)](https://www.apple.com/macos/)
 
----
+> [!WARNING]
+> Hephaestus is alpha software for trusted workloads. Public interfaces may
+> change before v1.0, and untrusted or mutually untrusted guests are not yet
+> supported. Read the [security policy](SECURITY.md) before deployment.
 
-Orchestrators like [Kata], [firectl], and fly-machines-style schedulers
-speak one wire protocol — [Firecracker]'s. That protocol only runs on
-Linux/KVM. If you want the same orchestration experience on an M-series
-Mac, your options have been "run Firecracker in a Linux VM" or "don't."
+## Why Hephaestus?
 
-**hephaestus** is a third option. It speaks Firecracker's HTTP wire
-shapes verbatim (the [Go SDK] accepts it without modification) but
-substitutes Apple's Virtualization.framework for KVM underneath. Your
-existing orchestrator code points at a different UNIX socket and keeps
-working.
+Firecracker's API is widely used by microVM orchestrators, but Firecracker
+itself requires Linux and KVM. Hephaestus preserves the control-plane model on
+an Apple Silicon Mac while replacing KVM with Virtualization.framework.
 
-> **Status: alpha.** The HTTP API, CLI, warm pool, snapshots, and
-> experimental jailer supervisor work end-to-end. Multi-tenant hardening
-> is still incomplete, and there are no stability guarantees pre-v1.0.
-> Don't run untrusted guest code. See [Security](#security) and
-> [Status at a glance](#status-at-a-glance).
+| | Firecracker | Hephaestus |
+| :-- | :-- | :-- |
+| Host | Linux/KVM | macOS/Virtualization.framework |
+| Architectures | x86_64 and aarch64 | Apple Silicon |
+| Control plane | HTTP over a UNIX socket | Firecracker-compatible HTTP over a UNIX socket |
+| VM per process | Yes | Yes |
+| Snapshot format | Firecracker-specific | Virtualization.framework-specific |
+| Untrusted multi-tenancy | Firecracker jailer | Not currently supported |
 
-[Kata]: https://katacontainers.io/
-[firectl]: https://github.com/firecracker-microvm/firectl
-[Firecracker]: https://github.com/firecracker-microvm/firecracker
-[Go SDK]: https://github.com/firecracker-microvm/firecracker-go-sdk
+Compatibility applies to API wire shapes and supported behavior. Hephaestus is
+not a binary port, and snapshots cannot move between the two hypervisors. See
+[Firecracker compatibility](docs/firecracker-compatibility.md) for endpoint and
+field-level details.
 
-## Architecture
+## Getting started
 
-```mermaid
-flowchart TB
-  subgraph Clients[HTTP clients]
-    direction LR
-    A1[firectl]
-    A2[firecracker-go-sdk]
-    A3[Kata / fly-style]
-    A4[curl]
-  end
-  A1 & A2 & A3 & A4 --> B
-  B[hephaestus-firecracker<br/>UNIX socket · HTTP/1.1]
-  B --> C[VzBackend<br/>state machine · pool matcher]
-  F[hephaestus CLI<br/>run / vz-exec / pool / snapshot]
-  C --> D
-  F --> D
-  D[Apple Virtualization.framework]
-  D --> E[Linux guest VM]
+You need an Apple Silicon Mac running macOS 26 or later, Xcode 26, Rust, and
+[`apple/container`](https://github.com/apple/container). The source tree also
+uses `just` for artifact-discovery and test shortcuts.
+
+```console
+$ brew install rustup just container
+$ rustup-init
+$ container system start
+$ container run --rm docker.io/library/alpine:3.20 echo ready
+
+$ git clone https://github.com/hephaestus-vm/hephaestus
+$ cd hephaestus
+$ cargo build --workspace
+$ ./build/cargo_target/debug/hephaestus --help
+$ just hello
 ```
 
-Two entry points. `hephaestus-firecracker` is the HTTP API daemon —
-one VM per process, matching upstream's contract. `hephaestus` is a
-CLI for the cases where you don't want HTTP: boot a VM, exec one
-command, take a snapshot, warm a pool.
+The first `container run` populates the kernel and root filesystem artifacts.
+The `hephaestus` binary is the public CLI; `just hello` is a source-tree shortcut
+that discovers those artifacts, boots an Alpine Linux VM through the binary,
+prints `hello-from-hephaestus`, and exits.
 
-Both share a Rust↔Swift FFI layer that wraps `VZVirtualMachine`,
-`saveMachineStateTo:` / `restoreMachineStateFrom:`, and vsock. See
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full picture.
+For installation alternatives, artifact requirements, and troubleshooting, see
+[Getting started](docs/getting-started.md).
 
-## Quickstart
+## Use the Firecracker API
 
-### 1. The CLI warm-up
+Build the workspace and inspect the CLI:
 
-```bash
-# Install from source (Homebrew tap coming — see Installation)
-git clone https://github.com/hephaestus-vm/hephaestus
-cd hephaestus
-cargo build --release -p hephaestus-cli
-
-# Boot a Linux VM and run one command
-./build/cargo_target/release/hephaestus vz-exec \
-    --kernel  /path/to/vmlinuz \
-    --rootfs  /path/to/rootfs.ext4 \
-    --cmd     'uname -a'
+```console
+$ cargo build --workspace
+$ ./build/cargo_target/debug/hephaestus --help
 ```
 
-The VM boots, the command runs, the VM exits. ~300 ms cold start on
-an M-series.
+Then start one API process:
 
-### 2. The Firecracker pitch
-
-Same repo, different binary. Start the HTTP daemon:
-
-```bash
-./build/cargo_target/release/hephaestus-firecracker \
-    --api-sock /tmp/fc.sock \
-    --id       my-vm &
+```console
+$ ./build/cargo_target/debug/hephaestus-firecracker \
+    --api-sock /tmp/hephaestus.sock \
+    --id example
 ```
 
-Then talk to it exactly like Firecracker:
+In another terminal, configure it with Firecracker HTTP requests:
 
-```bash
-sock=/tmp/fc.sock
+```console
+$ curl --unix-socket /tmp/hephaestus.sock \
+    http://localhost/
 
-curl --unix-socket $sock -X PUT localhost/machine-config \
+$ curl --unix-socket /tmp/hephaestus.sock \
+    -X PUT http://localhost/machine-config \
     -H 'Content-Type: application/json' \
-    -d '{"vcpu_count": 2, "mem_size_mib": 512}'
-
-curl --unix-socket $sock -X PUT localhost/boot-source \
-    -H 'Content-Type: application/json' \
-    -d '{"kernel_image_path": "/path/to/vmlinuz"}'
-
-curl --unix-socket $sock -X PUT localhost/drives/rootfs \
-    -H 'Content-Type: application/json' \
-    -d '{"drive_id": "rootfs", "path_on_host": "/path/to/rootfs.ext4",
-         "is_root_device": true, "is_read_only": false}'
-
-curl --unix-socket $sock -X PUT localhost/actions \
-    -H 'Content-Type: application/json' \
-    -d '{"action_type": "InstanceStart"}'
+    -d '{"vcpu_count":2,"mem_size_mib":512}'
 ```
 
-VM is Running. And yes — the [firecracker-go-sdk][Go SDK] works
-unmodified; see [`compat/firectl-harness/`](compat/firectl-harness/)
-for a 250-line program that drives the full 14-call sequence through
-the real SDK.
+A complete boot requires a Linux kernel and ext4 root filesystem. Follow the
+[Firecracker API guide](docs/guides/firecracker-api.md), or run
+`just fc-compat` to exercise the full sequence with the real Firecracker Go
+SDK.
 
-## Status at a glance
+## How it works
 
-| Area                                    | Status                                      |
-| :-------------------------------------- | :------------------------------------------ |
-| Firecracker HTTP API                    | Alpha — 14/14 SDK calls green on macOS      |
-| CLI surface (`run` / `vz-exec` / `pool` / `snapshot`) | Working           |
-| Warm pool + snapshot endpoints          | Working (~235 ms restore, see [Performance](#performance)) |
-| Multi-tenant / untrusted guests         | **Not supported** — experimental jailer supervisor only |
-| Cross-tool snapshot interop with real Firecracker | Impossible — different hypervisor blob formats |
-| Public API stability                    | Breaking changes expected pre-v1.0          |
+```text
+Firecracker clients ── HTTP/1.1 over UDS ──> hephaestus-firecracker
+                                                     │
+hephaestus CLI ──────────────────────────────────────┤
+                                                     ▼
+                                      Virtualization.framework
+                                                     ▼
+                                                 Linux VM
+```
 
-## Firecracker API compat
+Hephaestus has two VM paths:
 
-Endpoint-level status. See [docs/COMPAT.md](docs/COMPAT.md) for
-per-endpoint notes and known deviations.
+- `hephaestus run` uses Apple's Containerization library for process-oriented
+  execution, terminal handling, and networking.
+- `hephaestus-firecracker` and the `vz-*` CLI commands use
+  Virtualization.framework directly, enabling snapshots, warm pools, and the
+  Firecracker lifecycle.
 
-| Endpoint                              | hephaestus | Notes                                      |
-| :------------------------------------ | :--------: | :----------------------------------------- |
-| `GET /`                               | ✓          | `InstanceInfo` round-trips through Go SDK   |
-| `GET/PUT/PATCH /machine-config`       | ✓          | CPU templates rejected on Apple Silicon     |
-| `PUT /boot-source`                    | ✓          | kernel + boot args + optional initrd       |
-| `PUT/PATCH /drives/{id}`              | ⚠︎         | Root + secondary drives (`/dev/vdb…`); `PATCH` pre-boot only |
-| `PUT /network-interfaces/{id}`        | ⚠︎         | VZ NAT NIC attached; `guest_mac` honored, L3 up to guest |
-| `PATCH /network-interfaces/{id}`      | ⚠︎         | Accept-noop (rate-limiter ignored)         |
-| `PUT /logger`                         | ✓          | Firecracker-style text logs + debug access |
-| `PUT /metrics`                        | ⚠︎         | Firecracker-style JSON; real per-endpoint API counts; device counters zero |
-| `PUT /actions` (`InstanceStart`, `FlushMetrics`, `SendCtrlAltDel`) | ✓ | Boot/restore, force metrics flush, or graceful guest stop |
-| `PUT /entropy`                        | ✓          | virtio-rng always attached; request confirmed |
-| `PUT/PATCH/GET /balloon`              | ⚠︎         | VZ traditional balloon; live target adjust; no stats |
-| `PATCH /vm`                           | ✓          | `Paused ↔ Resumed`                         |
-| `PUT /snapshot/create`                | ✓          | A+stub (single blob at `snapshot_path`)    |
-| `PUT /snapshot/load`                  | ✓          | Round-trip across process restart          |
-| `GET /version`                        | ✓          | Reports pinned Firecracker compat version  |
-| `GET/PUT/PATCH /mmds`, `PUT /mmds/config` | ⚠︎     | Stored JSON; guest vsock/link-local path GETs via agent shim |
-| `PUT /vsock`                         | ⚠︎         | Host UDS `CONNECT <port>` bridge after boot |
-| cpu-config / pmem / serial / hotplug memory / vm config / balloon stats | ✗ | Routed, return Firecracker-shaped errors |
+Both paths share a Rust-to-Swift bridge. The HTTP daemon runs one VM per process,
+matching Firecracker's process model. Read the [architecture](docs/design/architecture.md)
+for the component and state-machine details.
+
+## Capabilities and limitations
+
+| Area | Current state |
+| :-- | :-- |
+| Firecracker API | Core lifecycle and the 14-call Go SDK sequence pass |
+| Guest networking | Virtualization.framework NAT; guest configures L3 |
+| Snapshots | Save and restore between Hephaestus processes |
+| Warm pools | Agent and stock-init flavors supported |
+| MMDS | Control-plane API plus guest agent/vsock shim |
+| Cross-hypervisor snapshots | Unsupported by the underlying formats |
+| CPU templates, pmem, memory hotplug | Unsupported by Virtualization.framework |
+| Untrusted multi-tenancy | **Unsupported**; jailer remains experimental |
+| API stability | Breaking changes may occur before v1.0 |
+
+The canonical support matrix is
+[docs/firecracker-compatibility.md](docs/firecracker-compatibility.md).
 
 ## Performance
 
-Session-5 medians, 5 runs per path on an M-series, Alpine 3.20 guest,
-2 vCPU / 512 MiB. See [docs/perf.md](docs/perf.md) for methodology
-and how to reproduce.
+On the current M-series reference system with an Alpine 3.20 guest configured
+with 2 vCPUs and 512 MiB of memory:
 
-| phase (ms)                | agent pool | stock pool | snapshot load |
-| :------------------------ | ---------: | ---------: | ------------: |
-| `cp -c` clone              |        4.0 |        4.5 |           n/a |
-| config build              |       20.1 |       20.5 |          19.6 |
-| VM construct              |        0.3 |        1.5 |           0.3 |
-| **restoreMachineStateFrom** |  **228.9** |  **213.2** |     **214.5** |
-| resume                    |        0.2 |        0.2 |           0.2 |
-| **total**                 |  **253.0** |  **243.4** |     **234.7** |
+| Path | Median restore time |
+| :-- | --: |
+| Agent warm pool | 253.0 ms |
+| Stock-init warm pool | 243.4 ms |
+| Snapshot load | 234.7 ms |
 
-Restore is dominated (~90 %) by VZ's `restoreMachineStateFrom:`
-primitive. That's the floor on the path we control; anything faster
-would need a Framework-level change.
+Approximately 90% of restore time is spent inside Apple's
+`restoreMachineStateFrom:` primitive. See [Performance](docs/performance.md) for
+the methodology, phase breakdown, and reproduction commands.
 
-## Installation
+## Documentation
 
-All three paths build an ad-hoc signed binary. The virtualization
-entitlement is baked in via `hephaestus.entitlements` and applied by
-`scripts/link-and-sign.sh` during build.
+- [Documentation index](docs/README.md)
+- [Getting started](docs/getting-started.md)
+- [Firecracker compatibility](docs/firecracker-compatibility.md)
+- [CLI guide](docs/guides/cli.md)
+- [Firecracker API guide](docs/guides/firecracker-api.md)
+- [Networking and MMDS](docs/guides/networking.md)
+- [Snapshots](docs/guides/snapshots.md)
+- [Warm pools](docs/guides/warm-pools.md)
+- [Jailer](docs/guides/jailer.md)
+- [Architecture](docs/design/architecture.md)
+- [Contributor setup](docs/development/setup.md)
 
-### Homebrew
+## Releases
 
-Tap coming alongside the first non-alpha release. Until then, use the
-source install below.
-
-### Pre-built binaries
-
-GitHub Releases attach `hephaestus` and `hephaestus-firecracker`
-tarballs per tag. Because they're ad-hoc signed, macOS Gatekeeper will
-quarantine them on first run:
-
-```bash
-curl -LO https://github.com/hephaestus-vm/hephaestus/releases/download/v0.3.0-alpha.1/hephaestus-aarch64-apple-darwin.tar.gz
-tar xf hephaestus-aarch64-apple-darwin.tar.gz
-xattr -d com.apple.quarantine hephaestus hephaestus-firecracker
-./hephaestus ping
-```
-
-### From source
-
-```bash
-git clone https://github.com/hephaestus-vm/hephaestus
-cd hephaestus
-cargo build --release
-# Binaries land under build/cargo_target/release/
-```
-
-### Requirements
-
-- Apple Silicon Mac
-- macOS 26 (Tahoe) or later
-- Xcode 26 as the active developer directory (`xcode-select -p`)
-- Rust stable (rustup or Homebrew)
-- [`just`](https://github.com/casey/just) (optional, for bundled recipes)
-- [`apple/container`](https://github.com/apple/container)
-  (`brew install container`) — we reuse its cached kernel and rootfs
-  artifacts in several recipes
+Source archives and pre-built binaries are published on the
+[GitHub Releases](https://github.com/hephaestus-vm/hephaestus/releases) page.
+Hephaestus follows Semantic Versioning, with additional instability allowed
+while the major version is zero. See the [release policy](docs/project/release-policy.md)
+and [changelog](CHANGELOG.md).
 
 ## Contributing
 
-PRs welcome. Each commit needs a `Signed-off-by:` line (run
-`git commit -s`); no CLA. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, style, and review
-expectations. File an issue before starting a large feature so we can
-align on scope.
+Contributions are welcome. Every commit requires a Developer Certificate of
+Origin `Signed-off-by:` line; no CLA is required. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
 ## Security
 
-**hephaestus assumes trusted guest code.** The `hephaestus-jailer`
-supervisor can generate a per-VM deny-by-default macOS sandbox profile and
-launch `hephaestus-firecracker` under it, and `hephaestus-firecracker` still
-accepts an experimental `--sandbox-profile <file>` hook for custom profiles.
-The sandbox recipes (`just fc-compat-sandbox-config`, `just fc-compat-sandbox`,
-`just fc-compat-sandbox-vsock-e2e`, `just fc-compat-sandbox-snapshot`, and the
-sandbox pool recipes) exercise generated profiles across config-only,
-cold-boot, vsock/MMDS, snapshot, and warm-pool paths. This is not yet complete
-multi-tenant hardening: launchd supervision, uid/gid isolation, and host-network
-MMDS entitlements are still future work. Don't run untrusted code until those
-pieces are built.
-
-Please report vulnerabilities privately — see
-[SECURITY.md](SECURITY.md) for scope and the reporting address.
+Do not report vulnerabilities in a public issue. Follow the private reporting
+instructions in [SECURITY.md](SECURITY.md).
 
 ## Acknowledgments
 
-Built on [Firecracker][Firecracker] (wire types + API surface),
-[apple/containerization] (Swift VM primitives used by the
-`hephaestus run` path), [apple/container] (kernel + rootfs artifacts
-the recipes consume), and the [firecracker-go-sdk][Go SDK]
-(compatibility test harness). Full attribution lives in
-[NOTICE](NOTICE).
-
-[apple/containerization]: https://github.com/apple/containerization
-[apple/container]: https://github.com/apple/container
+Hephaestus builds on [Firecracker](https://github.com/firecracker-microvm/firecracker),
+[apple/containerization](https://github.com/apple/containerization),
+[apple/container](https://github.com/apple/container), and the
+[Firecracker Go SDK](https://github.com/firecracker-microvm/firecracker-go-sdk).
+Full attribution is in [NOTICE](NOTICE).
 
 ## License
 
-[Apache License 2.0](LICENSE).
+Licensed under the [Apache License 2.0](LICENSE).

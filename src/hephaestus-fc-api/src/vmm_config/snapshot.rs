@@ -7,7 +7,7 @@
 // `LoadSnapshotConfig` shape directly.
 //
 // Wire-compat divergence (the "A+stub" decision; see
-// `docs/hephaestus-progress.md`): `mem_file_path` is accepted but VZ's
+// `docs/firecracker-compatibility.md`): `mem_file_path` is accepted but VZ's
 // `saveMachineStateTo:` writes one combined blob, not separate state
 // and memory files. We honor `mem_file_path` only by touching an empty
 // stub file so existence checks pass; the real save lives at
