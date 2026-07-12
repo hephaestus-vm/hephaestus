@@ -16,6 +16,13 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  docs:
+    name: documentation links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 scripts/check-doc-links.py
+
   lint:
     name: fmt + clippy
     runs-on: macos-15

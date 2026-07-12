@@ -2,9 +2,10 @@
 Thanks for the PR. A few things before you hit submit:
 - Subject ≤ 79 chars (we count before merging).
 - Commits carry `Signed-off-by:` lines (run `git commit -s`).
-- `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`,
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   and `cargo test --workspace` all green locally.
-- If you touched HTTP wire types, `just fc-compat` passes.
+- If you touched HTTP wire types, `just fc-compat-config` passes.
+- User-visible behavior includes its documentation update.
 -->
 
 ## Problem
@@ -20,5 +21,8 @@ Thanks for the PR. A few things before you hit submit:
 - [ ] `cargo fmt --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace`
-- [ ] `just fc-compat` (if wire types touched)
+- [ ] `python3 scripts/check-doc-links.py`
+- [ ] `just fc-compat-config` (if wire types touched)
+- [ ] Relevant real-VM smoke (if execution behavior changed)
+- [ ] User-facing documentation updated (if behavior changed)
 - [ ] DCO sign-off present on every commit
