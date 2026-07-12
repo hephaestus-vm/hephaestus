@@ -394,7 +394,7 @@ fn run(args: Args) -> Result<u8, JailerError> {
         binary: plan.binary.clone(),
         source,
     })?;
-    CHILD_PGID.store(child.id() as i32, Ordering::SeqCst);
+    CHILD_PGID.store(child.id().cast_signed(), Ordering::SeqCst);
     install_signal_forwarding();
     let status = child.wait().map_err(|source| JailerError::Exec {
         binary: plan.binary.clone(),
