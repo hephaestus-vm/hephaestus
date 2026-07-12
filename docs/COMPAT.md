@@ -24,9 +24,12 @@ Legend:
 
 - **Status:** ✓
 - `vcpu_count` and `mem_size_mib` map to Swift defaults when unset
-  (2 / 512 per VZ conventions). `cpu_template` is accepted by the
-  serde wire layer but rejected with `NotSupported` when present —
-  Apple Silicon CPU feature control isn't client-configurable in VZ.
+  (2 / 512 per VZ conventions). `vcpu_count` must be in `1..=32`
+  (Firecracker's `MAX_SUPPORTED_VCPUS`); out-of-range values are
+  rejected with `InvalidConfig` like upstream. `cpu_template` is
+  accepted by the serde wire layer but rejected with `NotSupported`
+  when present — Apple Silicon CPU feature control isn't
+  client-configurable in VZ.
 - `PATCH` pre-boot only; post-boot returns `InvalidState`.
 
 ### `PUT /boot-source`
@@ -39,24 +42,50 @@ Legend:
 ### `PUT /drives/{id}`, `PATCH /drives/{id}`
 
 - **Status:** ⚠︎ Partial
-- `PUT` fully honored: `drive_id`, `path_on_host`, `is_root_device`,
-  `is_read_only`, `cache_type`, `io_engine`.
-- `PATCH` swaps `path_on_host` pre-boot only. VZ's
+- **Root + secondary drives supported.** The root device
+  (`is_root_device: true`) boots as `/dev/vda`; additional drives
+  (`is_root_device: false`) attach in insertion order as `/dev/vdb`,
+  `/dev/vdc`, … Re-`PUT` of an existing `drive_id` updates it in place.
+- Honored fields: `drive_id`, `path_on_host`, `is_root_device`, and
+  `is_read_only` (per-drive; a read-only drive is attached read-only,
+  so the guest cannot mutate it).
+- Accepted but **ignored**: `cache_type`, `io_engine`, `partuuid`,
+  `rate_limiter`. VZ's built-in block attachment doesn't expose these
+  knobs.
+- The warm pool serves single-rootfs VMs only, so configuring a
+  secondary drive skips the pool fast-path and cold-boots.
+- `PATCH` swaps `path_on_host` pre-boot only (by `drive_id`). VZ's
   `VZVirtioBlockDeviceConfiguration` attachments aren't hot-swappable
   the way Linux virtio-blk + io_uring is. Post-boot `PATCH` returns
   `InvalidState`. `firectl` and Kata both patch drives before
   `InstanceStart`, so pre-boot-only covers the real usage. If a
   client needs post-boot drive patching, stop-and-restart is the
   escape hatch.
+- Verified by a real-VM smoke: a secondary drive appears as
+  `/dev/vdb` in the guest.
 
 ### `PUT /network-interfaces/{id}`, `PATCH /network-interfaces/{id}`
 
-- **Status:** ⚠︎ Partial
-- Accepted + mostly noop. hephaestus attaches VZ's built-in NAT
-  (192.168.64.0/24) to every VM regardless of client config. We
-  don't honor MAC address, host tap name, or rate-limiter settings.
-- `PATCH` is an accept-noop so `firectl` and Kata don't trip on
-  rate-limiter updates.
+- **Status:** ⚠︎ Partial — NIC attached, L3 config is the guest's job.
+- `PUT /network-interfaces/{id}` on the HTTP API path attaches a
+  guest NIC backed by VZ's built-in NAT (`192.168.64.0/24`, gateway
+  `.1`). NAT only needs the base `com.apple.security.virtualization`
+  entitlement, so it works under ad-hoc signing. `guest_mac` is
+  honored (VZ assigns a random MAC when omitted).
+- Like Firecracker, hephaestus provides the *device*; the guest
+  configures L3 (DHCP / `ip=` boot arg / cloud-init). VZ NAT runs a
+  DHCP server, so a guest with a DHCP client gets a `192.168.64.0/24`
+  lease automatically.
+- **Ignored**: `host_dev_name` (VZ manages the host side), and
+  `rx_rate_limiter` / `tx_rate_limiter` (VZ exposes no I/O rate knob).
+- Guest-visible link-local MMDS (`169.254.169.254`) still rides the
+  `hephaestus-agent` shim, not the NAT NIC — VZ NAT is a black box we
+  can't inject an MMDS responder into. Reaching MMDS over the NIC
+  without the agent needs bridged `VZVmnet` + the restricted
+  `com.apple.vm.networking` entitlement (tracked in ROADMAP M1b).
+- `PATCH` is an accept-noop (VZ attachments aren't hot-swappable).
+- Verified by `just fc-compat-net-e2e` (boots with a NIC, confirms a
+  non-loopback netdev appears in the guest).
 
 ### `PUT /actions`
 
@@ -64,7 +93,10 @@ Legend:
 - `action_type: "InstanceStart"` cold-boots/restores the VM.
 - `action_type: "FlushMetrics"` forces an immediate metrics JSON flush when
   `PUT /metrics` has configured a sink.
-- `action_type: "SendCtrlAltDel"` returns `NotSupported`.
+- `action_type: "SendCtrlAltDel"` requests a graceful guest shutdown via
+  VZ `requestStop()` (ACPI-style stop). The guest powers off rather
+  than reboots — the closest VZ analog — and it's only valid while the
+  VM is `Running`, matching upstream.
 
 ### `PATCH /vm`
 
@@ -89,13 +121,17 @@ Legend:
 ### `PUT /metrics`
 
 - **Status:** ⚠︎ Partial
-- Opens `metrics_path` append-mode and writes newline-delimited JSON.
-  Flushes happen at configure time, after each API request/lifecycle event,
-  and from a 60s background timer (matching Firecracker's default cadence).
-  The shape includes Firecracker-compatible top-level groups such as
-  `api_server`, `get_api_requests`, `put_api_requests`, `patch_api_requests`,
-  `logger`, `vmm`, `vcpu`, and `seccomp`. Linux/KVM-only counters are emitted
-  as numeric zeros; macOS/hephaestus-specific counters live under the
+- Opens `metrics_path` append-mode (handle held for the process lifetime,
+  not reopened per request) and writes newline-delimited JSON. Flushes
+  happen at configure time, after each API request/lifecycle event, and
+  from a 60s background timer (matching Firecracker's default cadence).
+  The shape includes Firecracker-compatible top-level groups: `api_server`,
+  `get_api_requests`, `put_api_requests`, `patch_api_requests`, `logger`,
+  `vmm`, `vcpu`, and `seccomp`. The **`*_api_requests` counters are real**
+  — each served request is classified by `(method, path)` into the matching
+  per-endpoint counter. Device/hypervisor counters with no VZ equivalent
+  (`vmm.panic_count`, `vcpu.*`, `seccomp.num_faults`, `logger.missed_*`) are
+  emitted as zeros. macOS/hephaestus-specific counters live under the
   `hephaestus` object (`api_requests`, failures, pool hits/misses, snapshot
   loads). It is intentionally not byte-for-byte identical to Firecracker's
   full metrics set because most device counters do not exist in VZ.
@@ -180,12 +216,25 @@ migration between hephaestus processes).
   hephaestus-agent by convention. Config-only CI validates the wire shape;
   `just fc-compat-vsock-e2e` validates the agent/MMDS path, the guest-side
   link-local MMDS shim, and a generic guest-port echo server.
-- **`PUT /balloon`, `PATCH /balloon`, `GET /balloon`,
-  `GET/PATCH /balloon/statistics`, `PATCH /balloon/hinting/start`,
+- **`PUT /balloon`, `PATCH /balloon`, `GET /balloon`** — ⚠︎ supported
+  via VZ's traditional memory balloon. `PUT` (pre-boot) configures the
+  reclaim target; `PATCH` live-adjusts it on a running VM. hephaestus
+  maps Firecracker's `amount_mib` (memory to reclaim) onto VZ's
+  `targetVirtualMachineMemorySize` (memory the guest keeps), so a
+  reclaim of `amount_mib` targets `mem_size_mib - amount_mib`.
+  `amount_mib` must be `< mem_size_mib` (validated at boot). Actual
+  reclaim depends on the guest's virtio-balloon driver. `deflate_on_oom`
+  is accepted but managed by VZ; a non-zero `stats_polling_interval_s`
+  is rejected.
+- **`GET/PATCH /balloon/statistics`, `PATCH /balloon/hinting/start`,
   `GET /balloon/hinting/status`, `PATCH /balloon/hinting/stop`** —
-  routed but return `NotSupported`; VZ doesn't expose a balloon device.
-- **`PUT /entropy`** — routed but returns `NotSupported`; no
-  configurable virtio-rng device.
+  routed but return `NotSupported`; VZ exposes no balloon statistics or
+  free-page hinting.
+- **`PUT /entropy`** — ✓ accepted (pre-boot). The direct-VZ config
+  always attaches a virtio-rng (`VZVirtioEntropyDeviceConfiguration`),
+  so the guest always has an entropy source; the request is accepted
+  and confirmed. Any `rate_limiter` is ignored (VZ exposes no rng rate
+  knob).
 - **`PUT/PATCH /cpu-config`, CPU templates** — routed/rejected with
   `NotSupported`; Apple Silicon CPU templates are not configurable.
 - **`PUT /pmem/{id}`** — routed but returns `NotSupported`; VZ's direct

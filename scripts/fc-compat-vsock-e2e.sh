@@ -160,6 +160,10 @@ def echo_client(result):
     for _ in range(80):
         try:
             s = connect_with_retry(echo_port)
+            # Bound every recv: the guest halts the VM right after echoing, so
+            # a lost/short response must fail this attempt rather than park the
+            # thread in recv() forever (which would wedge interpreter shutdown).
+            s.settimeout(10)
             s.sendall(echo_token)
             data = b""
             while len(data) < len(echo_token):
@@ -184,7 +188,10 @@ for _ in range(80):
         command = connect_with_retry(1234)
         command.sendall(struct.pack("<I", len(cmd)) + cmd)
         echo_result = []
-        echo_thread = threading.Thread(target=echo_client, args=(echo_result,))
+        # daemon=True so a still-blocked echo attempt from an earlier retry
+        # can never keep the interpreter alive at shutdown — the test's verdict
+        # comes from echo_result + the join(timeout) below, not thread liveness.
+        echo_thread = threading.Thread(target=echo_client, args=(echo_result,), daemon=True)
         echo_thread.start()
 
         data = b""
@@ -208,6 +215,9 @@ for _ in range(80):
         print("generic guest-port vsock echo test exited 0")
         raise SystemExit(0)
     except Exception as exc:
+        # Log every failed attempt (not just the last) so a flake or a
+        # persistent failure both leave a diagnosable trail.
+        sys.stderr.write(f"vsock-e2e attempt failed: {type(exc).__name__}: {exc!r}\n")
         last = exc
         time.sleep(0.25)
 raise SystemExit(f"could not complete vsock e2e: {last}")

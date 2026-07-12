@@ -29,6 +29,12 @@ pub struct ProfileInputs<'a> {
     /// Read-only VM inputs. Typically the kernel image, initramfs,
     /// read-only rootfs, and any MMDS JSON file the client pre-staged.
     pub reads: Vec<&'a Path>,
+    /// Read-only directory subtrees. Typically the warm-pool base, whose
+    /// snapshot blob and pristine rootfs the daemon reads but must not be
+    /// able to overwrite (per-slot dirs are granted read/write via
+    /// [`Self::work_dirs`] instead). Must already exist — unlike `work_dirs`,
+    /// these are not created.
+    pub read_dirs: Vec<&'a Path>,
 }
 
 /// Generate the sandbox profile source. Caller is responsible for writing
@@ -60,6 +66,17 @@ pub fn generate(inputs: &ProfileInputs<'_>) -> Result<String, GenError> {
         out.push_str("\n;; Explicit read-only VM inputs.\n(allow file-read-data\n");
         for path in &inputs.reads {
             out.push_str(&format!("  {}\n", literal_form(path)?));
+        }
+        out.push_str(")\n");
+    }
+
+    if !inputs.read_dirs.is_empty() {
+        out.push_str(
+            "\n;; Read-only directory subtrees (e.g. warm-pool snapshot base).\n\
+             (allow file-read*\n",
+        );
+        for path in &inputs.read_dirs {
+            out.push_str(&format!("  {}\n", read_subpath_form(path)?));
         }
         out.push_str(")\n");
     }
@@ -103,6 +120,22 @@ fn subpath_form(path: &Path) -> Result<String, GenError> {
         path: path.to_path_buf(),
         source: e,
     })?;
+    let canonical = canonicalize(path).map_err(|e| GenError::Canonicalize {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(format!(
+        "(subpath \"{}\")",
+        scheme_escape(&canonical.to_string_lossy())
+    ))
+}
+
+/// `(subpath "<abs dir>")` for a read-only directory subtree. Unlike
+/// [`subpath_form`] this does *not* create the directory — read-only grants
+/// (e.g. the warm-pool base) must reference a path that already exists, so a
+/// missing pool surfaces as a clean canonicalize error instead of a silently
+/// emitted stale path.
+fn read_subpath_form(path: &Path) -> Result<String, GenError> {
     let canonical = canonicalize(path).map_err(|e| GenError::Canonicalize {
         path: path.to_path_buf(),
         source: e,

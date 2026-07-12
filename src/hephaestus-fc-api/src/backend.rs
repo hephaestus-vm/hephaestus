@@ -14,6 +14,7 @@
 //! endpoints are routed and return `VmmBackendError::NotSupported` so clients
 //! get Firecracker-shaped errors instead of 404s.
 
+use crate::vmm_config::balloon::{BalloonDeviceConfig, BalloonUpdateConfig};
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -126,6 +127,35 @@ pub trait VmmBackend {
 
     /// `PATCH /machine-config`
     fn patch_machine_config(&mut self, update: MachineConfigUpdate) -> Result<(), VmmBackendError>;
+
+    /// `PUT /entropy` — configure a virtio-rng device. Default impl is
+    /// `NotSupported` so backends opt in.
+    fn configure_entropy(&mut self) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("entropy".into()))
+    }
+
+    /// `PUT /balloon` — configure the memory balloon (pre-boot). Default impl
+    /// is `NotSupported` so backends opt in.
+    fn configure_balloon(&mut self, _cfg: BalloonDeviceConfig) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("balloon".into()))
+    }
+
+    /// `PATCH /balloon` — adjust the balloon reclaim target at runtime.
+    fn update_balloon(&mut self, _cfg: BalloonUpdateConfig) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("balloon".into()))
+    }
+
+    /// `GET /balloon` — return the configured balloon, or `NotSupported`
+    /// if none was configured.
+    fn get_balloon(&self) -> Result<BalloonDeviceConfig, VmmBackendError> {
+        Err(VmmBackendError::NotSupported("balloon".into()))
+    }
+
+    /// `PUT /actions` with `SendCtrlAltDel` — request a graceful guest
+    /// shutdown. Default impl is `NotSupported` so backends opt in.
+    fn send_ctrl_alt_del(&mut self) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported("SendCtrlAltDel".into()))
+    }
 
     /// `PUT /actions` with `InstanceStart` — boot the microVM.
     fn start_micro_vm(&mut self) -> Result<(), VmmBackendError>;

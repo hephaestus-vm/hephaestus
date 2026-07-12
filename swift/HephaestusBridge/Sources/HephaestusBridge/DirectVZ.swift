@@ -484,8 +484,9 @@ public func hb_vz_sh(
                 // The panic message follows PID 1 exiting; user has seen
                 // their shell end, and the kernel noise after isn't
                 // interesting output. Swallow it and signal shutdown.
-                exitBox.signalled = true
-                exitSem.signal()
+                if exitBox.signalOnce() {
+                    exitSem.signal()
+                }
             }
         }
 
@@ -526,8 +527,7 @@ public func hb_vz_sh(
             guard let vm = holder.vm else { return }
             observerBox.observation = vm.observe(\.state, options: [.new]) { vm, _ in
                 if vm.state == .stopped || vm.state == .error {
-                    if !exitBox.signalled {
-                        exitBox.signalled = true
+                    if exitBox.signalOnce() {
                         exitSem.signal()
                     }
                 }
@@ -561,8 +561,27 @@ private final class ObservationBox: @unchecked Sendable {
     var observation: NSKeyValueObservation?
 }
 
+/// Set once from either the serial-sniffer thread or the KVO observer thread,
+/// so access is lock-guarded. `signalOnce()` is an atomic test-and-set: it
+/// returns true exactly once (to the winner), which callers use to signal the
+/// exit semaphore a single time.
 private final class ExitFlagBox: @unchecked Sendable {
-    var signalled = false
+    private let lock = NSLock()
+    private var value = false
+
+    func signalOnce() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if value { return false }
+        value = true
+        return true
+    }
+
+    var signalled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
 }
 
 private final class ExitCodeBox: @unchecked Sendable {
@@ -646,6 +665,19 @@ public func hb_vz_exec(
             }
         }
 
+        // Tear the VM + serial pipes + observer down on every exit path.
+        // Previously this ran only on success, so a thrown error (agent
+        // connect timeout, short read) leaked the running VM and left the
+        // pipe readabilityHandlers firing guest output after we returned.
+        defer {
+            session.close()
+            _ = blockingStop(queue: queue, holder: holder)
+            queue.sync {
+                observerBox.observation?.invalidate()
+                observerBox.observation = nil
+            }
+        }
+
         try blockingStart(queue: queue, holder: holder)
 
         // Connect to the agent's vsock listener, send the command, read the
@@ -656,19 +688,13 @@ public func hb_vz_exec(
             queue: queue,
             command: command,
             forwardStdin: forwardStdin != 0,
-            stdinFd: FileHandle.standardInput.fileDescriptor
+            stdinFd: FileHandle.standardInput.fileDescriptor,
+            exitReadTimeoutSeconds: timeoutSeconds == 0 ? 30 : timeoutSeconds
         )
 
         // Agent halts after responding, so wait for the clean VZ shutdown.
         let timeout = DispatchTime.now() + .seconds(Int(timeoutSeconds == 0 ? 30 : timeoutSeconds))
         _ = stopSem.wait(timeout: timeout)
-
-        session.close()
-        _ = blockingStop(queue: queue, holder: holder)
-        queue.sync {
-            observerBox.observation?.invalidate()
-            observerBox.observation = nil
-        }
 
         outExitCode?.pointee = exitCode
         outErr?.pointee = nil
@@ -817,12 +843,15 @@ public func hb_vz_exec_snapshot_restore(
         let restoreElapsed = DispatchTime.now().uptimeNanoseconds - restoreStart.uptimeNanoseconds
         outRestoreNanos?.pointee = restoreElapsed
 
+        // The snapshot-restore FFI has no timeout argument; apply a generous
+        // backstop so a hung guest command still can't block the call forever.
         let exitCode = try sendCommandAndAwaitExit(
             holder: holder,
             queue: queue,
             command: command,
             forwardStdin: false,
-            stdinFd: -1
+            stdinFd: -1,
+            exitReadTimeoutSeconds: 300
         )
 
         // Give the agent a beat to halt the VM cleanly.
@@ -1028,6 +1057,8 @@ private enum VsockError: Error, CustomStringConvertible {
     case shortRead
     case connect(Error)
     case write(Error)
+    case read(Error)
+    case readTimedOut(seconds: UInt32)
     var description: String {
         switch self {
         case .noSocketDevice: return "VM has no virtio-vsock device configured"
@@ -1035,6 +1066,9 @@ private enum VsockError: Error, CustomStringConvertible {
         case .shortRead: return "short read on vsock exit-code response"
         case .connect(let e): return "vsock connect failed: \(e)"
         case .write(let e): return "vsock write failed: \(e)"
+        case .read(let e): return "vsock read failed: \(e)"
+        case .readTimedOut(let s):
+            return "timed out after \(s)s waiting for the guest command's exit code over vsock"
         }
     }
 }
@@ -1053,7 +1087,8 @@ private func sendCommandAndAwaitExit(
     queue: DispatchQueue,
     command: String,
     forwardStdin: Bool,
-    stdinFd: Int32
+    stdinFd: Int32,
+    exitReadTimeoutSeconds: UInt32
 ) throws -> Int32 {
     let connection = try connectToAgent(holder: holder, queue: queue)
     defer { connection.close() }
@@ -1092,10 +1127,18 @@ private func sendCommandAndAwaitExit(
         }
     }
 
-    // Response: i32 LE exit code.
+    // Response: i32 LE exit code. Bound the read so a guest command that
+    // hangs (and so never writes its exit code, and never EOFs the way a
+    // crash would) can't park this call forever — that would defeat the
+    // caller's `timeout_seconds`.
+    setRecvTimeout(fd: fd, seconds: exitReadTimeoutSeconds)
     var codeBytes = [UInt8](repeating: 0, count: 4)
-    try codeBytes.withUnsafeMutableBufferPointer { buf in
-        try readAll(fd: fd, into: UnsafeMutableRawBufferPointer(buf))
+    do {
+        try codeBytes.withUnsafeMutableBufferPointer { buf in
+            try readAll(fd: fd, into: UnsafeMutableRawBufferPointer(buf))
+        }
+    } catch VsockError.readTimedOut {
+        throw VsockError.readTimedOut(seconds: exitReadTimeoutSeconds)
     }
     let code = Int32(bitPattern:
         UInt32(codeBytes[0])
@@ -1227,20 +1270,43 @@ private final class MmdsSocketService: NSObject, VZVirtioSocketListenerDelegate,
         let fd = connection.fileDescriptor
         let fallbackBody = body
         DispatchQueue.global(qos: .utility).async { [weak self, weak connection] in
+            // Read to end-of-headers, not a single one-shot read: virtio-vsock
+            // gives no single-segment delivery guarantee, so the guest's
+            // request can arrive split across reads. A one-shot read that
+            // catches only the request line silently drops the Accept header —
+            // the difference between Firecracker's JSON and IMDS output
+            // formats. The receive timeout bounds a guest that stalls
+            // mid-request so this pool thread can't be pinned forever.
+            setRecvTimeout(fd: fd, seconds: 2)
+            let endOfHeaders = Data("\r\n\r\n".utf8)
+            var requestBytes = Data()
             var scratch = [UInt8](repeating: 0, count: 4096)
-            let n = scratch.withUnsafeMutableBufferPointer { buf in
-                read(fd, buf.baseAddress, buf.count)
+            while requestBytes.count < 8192, requestBytes.range(of: endOfHeaders) == nil {
+                let n = scratch.withUnsafeMutableBufferPointer { buf in
+                    read(fd, buf.baseAddress, buf.count)
+                }
+                if n < 0 && errno == EINTR { continue }
+                // EOF, error, or recv-timeout: parse whatever we have.
+                if n <= 0 { break }
+                requestBytes.append(contentsOf: scratch.prefix(n))
             }
-            let requestBytes = n > 0 ? Data(scratch.prefix(n)) : Data()
             let response = MmdsSocketService.response(
                 fallbackBody: fallbackBody,
                 requestBytes: requestBytes
             )
             let header = "HTTP/1.1 \(response.status)\r\nContent-Type: \(response.contentType)\r\nContent-Length: \(response.body.count)\r\nConnection: close\r\n\r\n"
-            _ = header.withCString { ptr in write(fd, ptr, strlen(ptr)) }
-            response.body.withUnsafeBytes { raw in
-                if let base = raw.baseAddress {
-                    _ = write(fd, base, raw.count)
+            var out = Data(header.utf8)
+            out.append(response.body)
+            // Full-write loop: a single write(2) may write short, which would
+            // truncate the JSON body the guest sees.
+            out.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                guard let base = raw.baseAddress else { return }
+                var offset = 0
+                while offset < raw.count {
+                    let n = write(fd, base.advanced(by: offset), raw.count - offset)
+                    if n < 0 && errno == EINTR { continue }
+                    if n <= 0 { break }
+                    offset += n
                 }
             }
             connection?.close()
@@ -1287,8 +1353,13 @@ private final class MmdsSocketService: NSObject, VZVirtioSocketListenerDelegate,
 
     private static func parseRequest(_ data: Data) -> MmdsHttpRequest? {
         guard let text = String(data: data, encoding: .utf8) else { return nil }
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map {
-            String($0).trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+        // Split with components(separatedBy:), NOT split(separator: "\n"):
+        // Swift treats "\r\n" as a single grapheme-cluster Character, so a
+        // Character-based split on "\n" never matches inside CRLF-delimited
+        // HTTP headers — the request parses as one giant line and every
+        // header (notably Accept) is silently dropped.
+        let lines = text.components(separatedBy: "\n").map {
+            $0.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
         }
         guard let requestLine = lines.first else { return nil }
         let parts = requestLine.split(separator: " ", omittingEmptySubsequences: true)
@@ -1377,13 +1448,33 @@ private func readAll(fd: Int32, into buf: UnsafeMutableRawBufferPointer) throws 
     while remaining > 0 {
         let n = read(fd, buf.baseAddress!.advanced(by: offset), remaining)
         if n < 0 {
-            throw VsockError.write(POSIXError(.init(rawValue: errno) ?? .EIO))
+            let err = errno
+            if err == EINTR { continue }
+            // With SO_RCVTIMEO set, a lapsed deadline surfaces as EAGAIN/
+            // EWOULDBLOCK — report it as a timeout so the caller's
+            // `timeout_seconds` is honored instead of blocking forever.
+            if err == EAGAIN || err == EWOULDBLOCK {
+                throw VsockError.readTimedOut(seconds: 0)
+            }
+            throw VsockError.read(POSIXError(.init(rawValue: err) ?? .EIO))
         }
         if n == 0 {
             throw VsockError.shortRead
         }
         offset += n
         remaining -= n
+    }
+}
+
+/// Best-effort receive timeout on a socket fd via `SO_RCVTIMEO`, so a blocked
+/// `read` (e.g. a guest command that hangs without ever writing its exit
+/// code) can't park the caller indefinitely. `seconds == 0` clears the
+/// timeout (blocking). Failures are ignored: the timeout is a backstop, not a
+/// correctness dependency.
+private func setRecvTimeout(fd: Int32, seconds: UInt32) {
+    var tv = timeval(tv_sec: Int(seconds), tv_usec: 0)
+    _ = withUnsafePointer(to: &tv) { ptr in
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, ptr, socklen_t(MemoryLayout<timeval>.size))
     }
 }
 
@@ -1436,6 +1527,23 @@ private final class VzVmHandle: @unchecked Sendable {
 /// Differs from `buildConfig` in that the caller supplies the command
 /// line verbatim (no kernel cmdline defaults baked in) and an optional
 /// initrd path.
+/// Decode the parallel `(paths, readonly)` FFI arrays into secondary drive
+/// specs. `count` elements are read from each; a null path entry is skipped.
+private func decodeExtraDrives(
+    count: Int,
+    paths: UnsafePointer<UnsafePointer<CChar>?>?,
+    readonly: UnsafePointer<Bool>?
+) -> [(url: URL, readOnly: Bool)] {
+    guard count > 0, let paths else { return [] }
+    var out: [(url: URL, readOnly: Bool)] = []
+    for i in 0..<count {
+        guard let p = paths[i] else { continue }
+        let ro = readonly?[i] ?? false
+        out.append((URL(fileURLWithPath: String(cString: p)), ro))
+    }
+    return out
+}
+
 private func buildLongRunningConfig(
     kernel: URL,
     rootfs: URL,
@@ -1444,7 +1552,11 @@ private func buildLongRunningConfig(
     machineIdURL: URL,
     cpuCount: Int,
     memoryBytes: UInt64,
-    commandLine: String
+    commandLine: String,
+    readOnly: Bool,
+    enableNetworking: Bool,
+    macAddress: String?,
+    extraDrives: [(url: URL, readOnly: Bool)]
 ) throws -> VZVirtualMachineConfiguration {
     let config = VZVirtualMachineConfiguration()
     config.cpuCount = cpuCount
@@ -1468,11 +1580,23 @@ private func buildLongRunningConfig(
     }
     config.bootLoader = bootloader
 
+    // Root device first (guest boots it as /dev/vda), then any secondary
+    // data drives in order (/dev/vdb, /dev/vdc, ...).
     let rootfsAttachment = try VZDiskImageStorageDeviceAttachment(
         url: rootfs,
-        readOnly: false
+        readOnly: readOnly
     )
-    config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)]
+    var storage: [VZStorageDeviceConfiguration] = [
+        VZVirtioBlockDeviceConfiguration(attachment: rootfsAttachment)
+    ]
+    for drive in extraDrives {
+        let attachment = try VZDiskImageStorageDeviceAttachment(
+            url: drive.url,
+            readOnly: drive.readOnly
+        )
+        storage.append(VZVirtioBlockDeviceConfiguration(attachment: attachment))
+    }
+    config.storageDevices = storage
 
     FileManager.default.createFile(atPath: logURL.path, contents: nil)
     let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
@@ -1481,6 +1605,26 @@ private func buildLongRunningConfig(
 
     config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
     config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
+
+    // Always attach a traditional memory balloon. Idle (target == full
+    // memory) it reclaims nothing, so it's inert until `PATCH /balloon`
+    // sets a smaller target — mirroring how the entropy device is always
+    // present. Keeps the FFI simple (no attach flag) and the config
+    // identical across save/restore.
+    config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
+
+    // Guest networking via VZ's built-in NAT. NAT only needs the base
+    // com.apple.security.virtualization entitlement (unlike vmnet's
+    // restricted com.apple.vm.networking), so it works under ad-hoc
+    // signing. VZ hands the guest a DHCP lease in 192.168.64.0/24.
+    if enableNetworking {
+        let netDevice = VZVirtioNetworkDeviceConfiguration()
+        netDevice.attachment = VZNATNetworkDeviceAttachment()
+        if let macAddress, let mac = VZMACAddress(string: macAddress) {
+            netDevice.macAddress = mac
+        }
+        config.networkDevices = [netDevice]
+    }
 
     try config.validate()
     if #available(macOS 14.0, *) {
@@ -1498,6 +1642,12 @@ public func hb_vz_long_new(
     bootArgs: UnsafePointer<CChar>?,
     cpuCount: UInt32,
     memoryMib: UInt64,
+    readOnly: Bool,
+    enableNetworking: Bool,
+    macAddress: UnsafePointer<CChar>?,
+    extraDriveCount: Int,
+    extraDrivePaths: UnsafePointer<UnsafePointer<CChar>?>?,
+    extraDriveReadonly: UnsafePointer<Bool>?,
     outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
     outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
@@ -1511,6 +1661,9 @@ public func hb_vz_long_new(
     let log = URL(fileURLWithPath: String(cString: logPath))
     let initrd: URL? = initrdPath.map { URL(fileURLWithPath: String(cString: $0)) }
     let commandLine = String(cString: bootArgs)
+    let mac: String? = macAddress.map { String(cString: $0) }
+    let extraDrives = decodeExtraDrives(
+        count: extraDriveCount, paths: extraDrivePaths, readonly: extraDriveReadonly)
 
     // Machine-id file lives next to the log. Persisted across calls so a
     // future "snapshot this long-running VM" feature doesn't trip over
@@ -1526,7 +1679,11 @@ public func hb_vz_long_new(
             machineIdURL: machineId,
             cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
             memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
-            commandLine: commandLine
+            commandLine: commandLine,
+            readOnly: readOnly,
+            enableNetworking: enableNetworking,
+            macAddress: mac,
+            extraDrives: extraDrives
         )
 
         let queue = DispatchQueue(label: "com.hephaestus.vz-long-\(UUID().uuidString)")
@@ -1586,6 +1743,64 @@ public func hb_vz_long_pause(
         writeError(outErr, formatError(error))
         return Status.swiftError
     }
+}
+
+/// Set the memory balloon's target VM memory size (bytes). Inflating the
+/// balloon (target < configured memory) reclaims guest memory; deflating
+/// (target → configured memory) returns it. The VZ analog of Firecracker's
+/// `PATCH /balloon`.
+@_cdecl("hb_vz_long_set_balloon_target")
+public func hb_vz_long_set_balloon_target(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    targetBytes: UInt64,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrowVz(vm, outErr) else { return Status.invalidArgument }
+    var found = false
+    handle.queue.sync {
+        guard let vm = handle.holder.vm,
+            let balloon = vm.memoryBalloonDevices.first
+                as? VZVirtioTraditionalMemoryBalloonDevice
+        else { return }
+        found = true
+        balloon.targetVirtualMachineMemorySize = targetBytes
+    }
+    if !found {
+        writeError(outErr, "no memory balloon device on this VM")
+        return Status.swiftError
+    }
+    outErr?.pointee = nil
+    return Status.ok
+}
+
+/// Request a graceful guest shutdown — the VZ analog of Firecracker's
+/// `SendCtrlAltDel`. `requestStop()` delivers an ACPI-style stop request;
+/// the guest shuts down asynchronously. Returns an error if the VM can't
+/// accept a stop request in its current state (e.g. not running).
+@_cdecl("hb_vz_long_request_stop")
+public func hb_vz_long_request_stop(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrowVz(vm, outErr) else { return Status.invalidArgument }
+    let box = ErrorBox()
+    var canStop = false
+    handle.queue.sync {
+        guard let vm = handle.holder.vm else { return }
+        canStop = vm.canRequestStop
+        guard canStop else { return }
+        do { try vm.requestStop() } catch { box.value = error }
+    }
+    if !canStop {
+        writeError(outErr, "VM cannot accept a stop request in its current state")
+        return Status.swiftError
+    }
+    if let error = box.value {
+        writeError(outErr, formatError(error))
+        return Status.swiftError
+    }
+    outErr?.pointee = nil
+    return Status.ok
 }
 
 @_cdecl("hb_vz_long_resume")
@@ -1682,9 +1897,12 @@ public func hb_vz_long_connect(
         case nil: throw VsockError.noSocketDevice
         }
         let fd = dup(conn.fileDescriptor)
+        // Capture errno before conn.close() — close(2) can overwrite it, which
+        // would misreport the dup failure.
+        let dupErrno = errno
         conn.close()
         if fd < 0 {
-            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+            throw POSIXError(.init(rawValue: dupErrno) ?? .EIO)
         }
         outFd.pointee = fd
         return Status.ok
@@ -2006,6 +2224,12 @@ public func hb_vz_long_restore(
     savePath: UnsafePointer<CChar>?,
     cpuCount: UInt32,
     memoryMib: UInt64,
+    readOnly: Bool,
+    enableNetworking: Bool,
+    macAddress: UnsafePointer<CChar>?,
+    extraDriveCount: Int,
+    extraDrivePaths: UnsafePointer<UnsafePointer<CChar>?>?,
+    extraDriveReadonly: UnsafePointer<Bool>?,
     resume: Bool,
     outVm: UnsafeMutablePointer<UnsafeMutablePointer<HbVzVm>?>?,
     outTimings: UnsafeMutablePointer<HbRestoreTimings>?,
@@ -2024,6 +2248,9 @@ public func hb_vz_long_restore(
     let commandLine = String(cString: bootArgs)
     let save = URL(fileURLWithPath: String(cString: savePath))
     let machineId = machineIdURL(forSavePath: save)
+    let mac: String? = macAddress.map { String(cString: $0) }
+    let extraDrives = decodeExtraDrives(
+        count: extraDriveCount, paths: extraDrivePaths, readonly: extraDriveReadonly)
 
     do {
         let configStart = DispatchTime.now()
@@ -2035,7 +2262,11 @@ public func hb_vz_long_restore(
             machineIdURL: machineId,
             cpuCount: Int(cpuCount == 0 ? 2 : cpuCount),
             memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
-            commandLine: commandLine
+            commandLine: commandLine,
+            readOnly: readOnly,
+            enableNetworking: enableNetworking,
+            macAddress: mac,
+            extraDrives: extraDrives
         )
         let configElapsed = DispatchTime.now().uptimeNanoseconds - configStart.uptimeNanoseconds
 

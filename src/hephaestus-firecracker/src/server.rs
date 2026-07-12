@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -21,6 +21,7 @@ use serde::Serialize;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
+use hephaestus_fc_api::vmm_config::balloon::{BalloonDeviceConfig, BalloonUpdateConfig};
 use hephaestus_fc_api::vmm_config::boot_source::BootSourceConfig;
 use hephaestus_fc_api::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig};
 use hephaestus_fc_api::vmm_config::logger::LoggerConfig;
@@ -188,21 +189,27 @@ async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Respon
                 backend.lock().await.flush_metrics();
                 to_response(Ok(()))
             }
-            Ok(ActionBody { action_type }) => fault(
-                StatusCode::BAD_REQUEST,
-                &format!("action_type `{action_type:?}` is not supported"),
-            ),
+            Ok(ActionBody {
+                action_type: ActionType::SendCtrlAltDel,
+            }) => to_response(backend.lock().await.send_ctrl_alt_del()),
             Err(resp) => resp,
         },
         (Method::PUT | Method::PATCH, "/cpu-config") => match parse_body::<Value>(req).await {
             Ok(_) => unsupported("cpu-config"),
             Err(resp) => resp,
         },
-        (Method::PUT | Method::PATCH, "/balloon") => match parse_body::<Value>(req).await {
-            Ok(_) => unsupported("balloon"),
+        (Method::PUT, "/balloon") => match parse_body::<BalloonDeviceConfig>(req).await {
+            Ok(cfg) => to_response(backend.lock().await.configure_balloon(cfg)),
             Err(resp) => resp,
         },
-        (Method::GET, "/balloon") => unsupported("balloon"),
+        (Method::PATCH, "/balloon") => match parse_body::<BalloonUpdateConfig>(req).await {
+            Ok(cfg) => to_response(backend.lock().await.update_balloon(cfg)),
+            Err(resp) => resp,
+        },
+        (Method::GET, "/balloon") => match backend.lock().await.get_balloon() {
+            Ok(cfg) => json_response(StatusCode::OK, &cfg),
+            Err(err) => to_response(Err(err)),
+        },
         (Method::GET, "/balloon/statistics") => unsupported("balloon/statistics"),
         (Method::PATCH, "/balloon/statistics") => match parse_body::<Value>(req).await {
             Ok(_) => unsupported("balloon/statistics"),
@@ -218,7 +225,7 @@ async fn route(req: Request<Incoming>, backend: Arc<Mutex<VzBackend>>) -> Respon
             Err(resp) => resp,
         },
         (Method::PUT, "/entropy") => match parse_body::<Value>(req).await {
-            Ok(_) => unsupported("entropy"),
+            Ok(_) => to_response(backend.lock().await.configure_entropy()),
             Err(resp) => resp,
         },
         (Method::PUT, p) if p.starts_with("/pmem/") => {
@@ -273,16 +280,29 @@ enum ActionType {
     SendCtrlAltDel,
 }
 
+/// Upstream Firecracker's `HTTP_MAX_PAYLOAD_SIZE` (vmm/src/lib.rs). Requests
+/// larger than this are rejected before buffering, so a client (or a buggy
+/// orchestrator) can't force the daemon to hold an unbounded body in memory.
+const MAX_BODY_BYTES: usize = 51_200;
+
 async fn parse_body<T: serde::de::DeserializeOwned>(
     req: Request<Incoming>,
 ) -> Result<T, Response<BoxBody>> {
-    let bytes = match req.into_body().collect().await {
+    let bytes = match Limited::new(req.into_body(), MAX_BODY_BYTES)
+        .collect()
+        .await
+    {
         Ok(b) => b.to_bytes(),
         Err(err) => {
-            return Err(fault(
-                StatusCode::BAD_REQUEST,
-                &format!("failed to read body: {err}"),
-            ));
+            let msg = if err
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                format!("request body exceeds the {MAX_BODY_BYTES}-byte limit")
+            } else {
+                format!("failed to read body: {err}")
+            };
+            return Err(fault(StatusCode::BAD_REQUEST, &msg));
         }
     };
     serde_json::from_slice::<T>(&bytes).map_err(|err| {

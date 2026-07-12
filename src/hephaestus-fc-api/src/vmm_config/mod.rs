@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Memory balloon wire structs (`PUT`/`PATCH`/`GET /balloon`).
+pub mod balloon;
 /// Kernel + initrd + cmdline wire struct (`PUT /boot-source`).
 pub mod boot_source;
 /// Block device wire struct (`PUT /drives/{id}`).

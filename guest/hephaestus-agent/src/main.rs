@@ -117,12 +117,22 @@ fn accept_command_loop(listen_fd: &OwnedFd) -> AgentResult<(String, UnixStream)>
         let conn_raw = accept(listen_fd.as_raw_fd()).map_err(|e| format!("vsock accept: {e}"))?;
         // SAFETY: `accept` returns a freshly-allocated fd we own exclusively.
         let mut stream = unsafe { UnixStream::from_raw_fd(conn_raw) };
+        // Bound the handshake read: this accept loop is serial, so a probe
+        // that connects and holds the socket open without ever sending a
+        // command frame would otherwise wedge every later connection. A
+        // stalled handshake just times out and we wait for the next one.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
         match read_command(&mut stream) {
-            Ok(cmd) if !cmd.is_empty() => return Ok((cmd, stream)),
+            Ok(cmd) if !cmd.is_empty() => {
+                // Clear the timeout for the command's own I/O — stdin
+                // forwarding may legitimately idle between reads.
+                let _ = stream.set_read_timeout(None);
+                return Ok((cmd, stream));
+            }
             _ => {
-                // Probe connection (host closed without writing, or sent a
-                // zero-length frame). Drop the stream and wait for the
-                // real command to arrive.
+                // Probe connection (host closed without writing, sent a
+                // zero-length frame, or stalled past the timeout). Drop the
+                // stream and wait for the real command to arrive.
                 drop(stream);
             }
         }

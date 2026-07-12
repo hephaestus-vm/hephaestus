@@ -2,13 +2,14 @@
 //! macOS sandbox profile and launches `hephaestus-firecracker` under it.
 //!
 //! What this does:
-//! 1. Materializes a per-VM work dir (`--work-dir <dir>/<id>`) holding the
-//!    api socket, log file, metrics file, snapshot blob, etc.
-//! 2. Canonicalizes the caller-supplied kernel/rootfs/initramfs paths.
-//! 3. Generates a deny-by-default sandbox profile granting only those
-//!    paths plus the per-VM work dir. The rootfs is granted read/write
-//!    because Firecracker root drives are commonly configured writable.
-//! 4. Execs `hephaestus-firecracker` with `--sandbox-profile <profile>`
+//! 1. Validates `--id` (Firecracker's `[A-Za-z0-9_-]{1,64}`) so it is a safe
+//!    single path component, and materializes a private per-VM work dir
+//!    (`<work-root>/<id>/`) holding the api socket, log, metrics, snapshot.
+//! 2. Generates a deny-by-default sandbox profile granting only the
+//!    caller-supplied paths (kernel/initramfs read-only, rootfs read/write,
+//!    pool base read-only + pool slots read/write) plus the per-VM work dir.
+//!    Paths are canonicalized during profile generation (see `profile.rs`).
+//! 3. Execs `hephaestus-firecracker` with `--sandbox-profile <profile>`
 //!    and `--api-sock <work_dir>/api.sock`. The child inherits the jail.
 //!
 //! What this is NOT (yet):
@@ -24,6 +25,7 @@
 //!   `com.apple.security.virtualization`; the jailer cannot grant that
 //!   for you. See `docs/JAILER_MMDS_PLAN.md` for the entitlement roadmap.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -82,6 +84,13 @@ struct Args {
 
 #[derive(Debug, Error)]
 enum JailerError {
+    #[error(
+        "invalid --id {id:?}: must match [A-Za-z0-9_-]{{1,64}} (the id becomes a \
+         work-dir path component and a sandbox grant, so it must be a single safe name)"
+    )]
+    InvalidId { id: String },
+    #[error("refusing unsafe work dir {}: {reason}", path.display())]
+    UnsafeWorkDir { path: PathBuf, reason: &'static str },
     #[error("kernel image not found: {}", path.display())]
     KernelNotFound { path: PathBuf },
     #[error("rootfs not found: {}", path.display())]
@@ -135,6 +144,13 @@ struct Plan {
 /// Validate inputs, materialize the per-VM work dir, and write the generated
 /// sandbox profile. Returns the resolved paths; performs no exec.
 fn prepare(args: &Args) -> Result<Plan, JailerError> {
+    // The id becomes a path component of the per-VM work dir and is emitted
+    // verbatim into the sandbox profile. An unvalidated id like `../../etc`
+    // would path-traverse out of the work root and widen the deny-by-default
+    // grant to an arbitrary directory, so we require Firecracker's charset
+    // (which also guarantees a single, safe path component).
+    validate_id(&args.id)?;
+
     if !args.kernel.exists() {
         return Err(JailerError::KernelNotFound {
             path: args.kernel.clone(),
@@ -165,7 +181,20 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
     // read/write/create/delete on the whole subtree so the daemon can
     // create them without us having to enumerate each one upfront.
     let work_root = args.work_dir.clone().unwrap_or_else(default_work_root);
+    secure_work_root(&work_root)?;
     let work_dir = work_root.join(&args.id);
+    // Refuse a pre-planted symlink at the exact work-dir path: `create_dir_all`
+    // follows symlinks, so without this a local user could seed
+    // `<root>/<id>` → victim dir and have the profile grant RW there. The id
+    // is validated above, so this only guards the leaf name.
+    if let Ok(meta) = std::fs::symlink_metadata(&work_dir)
+        && meta.file_type().is_symlink()
+    {
+        return Err(JailerError::UnsafeWorkDir {
+            path: work_dir,
+            reason: "path is a symlink",
+        });
+    }
     std::fs::create_dir_all(&work_dir).map_err(|source| JailerError::CreateWorkDir {
         path: work_dir.clone(),
         source,
@@ -179,21 +208,41 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
     // - read/write on the rootfs file (root drives are commonly writable)
     // - read/write on the work_dir subtree (api socket, logs, metrics, snapshots)
     // - read/write on the pool_dir subtree if --pool-dir is set
+    // Least privilege for the warm pool: the daemon only *reads* the
+    // immutable pool base (save.bin, pristine.ext4, save.machineid, meta) and
+    // *writes* inside the per-slot dirs it clones a rootfs into and flocks.
+    // Granting RW over the whole subtree would let a compromised daemon
+    // overwrite the snapshot every other tenant restores from. Slots are
+    // pre-created by `just pool-init`; the daemon never creates new ones.
+    let mut pool_read_dirs: Vec<PathBuf> = Vec::new();
+    let mut pool_slot_dirs_rw: Vec<PathBuf> = Vec::new();
+    if let Some(pool_dir) = args.pool_dir.as_deref() {
+        pool_read_dirs.push(pool_dir.to_path_buf());
+        pool_slot_dirs_rw = pool_slot_dirs(pool_dir);
+        if pool_slot_dirs_rw.is_empty() {
+            eprintln!(
+                "hephaestus-jailer: warning: --pool-dir {} has no slot-* dirs; \
+                 run `just pool-init` first or the pool will always miss",
+                pool_dir.display()
+            );
+        }
+    }
+
     let mut reads: Vec<&Path> = vec![&args.kernel];
     if let Some(initramfs) = args.initramfs.as_deref() {
         reads.push(initramfs);
     }
     let read_write_files: Vec<&Path> = vec![&args.rootfs];
     let mut work_dirs: Vec<&Path> = vec![work_dir.as_path()];
-    if let Some(pool_dir) = args.pool_dir.as_deref() {
-        // Pool dir is also a work dir — the daemon clones rootfs into a
-        // slot subdir and reads/writes the snapshot blob.
-        work_dirs.push(pool_dir);
+    for slot in &pool_slot_dirs_rw {
+        work_dirs.push(slot.as_path());
     }
+    let read_dirs: Vec<&Path> = pool_read_dirs.iter().map(PathBuf::as_path).collect();
     let inputs = profile::ProfileInputs {
         work_dirs,
         read_write_files,
         reads,
+        read_dirs,
     };
     let profile_source = profile::generate(&inputs)?;
     std::fs::write(&profile_path, profile_source).map_err(|source| JailerError::WriteProfile {
@@ -267,6 +316,88 @@ fn which(name: &str) -> Option<PathBuf> {
 /// Default work root: `$TMPDIR/hephaestus-jail` or `/tmp/hephaestus-jail`.
 fn default_work_root() -> PathBuf {
     std::env::temp_dir().join("hephaestus-jail")
+}
+
+/// Enforce Firecracker's instance-id charset (`[A-Za-z0-9_-]{1,64}`). This
+/// doubles as a "single safe path component" check: the charset excludes `/`,
+/// `.`, and `..`, so a validated id can never traverse out of the work root.
+fn validate_id(id: &str) -> Result<(), JailerError> {
+    let ok = (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if ok {
+        Ok(())
+    } else {
+        Err(JailerError::InvalidId { id: id.to_string() })
+    }
+}
+
+/// Ensure the shared work root is a private, non-symlink directory owned by
+/// us. The default root lives under world-writable `/tmp`, so a local attacker
+/// could otherwise pre-plant `hephaestus-jail` as a symlink to a victim dir
+/// (which `create_dir_all` would follow, widening the sandbox grant) or seed a
+/// guessable `<root>/<id>` for us to descend into. Forcing `0700` fails closed
+/// (EPERM) if another user already owns the path.
+fn secure_work_root(root: &Path) -> Result<(), JailerError> {
+    match std::fs::symlink_metadata(root) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(JailerError::UnsafeWorkDir {
+                    path: root.to_path_buf(),
+                    reason: "work root is a symlink",
+                });
+            }
+            if !meta.is_dir() {
+                return Err(JailerError::UnsafeWorkDir {
+                    path: root.to_path_buf(),
+                    reason: "work root exists but is not a directory",
+                });
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(root).map_err(|source| JailerError::CreateWorkDir {
+                path: root.to_path_buf(),
+                source,
+            })?;
+        }
+        Err(source) => {
+            return Err(JailerError::CreateWorkDir {
+                path: root.to_path_buf(),
+                source,
+            });
+        }
+    }
+    // Enforce private perms on every run. If we don't own the directory this
+    // fails with EPERM, which is the fail-closed outcome we want.
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).map_err(|_| {
+        JailerError::UnsafeWorkDir {
+            path: root.to_path_buf(),
+            reason: "cannot enforce private 0700 perms (not owner?)",
+        }
+    })
+}
+
+/// Existing `slot-*` subdirectories of a warm pool. Pool slots are pre-created
+/// by `just pool-init`; the daemon only clones a rootfs into and flocks an
+/// existing slot, so enumerating them lets us grant each read/write while
+/// keeping the pool base read-only. Returns empty on an unreadable/absent pool.
+fn pool_slot_dirs(pool_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(pool_dir) else {
+        return Vec::new();
+    };
+    let mut slots: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("slot-"))
+        })
+        .collect();
+    slots.sort();
+    slots
 }
 
 #[cfg(test)]
@@ -394,9 +525,12 @@ mod tests {
     fn build_command_passes_pool_dir_and_deny_probe_when_set() {
         let dir = scratch("cmd-opts");
         let mut args = args_in(&dir);
-        // pool_dir is a directory (generate's subpath_form create_dir_all's it);
-        // deny_probe is just passed through as a CLI arg, never materialized.
-        args.pool_dir = Some(dir.join("pool"));
+        // Pool base is granted read-only now, so it (and at least one slot)
+        // must pre-exist — the daemon never creates them. deny_probe is just
+        // passed through as a CLI arg, never materialized.
+        let pool = dir.join("pool");
+        fs::create_dir_all(pool.join("slot-0")).unwrap();
+        args.pool_dir = Some(pool);
         args.deny_probe = Some(dir.join("secret"));
         let plan = prepare(&args).unwrap();
         let cmd = build_command(&plan, &args);
@@ -404,5 +538,75 @@ mod tests {
         let got = arg_strings(&cmd);
         assert!(got.iter().any(|a| a == "--pool-dir"));
         assert!(got.iter().any(|a| a == "--sandbox-deny-probe"));
+    }
+
+    #[test]
+    fn validate_id_accepts_firecracker_charset_and_rejects_traversal() {
+        for ok in ["vm-test", "a", "ci_runner_42", &"x".repeat(64)] {
+            assert!(validate_id(ok).is_ok(), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "",
+            &"x".repeat(65),
+            "../etc",
+            "a/b",
+            "..",
+            ".",
+            "has space",
+            "tab\t",
+            "dot.dot",
+        ] {
+            assert!(
+                matches!(validate_id(bad), Err(JailerError::InvalidId { .. })),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_rejects_traversal_id_before_touching_the_filesystem() {
+        let dir = scratch("traversal-id");
+        let mut args = args_in(&dir);
+        args.id = "../../escape".into();
+        assert!(matches!(prepare(&args), Err(JailerError::InvalidId { .. })));
+    }
+
+    #[test]
+    fn prepare_grants_pool_base_read_only_and_slots_read_write() {
+        let dir = scratch("pool-split");
+        let mut args = args_in(&dir);
+        let pool = dir.join("pool");
+        // Immutable base file + two pre-created slots.
+        fs::create_dir_all(&pool).unwrap();
+        touch(pool.join("save.bin"));
+        fs::create_dir_all(pool.join("slot-0")).unwrap();
+        fs::create_dir_all(pool.join("slot-1")).unwrap();
+        args.pool_dir = Some(pool.clone());
+
+        let plan = prepare(&args).unwrap();
+        let profile = fs::read_to_string(&plan.profile_path).unwrap();
+        let pool_canon = fs::canonicalize(&pool).unwrap();
+
+        // Pool base appears under the read-only grant, NOT the read/write one.
+        assert!(
+            profile.contains(";; Read-only directory subtrees"),
+            "expected a read-only subtree section:\n{profile}"
+        );
+        let rw_section = profile
+            .split(";; Per-VM working directories/files")
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            !rw_section.contains(&format!("\"{}\"\n", pool_canon.to_string_lossy())),
+            "pool base must not be in the read/write grant:\n{profile}"
+        );
+        // Both slots are granted read/write.
+        for slot in ["slot-0", "slot-1"] {
+            let slot_canon = fs::canonicalize(pool.join(slot)).unwrap();
+            assert!(
+                rw_section.contains(&slot_canon.to_string_lossy().to_string()),
+                "{slot} should be read/write:\n{profile}"
+            );
+        }
     }
 }

@@ -140,19 +140,21 @@ per-endpoint notes and known deviations.
 | `GET /`                               | ✓          | `InstanceInfo` round-trips through Go SDK   |
 | `GET/PUT/PATCH /machine-config`       | ✓          | CPU templates rejected on Apple Silicon     |
 | `PUT /boot-source`                    | ✓          | kernel + boot args + optional initrd       |
-| `PUT/PATCH /drives/{id}`              | ⚠︎         | `PATCH` pre-boot only (VZ can't hot-swap)  |
-| `PUT /network-interfaces/{id}`        | ⚠︎         | Accepted + noop; VZ NAT attached on boot   |
+| `PUT/PATCH /drives/{id}`              | ⚠︎         | Root + secondary drives (`/dev/vdb…`); `PATCH` pre-boot only |
+| `PUT /network-interfaces/{id}`        | ⚠︎         | VZ NAT NIC attached; `guest_mac` honored, L3 up to guest |
 | `PATCH /network-interfaces/{id}`      | ⚠︎         | Accept-noop (rate-limiter ignored)         |
 | `PUT /logger`                         | ✓          | Firecracker-style text logs + debug access |
-| `PUT /metrics`                        | ⚠︎         | Firecracker-style JSON; Linux counters zero |
-| `PUT /actions` (`InstanceStart`, `FlushMetrics`) | ✓ | Boot/restore or force metrics flush |
+| `PUT /metrics`                        | ⚠︎         | Firecracker-style JSON; real per-endpoint API counts; device counters zero |
+| `PUT /actions` (`InstanceStart`, `FlushMetrics`, `SendCtrlAltDel`) | ✓ | Boot/restore, force metrics flush, or graceful guest stop |
+| `PUT /entropy`                        | ✓          | virtio-rng always attached; request confirmed |
+| `PUT/PATCH/GET /balloon`              | ⚠︎         | VZ traditional balloon; live target adjust; no stats |
 | `PATCH /vm`                           | ✓          | `Paused ↔ Resumed`                         |
 | `PUT /snapshot/create`                | ✓          | A+stub (single blob at `snapshot_path`)    |
 | `PUT /snapshot/load`                  | ✓          | Round-trip across process restart          |
 | `GET /version`                        | ✓          | Reports pinned Firecracker compat version  |
 | `GET/PUT/PATCH /mmds`, `PUT /mmds/config` | ⚠︎     | Stored JSON; guest vsock/link-local path GETs via agent shim |
 | `PUT /vsock`                         | ⚠︎         | Host UDS `CONNECT <port>` bridge after boot |
-| balloon / entropy / cpu-config / pmem / serial / hotplug memory / vm config | ✗ | Routed, return Firecracker-shaped errors |
+| cpu-config / pmem / serial / hotplug memory / vm config / balloon stats | ✗ | Routed, return Firecracker-shaped errors |
 
 ## Performance
 
