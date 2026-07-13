@@ -1,7 +1,8 @@
 # Release policy
 
 Hephaestus uses [Semantic Versioning](https://semver.org/) and records notable
-changes in the root [changelog](../../CHANGELOG.md).
+changes in the root [changelog](../../CHANGELOG.md). The current workflow is
+being replaced by the staged [release automation plan](release-automation.md).
 
 ## Alpha releases
 
@@ -19,10 +20,12 @@ unless [SECURITY.md](../../SECURITY.md) explicitly states otherwise.
 
 ## Release artifacts
 
-Tagged releases may publish ad-hoc-signed arm64 macOS binaries on
-[GitHub Releases](https://github.com/hephaestus-vm/hephaestus/releases). Users
-must verify the source and artifact before removing macOS quarantine. A future
-Developer ID distribution may have different signing and entitlement behavior.
+The repository does not yet have an origin version tag or published GitHub
+Release. The first automated release will publish ad-hoc-signed arm64 macOS
+binaries on [GitHub Releases](https://github.com/hephaestus-vm/hephaestus/releases).
+Users must verify the source and artifact before removing macOS quarantine. A
+future Developer ID distribution may have different signing and entitlement
+behavior.
 
 ## Release requirements
 

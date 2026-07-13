@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "signoff": "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>",
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "hephaestus",
+      "version-file": "version.txt",
+      "changelog-path": "CHANGELOG.md",
+      "versioning": "prerelease",
+      "prerelease": true,
+      "prerelease-type": "alpha",
+      "include-v-in-tag": true,
+      "include-component-in-tag": false,
+      "pull-request-title-pattern": "chore${scope}: release${component} ${version}",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "src/hephaestus-cli/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "src/hephaestus-firecracker/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "src/hephaestus-jailer/Cargo.toml",
+          "jsonpath": "$.package.version"
+        }
+      ]
+    }
+  }
+}

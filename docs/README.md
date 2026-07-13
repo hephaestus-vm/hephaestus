@@ -56,5 +56,6 @@ This documentation is organized by what you are trying to accomplish:
 
 - [Roadmap](project/roadmap.md)
 - [Release policy](project/release-policy.md)
+- [Release automation plan](project/release-automation.md)
 - [Changelog](../CHANGELOG.md)
 - [Security policy](../SECURITY.md)

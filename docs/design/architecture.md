@@ -60,8 +60,14 @@ direct path owns its process-delivery, console, vsock, and lifecycle plumbing.
 
 `VzBackend` implements the `VmmBackend` trait from `hephaestus-fc-api`. Its primary states are:
 
-```text
-NotStarted ── InstanceStart/snapshot load ──> Running ⇄ Paused
+```mermaid
+stateDiagram-v2
+    [*] --> NotStarted
+    NotStarted --> Running: InstanceStart
+    NotStarted --> Running: snapshot load + resume
+    NotStarted --> Paused: snapshot load without resume
+    Running --> Paused: pause
+    Paused --> Running: resume
 ```
 
 Construction-time resources are configured in `NotStarted`. Snapshot creation requires `Paused`; snapshot load requires `NotStarted`. `RunOrigin` records whether the current VM cold-booted, restored from a pool, or loaded a snapshot because later operations have origin-specific constraints.

@@ -3,63 +3,130 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]*.[0-9]*.[0-9]*"
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build and publish release binaries
+  validate:
+    name: Validate release candidate
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: compat/firectl-harness/go.mod
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install 1.96 --component rustfmt --component clippy --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Validate tag and changelog
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $TAG" >&2
+            exit 1
+          fi
+          product_version="$(tr -d '[:space:]' < version.txt)"
+          if [[ "$product_version" != "$version" ]]; then
+            echo "version.txt $product_version does not match tag $version" >&2
+            exit 1
+          fi
+          scripts/check-product-version.sh
+
+      - name: Validate source
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          python3 scripts/check-doc-links.py
+          scripts/fc-compat-config-only.sh
+          scripts/fc-compat-sandbox-config.sh
+
+  release:
+    name: Build and publish release binaries
+    needs: validate
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
         run: cargo build --release --workspace
-        # build.rs in hephaestus-bridge runs scripts/link-and-sign.sh
-        # as the linker wrapper, so the ad-hoc signing + entitlement
-        # happen inside `cargo build` — nothing extra to do here.
 
-      - name: Package binaries
-        id: pkg
+      - name: Verify release signatures
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          for binary in hephaestus hephaestus-firecracker; do
+            path="build/cargo_target/release/$binary"
+            codesign --verify --strict "$path"
+            codesign -d --entitlements - "$path" 2>&1 \
+              | grep -q com.apple.security.virtualization
+          done
+          codesign --verify --strict build/cargo_target/release/hephaestus-jailer
+
+      - name: Package binaries
+        id: package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
           triple="aarch64-apple-darwin"
-          outdir="release/hephaestus-${tag}-${triple}"
+          archive="hephaestus-${TAG}-${triple}"
+          outdir="release/$archive"
           mkdir -p "$outdir"
           cp build/cargo_target/release/hephaestus "$outdir/"
           cp build/cargo_target/release/hephaestus-firecracker "$outdir/"
+          cp build/cargo_target/release/hephaestus-jailer "$outdir/"
           cp LICENSE NOTICE README.md CHANGELOG.md "$outdir/"
-          tarball="hephaestus-${tag}-${triple}.tar.gz"
-          tar -czf "$tarball" -C release "hephaestus-${tag}-${triple}"
+          cp -R docs "$outdir/"
+          tarball="${archive}.tar.gz"
+          tar -czf "$tarball" -C release "$archive"
           shasum -a 256 "$tarball" > "${tarball}.sha256"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
-          echo "sha=${tarball}.sha256" >> "$GITHUB_OUTPUT"
+          echo "checksum=${tarball}.sha256" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub release
+      - name: Attest release archive
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ steps.package.outputs.tarball }}
+
+      - name: Upload assets to GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          TARBALL: ${{ steps.package.outputs.tarball }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          # Extract the changelog section for this tag so the release
-          # body isn't empty. Grabs lines between `## [tag]` and the
-          # next `## ` header.
-          awk -v tag="$tag" '
-            $0 ~ "^## \\[" tag { flag=1; next }
-            flag && /^## / { exit }
-            flag
-          ' CHANGELOG.md > release_notes.md
-          if [ ! -s release_notes.md ]; then
-            echo "Release notes for $tag not found in CHANGELOG.md" >&2
-            exit 1
-          fi
-          gh release create "$tag" \
-            --title "$tag" \
-            --notes-file release_notes.md \
-            "${{ steps.pkg.outputs.tarball }}" \
-            "${{ steps.pkg.outputs.sha }}"
+          for _ in {1..12}; do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" "$TARBALL" "$CHECKSUM" --clobber
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Release Please did not create a GitHub Release for $TAG" >&2
+          exit 1
