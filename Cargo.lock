@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "hephaestus-cli"
-version = "0.4.0-alpha.1"
+version = "0.4.0-alpha.2"
 dependencies = [
  "hephaestus-bridge",
  "hephaestus-pool",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "hephaestus-firecracker"
-version = "0.4.0-alpha.1"
+version = "0.4.0-alpha.2"
 dependencies = [
  "clap",
  "hephaestus-bridge",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "hephaestus-jailer"
-version = "0.4.0-alpha.1"
+version = "0.4.0-alpha.2"
 dependencies = [
  "clap",
  "libc",
