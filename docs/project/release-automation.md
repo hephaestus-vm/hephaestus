@@ -17,10 +17,10 @@ The release foundation is implemented around `v0.4.0-alpha.1`:
   assets;
 - CI rejects non-conventional PR titles before they can become squash commits.
 
-The origin has no historical Hephaestus version tags or GitHub Releases. The
-first `v0.4.0-alpha.1` release therefore requires a one-time bootstrap after
-this configuration reaches `main`. Real-VM release tests also require a suitable
-Mac and cannot currently run on ordinary hosted CI.
+The one-time `v0.4.0-alpha.1` bootstrap release is published with its arm64
+archive, checksum, and build-provenance attestation. Release Please has found
+that baseline and now maintains subsequent Release PRs. Real-VM release tests
+still require a suitable Mac and cannot currently run on ordinary hosted CI.
 
 ## Target workflow
 
@@ -56,14 +56,13 @@ rejects a tag when any of those package versions differ.
 The Firecracker compatibility version remains separate: `GET /version` reports
 protocol compatibility, not the Hephaestus product version.
 
-Two bootstrap tasks remain:
+The bootstrap tag and GitHub Release were created from the canonical version
+and matching changelog section; their artifact workflow completed successfully.
+Do not import unrelated tags from the upstream Firecracker history or create
+future product tags manually.
 
-1. After this setup reaches `main`, create the `v0.4.0-alpha.1` GitHub Release
-   once, targeting that merge commit and using the matching changelog section.
-   Creating the release also creates the tag and starts artifact publication.
-   Do not import unrelated tags from the upstream Firecracker history.
-2. Decide whether `hephaestus-agent` is versioned and shipped with the host
-   archive or built separately.
+One packaging decision remains: decide whether `hephaestus-agent` is versioned
+and shipped with the host archive or built separately.
 
 ## Phase 2: generate release PRs and changelogs — implemented
 
@@ -135,8 +134,8 @@ After the basic pipeline is reliable:
 - publish an SBOM alongside provenance;
 - add a Homebrew tap driven from the same GitHub Release;
 - define snapshot and pool compatibility across product versions;
-- exercise install and quarantine-removal instructions from the packaged
-  archive.
+- automate clean-machine coverage for the documented install and quarantine
+  procedure.
 
 ## Required repository policy
 
@@ -145,7 +144,8 @@ The automation depends on repository policy as much as workflow YAML:
 - squash merges must use Conventional Commit PR titles;
 - CI must be required before merging normal and Release PRs;
 - version tags must be created by automation, not pushed manually;
-- release workflow actions should be pinned to reviewed revisions;
+- workflow actions are pinned to reviewed commit SHAs and updated through
+  Dependabot;
 - only the release workflow receives `contents: write` and provenance
   permissions;
 - changelog edits happen in the generated Release PR, not opportunistically in

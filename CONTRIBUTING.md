@@ -17,18 +17,6 @@ ship.
 Open an issue before investing in a large feature or architecture change. This
 lets maintainers confirm scope, platform feasibility, and the expected tests.
 
-## Developer Certificate of Origin
-
-Hephaestus uses the [Developer Certificate of Origin](https://developercertificate.org/).
-Every commit must include a `Signed-off-by:` line certifying that you have the
-right to submit it:
-
-```console
-$ git commit -s -m "describe the change"
-```
-
-There is no CLA or copyright assignment.
-
 ## Set up the repository
 
 Follow [Development setup](docs/development/setup.md). The short path is:
