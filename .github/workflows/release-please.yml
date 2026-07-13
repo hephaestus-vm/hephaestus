@@ -18,6 +18,8 @@ jobs:
   release-please:
     name: Maintain release pull request
     runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Check release automation bootstrap
         id: bootstrap
