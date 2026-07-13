@@ -37,29 +37,28 @@ field-level details.
 
 ## Getting started
 
-You need an Apple Silicon Mac running macOS 26 or later, Xcode 26, Rust, and
-[`apple/container`](https://github.com/apple/container). The source tree also
-uses `just` for artifact-discovery and test shortcuts.
+On an Apple Silicon Mac running macOS 26 or later, download the release archive,
+verify its checksum, and install the three binaries into a directory on `PATH`:
 
 ```console
-$ brew install rustup just container
-$ rustup-init
-$ container system start
-$ container run --rm docker.io/library/alpine:3.20 echo ready
-
-$ git clone https://github.com/hephaestus-vm/hephaestus
-$ cd hephaestus
-$ cargo build --workspace
-$ ./build/cargo_target/debug/hephaestus --help
-$ just hello
+$ VERSION=v0.4.0-alpha.1
+$ ARCHIVE="hephaestus-${VERSION}-aarch64-apple-darwin"
+$ curl --proto '=https' --tlsv1.2 -fLO \
+    "https://github.com/hephaestus-vm/hephaestus/releases/download/${VERSION}/${ARCHIVE}.tar.gz"
+$ curl --proto '=https' --tlsv1.2 -fLO \
+    "https://github.com/hephaestus-vm/hephaestus/releases/download/${VERSION}/${ARCHIVE}.tar.gz.sha256"
+$ shasum -a 256 -c "${ARCHIVE}.tar.gz.sha256"
+$ tar -xzf "${ARCHIVE}.tar.gz"
+$ mkdir -p "$HOME/.local/bin"
+$ /usr/bin/install -m 0755 "$ARCHIVE"/hephaestus{,-firecracker,-jailer} \
+    "$HOME/.local/bin/"
+$ "$HOME/.local/bin/hephaestus" --version
 ```
 
-The first `container run` populates the kernel and root filesystem artifacts.
-The `hephaestus` binary is the public CLI; `just hello` is a source-tree shortcut
-that discovers those artifacts, boots an Alpine Linux VM through the binary,
-prints `hello-from-hephaestus`, and exits.
-
-For installation alternatives, artifact requirements, and troubleshooting, see
+Add `$HOME/.local/bin` to `PATH` if needed. A source build additionally requires
+Xcode 26, Rust, `just`, and
+[`apple/container`](https://github.com/apple/container). For system-wide
+installation, source builds, guest artifacts, and signature verification, see
 [Getting started](docs/getting-started.md).
 
 ## Use the Firecracker API
@@ -180,17 +179,15 @@ the methodology, phase breakdown, and reproduction commands.
 ## Releases
 
 Release artifacts are published through the
-[GitHub Releases](https://github.com/hephaestus-vm/hephaestus/releases) page;
-until the first release appears, build from source. Hephaestus follows Semantic
-Versioning, with additional instability allowed
+[GitHub Releases](https://github.com/hephaestus-vm/hephaestus/releases) page.
+Hephaestus follows Semantic Versioning, with additional instability allowed
 while the major version is zero. See the [release policy](docs/project/release-policy.md),
 [automation plan](docs/project/release-automation.md), and
 [changelog](CHANGELOG.md).
 
 ## Contributing
 
-Contributions are welcome. Every commit requires a Developer Certificate of
-Origin `Signed-off-by:` line; no CLA is required. Read
+Contributions are welcome; no CLA is required. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
 ## Security

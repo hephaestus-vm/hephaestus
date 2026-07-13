@@ -32,7 +32,7 @@ jobs:
             echo "ready=false" >> "$GITHUB_OUTPUT"
             echo "Release Please starts after the one-time v0.4.0-alpha.1 bootstrap."
           fi
-      - uses: googleapis/release-please-action@v5
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
         id: release
         if: steps.bootstrap.outputs.ready == 'true'
         with:
@@ -42,7 +42,7 @@ jobs:
 
       - name: Check out release branch
         if: steps.release.outputs.prs_created == 'true'
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           fetch-depth: 0
@@ -71,5 +71,5 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add Cargo.lock
-          git commit -s -m "chore(release): synchronize Cargo.lock"
+          git commit -m "chore(release): synchronize Cargo.lock"
           git push origin "HEAD:$branch"

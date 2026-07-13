@@ -1,13 +1,74 @@
 # Getting started
 
-This guide builds Hephaestus from source and boots a Linux VM on a supported
+This guide installs or builds Hephaestus and boots a Linux VM on a supported
 Mac. The example is for development and evaluation, not untrusted workloads or
 production multi-tenancy.
 
-## Requirements
+## Runtime requirements
 
 - Apple Silicon Mac
 - macOS 26 (Tahoe) or later
+- An arm64 Linux kernel, init filesystem, and root filesystem for direct
+  Virtualization.framework commands
+
+## Install release binaries
+
+Choose a version from [GitHub Releases](https://github.com/hephaestus-vm/hephaestus/releases),
+download its Apple Silicon archive and checksum, and verify before extracting:
+
+```console
+$ VERSION=v0.4.0-alpha.1
+$ ARCHIVE="hephaestus-${VERSION}-aarch64-apple-darwin"
+$ curl --proto '=https' --tlsv1.2 -fLO \
+    "https://github.com/hephaestus-vm/hephaestus/releases/download/${VERSION}/${ARCHIVE}.tar.gz"
+$ curl --proto '=https' --tlsv1.2 -fLO \
+    "https://github.com/hephaestus-vm/hephaestus/releases/download/${VERSION}/${ARCHIVE}.tar.gz.sha256"
+$ shasum -a 256 -c "${ARCHIVE}.tar.gz.sha256"
+$ tar -xzf "${ARCHIVE}.tar.gz"
+```
+
+For a per-user installation, copy the executables to `~/.local/bin`:
+
+```console
+$ mkdir -p "$HOME/.local/bin"
+$ /usr/bin/install -m 0755 "$ARCHIVE"/hephaestus{,-firecracker,-jailer} \
+    "$HOME/.local/bin/"
+$ "$HOME/.local/bin/hephaestus" --version
+```
+
+If `~/.local/bin` is not already on `PATH`, add this to `~/.zprofile` and open a
+new terminal:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+For an administrator-managed, system-wide installation, stage and verify the
+archive as an ordinary user, then elevate only the final copy:
+
+```console
+$ sudo /usr/bin/install -m 0755 \
+    "$ARCHIVE"/hephaestus{,-firecracker,-jailer} /usr/local/bin/
+```
+
+Do not copy unmanaged files into `/opt/homebrew`; that prefix belongs to
+Homebrew. Verify the embedded signatures after installation:
+
+```console
+$ for binary in hephaestus hephaestus-firecracker hephaestus-jailer; do
+    codesign --verify --strict "$(command -v "$binary")"
+  done
+```
+
+A browser download may carry a quarantine attribute. Inspect and verify the
+archive first. If Gatekeeper then blocks an ad-hoc-signed binary, remove the
+attribute only from the verified installed files with
+`xattr -d com.apple.quarantine <path>`.
+
+## Source-build requirements
+
+A source build additionally requires:
+
 - Xcode 26 selected by `xcode-select`
 - Rust 1.96 or the toolchain selected by `rust-toolchain.toml`
 - [`just`](https://github.com/casey/just)
@@ -117,10 +178,8 @@ Release binaries are under `build/cargo_target/release/`. The build invokes
 `scripts/link-and-sign.sh`; running an unsigned copy will fail when it attempts
 to create a VM.
 
-Pre-built artifacts are also available from
-[GitHub Releases](https://github.com/hephaestus-vm/hephaestus/releases). macOS
-may quarantine an ad-hoc-signed download. Inspect the artifact before removing
-quarantine with `xattr -d com.apple.quarantine <binary>`.
+Pre-built artifacts follow the same layout and can be installed using the
+verified release procedure above.
 
 ## Verify the installation
 
