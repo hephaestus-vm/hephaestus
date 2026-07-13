@@ -98,7 +98,7 @@ The artifact workflow is driven by the tag created from the Release PR. It:
 6. Verify the `com.apple.security.virtualization` entitlement on every shipped
    host binary.
 7. Package `hephaestus`, `hephaestus-firecracker`, and `hephaestus-jailer`, plus
-   license, notice, README, and version metadata.
+   the verified installer, license, notice, README, and version metadata.
 8. Include the guest agent only after its build and compatibility contract is
    defined.
 9. Produces SHA-256 checksums and GitHub artifact provenance.
