@@ -4,6 +4,18 @@ All notable changes to hephaestus. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [0.4.0-alpha.2](https://github.com/hephaestus-vm/hephaestus/compare/v0.4.0-alpha.1...v0.4.0-alpha.2) (2026-07-13)
+
+
+### Features
+
+* **install:** add verified binary installer ([#20](https://github.com/hephaestus-vm/hephaestus/issues/20)) ([321b298](https://github.com/hephaestus-vm/hephaestus/commit/321b298067c8626593aca7a84ac47a6106354a76))
+
+
+### Bug Fixes
+
+* **release:** detect the bootstrap release ([f0fad1b](https://github.com/hephaestus-vm/hephaestus/commit/f0fad1b4c589061b15767fca3cce94ca77e3426d))
+
 ## [Unreleased]
 
 ## [0.4.0-alpha.1] — 2026-07-12
