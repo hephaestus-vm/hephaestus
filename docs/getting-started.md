@@ -14,7 +14,25 @@ production multi-tenancy.
 ## Install release binaries
 
 Choose a version from [GitHub Releases](https://github.com/hephaestus-vm/hephaestus/releases),
-download its Apple Silicon archive and checksum, and verify before extracting:
+download and inspect the installer, and pass the version explicitly:
+
+```console
+$ curl --proto '=https' --tlsv1.2 -fLo install.sh \
+    https://raw.githubusercontent.com/hephaestus-vm/hephaestus/main/install.sh
+$ less install.sh
+$ sh install.sh --version v0.4.0-alpha.1
+```
+
+The default destination is `~/.local/bin`. Use `--system` for an
+administrator-managed `/usr/local/bin` installation, `--prefix <directory>` for
+a different per-user location, or `--dry-run` to download and verify without
+installing. The script requires native Apple Silicon macOS, never runs itself as
+root, and elevates only final copies when `--system` is explicit.
+
+### Install manually
+
+To perform the same verification and installation yourself, download the Apple
+Silicon archive and checksum:
 
 ```console
 $ VERSION=v0.4.0-alpha.1

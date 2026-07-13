@@ -37,29 +37,23 @@ field-level details.
 
 ## Getting started
 
-On an Apple Silicon Mac running macOS 26 or later, download the release archive,
-verify its checksum, and install the three binaries into a directory on `PATH`:
+On an Apple Silicon Mac running macOS 26 or later, download and inspect the
+installer, then choose an explicit release version:
 
 ```console
-$ VERSION=v0.4.0-alpha.1
-$ ARCHIVE="hephaestus-${VERSION}-aarch64-apple-darwin"
-$ curl --proto '=https' --tlsv1.2 -fLO \
-    "https://github.com/hephaestus-vm/hephaestus/releases/download/${VERSION}/${ARCHIVE}.tar.gz"
-$ curl --proto '=https' --tlsv1.2 -fLO \
-    "https://github.com/hephaestus-vm/hephaestus/releases/download/${VERSION}/${ARCHIVE}.tar.gz.sha256"
-$ shasum -a 256 -c "${ARCHIVE}.tar.gz.sha256"
-$ tar -xzf "${ARCHIVE}.tar.gz"
-$ mkdir -p "$HOME/.local/bin"
-$ /usr/bin/install -m 0755 "$ARCHIVE"/hephaestus{,-firecracker,-jailer} \
-    "$HOME/.local/bin/"
+$ curl --proto '=https' --tlsv1.2 -fLo install.sh \
+    https://raw.githubusercontent.com/hephaestus-vm/hephaestus/main/install.sh
+$ less install.sh
+$ sh install.sh --version v0.4.0-alpha.1
 $ "$HOME/.local/bin/hephaestus" --version
 ```
 
-Add `$HOME/.local/bin` to `PATH` if needed. A source build additionally requires
-Xcode 26, Rust, `just`, and
-[`apple/container`](https://github.com/apple/container). For system-wide
-installation, source builds, guest artifacts, and signature verification, see
-[Getting started](docs/getting-started.md).
+The installer verifies the archive checksum, signatures, and virtualization
+entitlements before copying all three binaries to `~/.local/bin`. A source build
+additionally requires Xcode 26, Rust, `just`, and
+[`apple/container`](https://github.com/apple/container). For manual or
+system-wide installation, source builds, guest artifacts, and troubleshooting,
+see [Getting started](docs/getting-started.md).
 
 ## Use the Firecracker API
 

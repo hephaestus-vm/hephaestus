@@ -100,7 +100,7 @@ jobs:
           cp build/cargo_target/release/hephaestus "$outdir/"
           cp build/cargo_target/release/hephaestus-firecracker "$outdir/"
           cp build/cargo_target/release/hephaestus-jailer "$outdir/"
-          cp LICENSE NOTICE README.md CHANGELOG.md "$outdir/"
+          cp LICENSE NOTICE README.md CHANGELOG.md install.sh "$outdir/"
           cp -R docs "$outdir/"
           tarball="${archive}.tar.gz"
           tar -czf "$tarball" -C release "$archive"
