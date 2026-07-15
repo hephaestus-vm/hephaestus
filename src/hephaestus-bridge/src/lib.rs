@@ -235,7 +235,7 @@ unsafe extern "C" {
         cpu_count: u32,
         memory_mib: u64,
         read_only: bool,
-        enable_networking: bool,
+        network_mode: u32,
         mac: *const c_char,
         extra_drive_count: usize,
         extra_drive_paths: *const *const c_char,
@@ -263,6 +263,19 @@ unsafe extern "C" {
         vm: *mut HbVzVm,
         port: u32,
         out_fd: *mut c_int,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
+    fn hb_vz_long_vmnet_read(
+        vm: *mut HbVzVm,
+        buffer: *mut u8,
+        capacity: usize,
+        out_len: *mut usize,
+        out_err: *mut *mut c_char,
+    ) -> HbStatus;
+    fn hb_vz_long_vmnet_write(
+        vm: *mut HbVzVm,
+        buffer: *const u8,
+        len: usize,
         out_err: *mut *mut c_char,
     ) -> HbStatus;
     fn hb_vz_long_stop(vm: *mut HbVzVm, out_err: *mut *mut c_char) -> HbStatus;
@@ -305,7 +318,7 @@ unsafe extern "C" {
         cpu_count: u32,
         memory_mib: u64,
         read_only: bool,
-        enable_networking: bool,
+        network_mode: u32,
         mac: *const c_char,
         extra_drive_count: usize,
         extra_drive_paths: *const *const c_char,
@@ -539,6 +552,28 @@ impl Drop for Vm {
     }
 }
 
+/// Network attachment used by a long-running direct-VZ VM.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum VzNetworkMode {
+    /// Do not attach a network device.
+    #[default]
+    None,
+    /// Virtualization.framework's built-in NAT attachment.
+    Nat,
+    /// A customizable shared-mode network backed by the vmnet framework.
+    Vmnet,
+}
+
+impl VzNetworkMode {
+    fn code(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Nat => 1,
+            Self::Vmnet => 2,
+        }
+    }
+}
+
 /// Builder spec for a long-running direct-VZ VM.
 ///
 /// Unlike [`Spec`]/[`Vm`] (containerization-backed, vminitd-orchestrated),
@@ -566,10 +601,10 @@ pub struct VzSpec {
     /// `drive.is_read_only`; when a client marks a shared/golden rootfs
     /// read-only, the guest must not be able to mutate it.
     pub read_only: bool,
-    /// Attach a guest NIC backed by VZ's built-in NAT (192.168.64.0/24).
-    /// NAT only needs the base virtualization entitlement. `false` boots
-    /// with no network device.
-    pub networking: bool,
+    /// Network attachment for the guest NIC. `None` boots without a network
+    /// device, `Nat` uses VZ's built-in NAT, and `Vmnet` creates a shared-mode
+    /// vmnet network.
+    pub network_mode: VzNetworkMode,
     /// Optional guest MAC address (from Firecracker's `guest_mac`). `None`
     /// lets VZ assign a random locally-administered address.
     pub mac: Option<String>,
@@ -600,7 +635,16 @@ impl VzSpec {
     }
 
     pub fn networking(mut self, networking: bool) -> Self {
-        self.networking = networking;
+        self.network_mode = if networking {
+            VzNetworkMode::Nat
+        } else {
+            VzNetworkMode::None
+        };
+        self
+    }
+
+    pub fn network_mode(mut self, mode: VzNetworkMode) -> Self {
+        self.network_mode = mode;
         self
     }
 
@@ -670,7 +714,7 @@ impl VzVm {
                 spec.cpus,
                 spec.memory_mib,
                 spec.read_only,
-                spec.networking,
+                spec.network_mode.code(),
                 mac_ptr,
                 drives.count(),
                 drives.paths_ptr(),
@@ -750,6 +794,33 @@ impl VzVm {
         // SAFETY: hb_vz_long_connect returns a freshly dup(2)'d descriptor whose
         // ownership is transferred to Rust.
         Ok(unsafe { UnixStream::from_raw_fd(out_fd) })
+    }
+
+    /// Poll one raw Ethernet frame from the process-owned vmnet interface.
+    /// Returns zero when no frame is currently available.
+    pub fn vmnet_read(&self, buffer: &mut [u8]) -> Result<usize, VmError> {
+        let mut len = 0usize;
+        let mut out_err: *mut c_char = std::ptr::null_mut();
+        let status = unsafe {
+            hb_vz_long_vmnet_read(
+                self.handle,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut len,
+                &mut out_err,
+            )
+        };
+        status.into_result(out_err)?;
+        Ok(len)
+    }
+
+    /// Inject one raw Ethernet frame through the process-owned vmnet interface.
+    pub fn vmnet_write(&self, buffer: &[u8]) -> Result<(), VmError> {
+        let mut out_err: *mut c_char = std::ptr::null_mut();
+        let status = unsafe {
+            hb_vz_long_vmnet_write(self.handle, buffer.as_ptr(), buffer.len(), &mut out_err)
+        };
+        status.into_result(out_err)
     }
 
     /// Request graceful stop, then force-stop. Idempotent.
@@ -1227,7 +1298,7 @@ pub fn vz_long_restore(
     cpu_count: u32,
     memory_mib: u64,
     read_only: bool,
-    networking: bool,
+    network_mode: VzNetworkMode,
     mac: Option<&str>,
     extra_drives: &[(std::path::PathBuf, bool)],
     resume: bool,
@@ -1257,7 +1328,7 @@ pub fn vz_long_restore(
             cpu_count,
             memory_mib,
             read_only,
-            networking,
+            network_mode.code(),
             mac_ptr,
             drives.count(),
             drives.paths_ptr(),

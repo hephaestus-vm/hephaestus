@@ -12,6 +12,8 @@ import ContainerizationOS
 import Dispatch
 import Foundation
 import Virtualization
+import XPC
+import vmnet
 
 // =============================================================================
 // VM lifecycle primitives shared across N0/N1.
@@ -1506,6 +1508,12 @@ private final class VzVmHandle: @unchecked Sendable {
     let config: VZVirtualMachineConfiguration
     let logURL: URL
     let machineIdURL: URL
+    // VZVmnetNetworkDeviceAttachment does not retain its vmnet_network_ref, so
+    // the handle must own it for at least as long as the VM configuration.
+    let vmnetNetwork: vmnet_network_ref?
+    let vmnetInterface: interface_ref?
+    let vmnetQueue: DispatchQueue?
+    let vmnetMaxPacketSize: Int
     var socketListeners: [AnyObject] = []
 
     init(
@@ -1513,14 +1521,72 @@ private final class VzVmHandle: @unchecked Sendable {
         holder: VMHolder,
         config: VZVirtualMachineConfiguration,
         logURL: URL,
-        machineIdURL: URL
+        machineIdURL: URL,
+        vmnetNetwork: vmnet_network_ref? = nil,
+        vmnetInterface: interface_ref? = nil,
+        vmnetQueue: DispatchQueue? = nil,
+        vmnetMaxPacketSize: Int = 1514
     ) {
         self.queue = queue
         self.holder = holder
         self.config = config
         self.logURL = logURL
         self.machineIdURL = machineIdURL
+        self.vmnetNetwork = vmnetNetwork
+        self.vmnetInterface = vmnetInterface
+        self.vmnetQueue = vmnetQueue
+        self.vmnetMaxPacketSize = vmnetMaxPacketSize
     }
+}
+
+private final class VmnetStartState: @unchecked Sendable {
+    var status: vmnet_return_t = .VMNET_FAILURE
+    var maxPacketSize: Int = 1514
+}
+
+@available(macOS 26.0, *)
+private func startVmnetPacketInterface(
+    network: vmnet_network_ref
+) throws -> (interface_ref, DispatchQueue, Int) {
+    let queue = DispatchQueue(label: "com.hephaestus.vmnet-packets-\(UUID().uuidString)")
+    let semaphore = DispatchSemaphore(value: 0)
+    let state = VmnetStartState()
+    let descriptor = xpc_dictionary_create(nil, nil, 0)
+    xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, true)
+
+    guard let interface = vmnet_interface_start_with_network(
+        network,
+        descriptor,
+        queue,
+        { status, parameters in
+            state.status = status
+            if let parameters {
+                let maxPacketSize = xpc_dictionary_get_uint64(
+                    parameters,
+                    vmnet_max_packet_size_key
+                )
+                if maxPacketSize > 0 {
+                    state.maxPacketSize = Int(maxPacketSize)
+                }
+            }
+            semaphore.signal()
+        }
+    ) else {
+        throw NSError(
+            domain: "HephaestusVmnet",
+            code: 3,
+            userInfo: [NSLocalizedDescriptionKey: "vmnet packet interface failed synchronously"]
+        )
+    }
+    semaphore.wait()
+    guard state.status == .VMNET_SUCCESS else {
+        throw NSError(
+            domain: "HephaestusVmnet",
+            code: Int(state.status.rawValue),
+            userInfo: [NSLocalizedDescriptionKey: "vmnet packet interface failed (status: \(state.status))"]
+        )
+    }
+    return (interface, queue, state.maxPacketSize)
 }
 
 /// Build a VZVirtualMachineConfiguration for the long-running path.
@@ -1544,6 +1610,14 @@ private func decodeExtraDrives(
     return out
 }
 
+private struct LongRunningConfiguration {
+    let config: VZVirtualMachineConfiguration
+    let vmnetNetwork: vmnet_network_ref?
+    let vmnetInterface: interface_ref?
+    let vmnetQueue: DispatchQueue?
+    let vmnetMaxPacketSize: Int
+}
+
 private func buildLongRunningConfig(
     kernel: URL,
     rootfs: URL,
@@ -1554,11 +1628,15 @@ private func buildLongRunningConfig(
     memoryBytes: UInt64,
     commandLine: String,
     readOnly: Bool,
-    enableNetworking: Bool,
+    networkMode: UInt32,
     macAddress: String?,
     extraDrives: [(url: URL, readOnly: Bool)]
-) throws -> VZVirtualMachineConfiguration {
+) throws -> LongRunningConfiguration {
     let config = VZVirtualMachineConfiguration()
+    var retainedVmnetNetwork: vmnet_network_ref?
+    var packetInterface: interface_ref?
+    var packetQueue: DispatchQueue?
+    var maxPacketSize = 1514
     config.cpuCount = cpuCount
     config.memorySize = memoryBytes
 
@@ -1613,13 +1691,48 @@ private func buildLongRunningConfig(
     // identical across save/restore.
     config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
 
-    // Guest networking via VZ's built-in NAT. NAT only needs the base
-    // com.apple.security.virtualization entitlement (unlike vmnet's
-    // restricted com.apple.vm.networking), so it works under ad-hoc
-    // signing. VZ hands the guest a DHCP lease in 192.168.64.0/24.
-    if enableNetworking {
+    // Network mode is selected by the daemon at startup. NAT remains the
+    // base-entitlement default. vmnet creates a process-owned shared network
+    // whose DHCP/NAT topology can be customized through the vmnet framework.
+    if networkMode != 0 {
         let netDevice = VZVirtioNetworkDeviceConfiguration()
-        netDevice.attachment = VZNATNetworkDeviceAttachment()
+        switch networkMode {
+        case 1:
+            netDevice.attachment = VZNATNetworkDeviceAttachment()
+        case 2:
+            guard #available(macOS 26.0, *) else {
+                throw NSError(
+                    domain: "HephaestusVmnet",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "vmnet networking requires macOS 26 or later"]
+                )
+            }
+            var status: vmnet_return_t = .VMNET_FAILURE
+            guard let networkConfig = vmnet_network_configuration_create(.VMNET_SHARED_MODE, &status)
+            else {
+                throw NSError(
+                    domain: "HephaestusVmnet",
+                    code: Int(status.rawValue),
+                    userInfo: [NSLocalizedDescriptionKey: "failed to create vmnet configuration (status: \(status))"]
+                )
+            }
+            guard let network = vmnet_network_create(networkConfig, &status),
+                  status == .VMNET_SUCCESS else {
+                throw NSError(
+                    domain: "HephaestusVmnet",
+                    code: Int(status.rawValue),
+                    userInfo: [NSLocalizedDescriptionKey: "failed to create vmnet network (status: \(status))"]
+                )
+            }
+            retainedVmnetNetwork = network
+            netDevice.attachment = VZVmnetNetworkDeviceAttachment(network: network)
+        default:
+            throw NSError(
+                domain: "HephaestusVmnet",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "unknown network mode: \(networkMode)"]
+            )
+        }
         if let macAddress, let mac = VZMACAddress(string: macAddress) {
             netDevice.macAddress = mac
         }
@@ -1630,7 +1743,19 @@ private func buildLongRunningConfig(
     if #available(macOS 14.0, *) {
         try config.validateSaveRestoreSupport()
     }
-    return config
+    if #available(macOS 26.0, *), let network = retainedVmnetNetwork {
+        let packet = try startVmnetPacketInterface(network: network)
+        packetInterface = packet.0
+        packetQueue = packet.1
+        maxPacketSize = packet.2
+    }
+    return LongRunningConfiguration(
+        config: config,
+        vmnetNetwork: retainedVmnetNetwork,
+        vmnetInterface: packetInterface,
+        vmnetQueue: packetQueue,
+        vmnetMaxPacketSize: maxPacketSize
+    )
 }
 
 @_cdecl("hb_vz_long_new")
@@ -1643,7 +1768,7 @@ public func hb_vz_long_new(
     cpuCount: UInt32,
     memoryMib: UInt64,
     readOnly: Bool,
-    enableNetworking: Bool,
+    networkMode: UInt32,
     macAddress: UnsafePointer<CChar>?,
     extraDriveCount: Int,
     extraDrivePaths: UnsafePointer<UnsafePointer<CChar>?>?,
@@ -1671,7 +1796,7 @@ public func hb_vz_long_new(
     let machineId = log.deletingPathExtension().appendingPathExtension("machineid")
 
     do {
-        let config = try buildLongRunningConfig(
+        let built = try buildLongRunningConfig(
             kernel: kernel,
             rootfs: rootfs,
             initrd: initrd,
@@ -1681,10 +1806,11 @@ public func hb_vz_long_new(
             memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
             commandLine: commandLine,
             readOnly: readOnly,
-            enableNetworking: enableNetworking,
+            networkMode: networkMode,
             macAddress: mac,
             extraDrives: extraDrives
         )
+        let config = built.config
 
         let queue = DispatchQueue(label: "com.hephaestus.vz-long-\(UUID().uuidString)")
         let holder = VMHolder()
@@ -1701,7 +1827,11 @@ public func hb_vz_long_new(
             holder: holder,
             config: config,
             logURL: log,
-            machineIdURL: machineId
+            machineIdURL: machineId,
+            vmnetNetwork: built.vmnetNetwork,
+            vmnetInterface: built.vmnetInterface,
+            vmnetQueue: built.vmnetQueue,
+            vmnetMaxPacketSize: built.vmnetMaxPacketSize
         )
         let opaque = Unmanaged.passRetained(handle).toOpaque()
         outVm.pointee = opaque.assumingMemoryBound(to: HbVzVm.self)
@@ -1912,6 +2042,81 @@ public func hb_vz_long_connect(
     }
 }
 
+@_cdecl("hb_vz_long_vmnet_read")
+public func hb_vz_long_vmnet_read(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    buffer: UnsafeMutablePointer<UInt8>?,
+    capacity: Int,
+    outLen: UnsafeMutablePointer<Int>?,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrowVz(vm, outErr),
+          let interface = handle.vmnetInterface,
+          let buffer,
+          capacity > 0,
+          let outLen else {
+        writeError(outErr, "vmnet packet interface unavailable")
+        return Status.invalidArgument
+    }
+    guard capacity >= handle.vmnetMaxPacketSize else {
+        writeError(outErr, "vmnet read buffer is smaller than max packet size")
+        return Status.invalidArgument
+    }
+    var io = iovec(
+        iov_base: UnsafeMutableRawPointer(buffer),
+        iov_len: handle.vmnetMaxPacketSize
+    )
+    var packet = vmpktdesc(
+        vm_pkt_size: handle.vmnetMaxPacketSize,
+        vm_pkt_iov: &io,
+        vm_pkt_iovcnt: 1,
+        vm_flags: 0
+    )
+    var count: Int32 = 1
+    let result = vmnet_read(interface, &packet, &count)
+    guard result == .VMNET_SUCCESS else {
+        writeError(outErr, "vmnet_read failed (status: \(result))")
+        return Status.swiftError
+    }
+    outLen.pointee = count == 0 ? 0 : packet.vm_pkt_size
+    outErr?.pointee = nil
+    return Status.ok
+}
+
+@_cdecl("hb_vz_long_vmnet_write")
+public func hb_vz_long_vmnet_write(
+    vm: UnsafeMutablePointer<HbVzVm>?,
+    buffer: UnsafePointer<UInt8>?,
+    len: Int,
+    outErr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle = borrowVz(vm, outErr),
+          let interface = handle.vmnetInterface,
+          let buffer,
+          len > 0 else {
+        writeError(outErr, "vmnet packet interface unavailable")
+        return Status.invalidArgument
+    }
+    var io = iovec(
+        iov_base: UnsafeMutableRawPointer(mutating: buffer),
+        iov_len: len
+    )
+    var packet = vmpktdesc(
+        vm_pkt_size: len,
+        vm_pkt_iov: &io,
+        vm_pkt_iovcnt: 1,
+        vm_flags: 0
+    )
+    var count: Int32 = 1
+    let result = vmnet_write(interface, &packet, &count)
+    guard result == .VMNET_SUCCESS, count == 1 else {
+        writeError(outErr, "vmnet_write failed (status: \(result), count: \(count))")
+        return Status.swiftError
+    }
+    outErr?.pointee = nil
+    return Status.ok
+}
+
 @_cdecl("hb_vz_long_stop")
 public func hb_vz_long_stop(
     vm: UnsafeMutablePointer<HbVzVm>?,
@@ -1941,6 +2146,12 @@ public func hb_vz_long_free(vm: UnsafeMutablePointer<HbVzVm>?) {
     // no-op; if it hasn't, this prevents a leaked dispatch queue + VZ
     // process lingering past the handle's lifetime.
     _ = blockingStop(queue: handle.queue, holder: handle.holder)
+    if let interface = handle.vmnetInterface,
+       let queue = handle.vmnetQueue {
+        let semaphore = DispatchSemaphore(value: 0)
+        vmnet_stop_interface(interface, queue) { _ in semaphore.signal() }
+        _ = semaphore.wait(timeout: .now() + 2)
+    }
     Unmanaged<VzVmHandle>.fromOpaque(opaque).release()
 }
 
@@ -2225,7 +2436,7 @@ public func hb_vz_long_restore(
     cpuCount: UInt32,
     memoryMib: UInt64,
     readOnly: Bool,
-    enableNetworking: Bool,
+    networkMode: UInt32,
     macAddress: UnsafePointer<CChar>?,
     extraDriveCount: Int,
     extraDrivePaths: UnsafePointer<UnsafePointer<CChar>?>?,
@@ -2254,7 +2465,7 @@ public func hb_vz_long_restore(
 
     do {
         let configStart = DispatchTime.now()
-        let config = try buildLongRunningConfig(
+        let built = try buildLongRunningConfig(
             kernel: kernel,
             rootfs: rootfs,
             initrd: initrd,
@@ -2264,10 +2475,11 @@ public func hb_vz_long_restore(
             memoryBytes: (memoryMib == 0 ? 512 : memoryMib) * (1 << 20),
             commandLine: commandLine,
             readOnly: readOnly,
-            enableNetworking: enableNetworking,
+            networkMode: networkMode,
             macAddress: mac,
             extraDrives: extraDrives
         )
+        let config = built.config
         let configElapsed = DispatchTime.now().uptimeNanoseconds - configStart.uptimeNanoseconds
 
         let queue = DispatchQueue(label: "com.hephaestus.vz-long-restore-\(UUID().uuidString)")
@@ -2305,7 +2517,11 @@ public func hb_vz_long_restore(
             holder: holder,
             config: config,
             logURL: log,
-            machineIdURL: machineId
+            machineIdURL: machineId,
+            vmnetNetwork: built.vmnetNetwork,
+            vmnetInterface: built.vmnetInterface,
+            vmnetQueue: built.vmnetQueue,
+            vmnetMaxPacketSize: built.vmnetMaxPacketSize
         )
         let opaque = Unmanaged.passRetained(handle).toOpaque()
         outVm.pointee = opaque.assumingMemoryBound(to: HbVzVm.self)

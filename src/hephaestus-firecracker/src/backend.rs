@@ -9,8 +9,8 @@ use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,8 +31,10 @@ use hephaestus_fc_api::vmm_config::snapshot::{
 use hephaestus_fc_api::vmm_config::vsock::VsockConfig;
 use hephaestus_fc_api::{VmmBackend, VmmBackendError};
 use hephaestus_pool::{ClaimedSlot, Pool, PoolMatchSpec};
-use hephaestus_vmm::{VzSpec, VzVm, vz_long_restore};
+use hephaestus_vmm::{VzNetworkMode, VzSpec, VzVm, vz_long_restore};
 use serde_json::Value;
+
+use crate::host_mmds;
 
 /// Guest-initiated vsock port for hephaestus' practical MMDS transport.
 /// Port 1234 is reserved for hephaestus-agent command injection.
@@ -226,12 +228,22 @@ impl Default for MetricsState {
 // `Sync` is required because the vsock bridge shares the handle with its
 // accept-loop thread via `Arc<dyn VzVmHandle>`; `VzVm` is soundly `Sync`
 // (Swift serializes all handle access on the per-VM dispatch queue).
-trait VzVmHandle: std::fmt::Debug + Send + Sync {
+pub(crate) trait VzVmHandle: std::fmt::Debug + Send + Sync {
     fn serve_mmds_vsock(&self, port: u32, json: &[u8]) -> Result<(), VmmBackendError>;
     /// Open a host-side connection to a guest vsock port. Replaces the old
     /// raw-`usize` handle-address API: because the caller holds an
     /// `Arc<dyn VzVmHandle>`, the VZ handle provably outlives the connect.
     fn connect_vsock(&self, port: u32) -> Result<UnixStream, VmmBackendError>;
+    fn vmnet_read(&self, _buffer: &mut [u8]) -> Result<usize, VmmBackendError> {
+        Err(VmmBackendError::NotSupported(
+            "vmnet packet interface unavailable".into(),
+        ))
+    }
+    fn vmnet_write(&self, _buffer: &[u8]) -> Result<(), VmmBackendError> {
+        Err(VmmBackendError::NotSupported(
+            "vmnet packet interface unavailable".into(),
+        ))
+    }
     fn save_state(&self, path: &std::path::Path) -> Result<(), VmmBackendError>;
     fn pause(&self) -> Result<(), VmmBackendError>;
     fn resume(&self) -> Result<(), VmmBackendError>;
@@ -247,6 +259,16 @@ impl VzVmHandle for VzVm {
 
     fn connect_vsock(&self, port: u32) -> Result<UnixStream, VmmBackendError> {
         self.connect_vsock(port)
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))
+    }
+
+    fn vmnet_read(&self, buffer: &mut [u8]) -> Result<usize, VmmBackendError> {
+        self.vmnet_read(buffer)
+            .map_err(|err| VmmBackendError::Internal(err.to_string()))
+    }
+
+    fn vmnet_write(&self, buffer: &[u8]) -> Result<(), VmmBackendError> {
+        self.vmnet_write(buffer)
             .map_err(|err| VmmBackendError::Internal(err.to_string()))
     }
 
@@ -289,9 +311,14 @@ pub struct VzBackend {
     /// Secondary (non-root) drives in insertion order, keyed by drive_id.
     extra_drives: Vec<ExtraDrive>,
     iface: Option<NetworkInterfaceConfig>,
+    /// Host attachment used when a client configures a guest network interface.
+    /// NAT is the default; vmnet is opt-in at daemon startup.
+    network_mode: VzNetworkMode,
     machine_config: MachineConfig,
     mmds: Value,
+    mmds_shared: Arc<RwLock<Value>>,
     mmds_config: MmdsConfig,
+    host_mmds: bool,
     /// Configured memory balloon (`PUT /balloon`), if any. The VZ balloon
     /// device is always attached; this tracks whether the *client* asked for
     /// one and its current reclaim target.
@@ -300,11 +327,12 @@ pub struct VzBackend {
     logger: LoggerState,
     metrics: MetricsState,
     /// Drop order matters and is encoded by field order below:
-    /// `vsock_bridge` drops first (its `Drop` stops the accept loop and
-    /// releases its `Arc` clone of the VM), then `vm` (last `Arc` → frees the
-    /// Swift handle), then `pool_slot` (its `Drop` deletes the rootfs clone).
+    /// `vmnet_mmds` and `vsock_bridge` drop first (stopping their threads and
+    /// releasing `Arc` clones of the VM), then `vm` (last `Arc` frees the Swift
+    /// handle), then `pool_slot` (its `Drop` deletes the rootfs clone).
     /// Reordering these can delete a rootfs out from under a live VM or leave
     /// the bridge holding a freed handle.
+    vmnet_mmds: Option<host_mmds::VmnetMmdsResponder>,
     vsock_bridge: Option<VsockBridge>,
     vm: Option<Arc<dyn VzVmHandle>>,
     pool_slot: Option<ClaimedSlot>,
@@ -324,13 +352,17 @@ impl VzBackend {
             root_drive_read_only: false,
             extra_drives: Vec::new(),
             iface: None,
+            network_mode: VzNetworkMode::Nat,
             machine_config: MachineConfig::default(),
             mmds: Value::Object(Default::default()),
+            mmds_shared: Arc::new(RwLock::new(Value::Object(Default::default()))),
             mmds_config: MmdsConfig::default(),
+            host_mmds: false,
             balloon: None,
             vsock: None,
             logger: LoggerState::default(),
             metrics: MetricsState::default(),
+            vmnet_mmds: None,
             vsock_bridge: None,
             vm: None,
             pool_slot: None,
@@ -346,6 +378,31 @@ impl VzBackend {
     pub fn with_pool(mut self, pool: Pool) -> Self {
         self.pool = Some(pool);
         self
+    }
+
+    /// Enable transparent link-local MMDS when the daemon uses vmnet.
+    pub fn with_host_mmds(mut self, enabled: bool) -> Self {
+        self.host_mmds = enabled;
+        self
+    }
+
+    /// Use a process-owned shared vmnet network for configured guest NICs.
+    /// The default remains Virtualization.framework NAT.
+    pub fn with_vmnet_networking(mut self, enabled: bool) -> Self {
+        self.network_mode = if enabled {
+            VzNetworkMode::Vmnet
+        } else {
+            VzNetworkMode::Nat
+        };
+        self
+    }
+
+    fn configured_network_mode(&self) -> VzNetworkMode {
+        if self.iface.is_some() {
+            self.network_mode
+        } else {
+            VzNetworkMode::None
+        }
     }
 
     fn require_preboot(&self) -> Result<(), VmmBackendError> {
@@ -366,6 +423,7 @@ impl VzBackend {
     /// machine config) is untouched, so the client can fix the offending
     /// setting and retry `InstanceStart`.
     fn abort_boot(&mut self) {
+        self.vmnet_mmds = None;
         self.vsock_bridge = None;
         self.vm = None;
         self.pool_slot = None;
@@ -538,6 +596,22 @@ impl VzBackend {
         let json = serde_json::to_vec(&self.mmds)
             .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
         vm.serve_mmds_vsock(MMDS_VSOCK_PORT, &json)
+    }
+
+    fn start_vmnet_mmds(&mut self, vm: Arc<dyn VzVmHandle>) -> Result<(), VmmBackendError> {
+        if !self.host_mmds {
+            return Ok(());
+        }
+        if self.configured_network_mode() != VzNetworkMode::Vmnet {
+            return Err(VmmBackendError::InvalidConfig(
+                "--host-mmds requires --network-backend vmnet".into(),
+            ));
+        }
+        self.vmnet_mmds = Some(host_mmds::VmnetMmdsResponder::start(
+            vm,
+            self.mmds_shared.clone(),
+        )?);
+        Ok(())
     }
 
     fn start_vsock_bridge(&mut self) -> Result<(), VmmBackendError> {
@@ -752,12 +826,22 @@ impl VmmBackend for VzBackend {
 
     fn put_mmds(&mut self, data: Value) -> Result<(), VmmBackendError> {
         self.mmds = data;
+        *self
+            .mmds_shared
+            .write()
+            .map_err(|_| VmmBackendError::Internal("MMDS lock poisoned".into()))? =
+            self.mmds.clone();
         self.refresh_mmds_vsock_service()?;
         Ok(())
     }
 
     fn patch_mmds(&mut self, data: Value) -> Result<(), VmmBackendError> {
         merge_json(&mut self.mmds, data);
+        *self
+            .mmds_shared
+            .write()
+            .map_err(|_| VmmBackendError::Internal("MMDS lock poisoned".into()))? =
+            self.mmds.clone();
         self.refresh_mmds_vsock_service()?;
         Ok(())
     }
@@ -955,6 +1039,7 @@ impl VmmBackend for VzBackend {
         // Pool snapshots are single-rootfs; a VM needing secondary drives
         // can't be served from one, so skip the pool when any are configured.
         if self.extra_drives.is_empty()
+            && self.configured_network_mode() != VzNetworkMode::Vmnet
             && let Some(pool) = self.pool.as_ref()
         {
             let spec = PoolMatchSpec {
@@ -1014,7 +1099,7 @@ impl VmmBackend for VzBackend {
             .cpus(cpu)
             .memory_mib(memory)
             .read_only(self.root_drive_read_only)
-            .networking(self.iface.is_some())
+            .network_mode(self.configured_network_mode())
             .mac(self.configured_mac())
             .extra_drives(self.extra_drive_specs());
         if let Some(initrd) = boot.initrd_path.as_ref() {
@@ -1026,7 +1111,9 @@ impl VmmBackend for VzBackend {
         vm.start()
             .map_err(|err| VmmBackendError::Internal(err.to_string()))?;
 
-        self.vm = Some(Arc::new(vm));
+        let vm: Arc<dyn VzVmHandle> = Arc::new(vm);
+        self.start_vmnet_mmds(vm.clone())?;
+        self.vm = Some(vm);
         self.state = VmState::Running;
         self.origin = Some(RunOrigin::ColdBoot);
         if let Err(err) = self.start_vsock_bridge() {
@@ -1125,7 +1212,7 @@ impl VmmBackend for VzBackend {
         let log = self.serial_log_path();
 
         let initrd = boot.initrd_path.as_ref().map(PathBuf::from);
-        let networking = self.iface.is_some();
+        let network_mode = self.configured_network_mode();
         let mac = self.configured_mac();
         let extra_drives = self.extra_drive_specs();
         let (vm, timings) = vz_long_restore(
@@ -1138,7 +1225,7 @@ impl VmmBackend for VzBackend {
             cpu,
             memory,
             self.root_drive_read_only,
-            networking,
+            network_mode,
             mac.as_deref(),
             &extra_drives,
             params.resume_vm,
@@ -1161,7 +1248,9 @@ impl VmmBackend for VzBackend {
             params.resume_vm,
         );
 
-        self.vm = Some(Arc::new(vm));
+        let vm: Arc<dyn VzVmHandle> = Arc::new(vm);
+        self.start_vmnet_mmds(vm.clone())?;
+        self.vm = Some(vm);
         self.state = if params.resume_vm {
             VmState::Running
         } else {
@@ -1760,6 +1849,7 @@ mod tests {
         // No NIC configured → no networking, no MAC.
         let mut backend = VzBackend::new("test".into());
         assert!(backend.iface.is_none());
+        assert_eq!(backend.configured_network_mode(), VzNetworkMode::None);
         assert_eq!(backend.configured_mac(), None);
 
         // A configured guest_mac round-trips (Display is lowercase).
@@ -1773,9 +1863,16 @@ mod tests {
             })
             .unwrap();
         assert!(backend.iface.is_some());
+        assert_eq!(backend.configured_network_mode(), VzNetworkMode::Nat);
         assert_eq!(
             backend.configured_mac().as_deref(),
             Some("aa:bb:cc:dd:ee:ff")
+        );
+
+        let vmnet_backend = backend.with_vmnet_networking(true);
+        assert_eq!(
+            vmnet_backend.configured_network_mode(),
+            VzNetworkMode::Vmnet
         );
 
         // A NIC without an explicit MAC still enables networking (VZ assigns one).
