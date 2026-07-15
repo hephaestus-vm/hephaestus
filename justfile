@@ -293,6 +293,16 @@ fc-compat-vsock-e2e:
 fc-compat-net-e2e:
     scripts/fc-compat-net-e2e.sh
 
+# Real-VM transparent MMDS smoke through the profile-authorized shared vmnet
+# attachment. The guest obtains DHCP and fetches 169.254.169.254 without the
+# agent MMDS shim. Requires the managed capability, profile, and identity.
+fc-compat-vmnet-e2e: sign-vmnet
+    HEPHAESTUS_FIRECRACKER_BIN="$PWD/build/HephaestusFirecracker.app/Contents/MacOS/hephaestus-firecracker" \
+      HEPHAESTUS_FIRECRACKER_ARGS="--network-backend vmnet --host-mmds" \
+      HEPHAESTUS_NETWORK_LABEL="shared vmnet + transparent MMDS" \
+      HEPHAESTUS_TEST_MMDS=1 \
+      scripts/fc-compat-net-e2e.sh
+
 # Real-VM e2e for vz-exec --stdin, stderr split, and hephaestus-jailer.
 # Requires apple/container kernel/rootfs artifacts; not CI-safe.
 e2e-new-features:
@@ -450,33 +460,30 @@ test-rootfs: build
 
 # --- M1b (vmnet MMDS) enablement ------------------------------------------
 # Probe whether this machine can honor the restricted com.apple.vm.networking
-# entitlement. SIGKILL on launch => needs a provisioning profile; printed
-# output => usable. See docs/DEV_ENV.md.
+# entitlement. The executable is wrapped in an app bundle because AMFI requires
+# the authorizing provisioning profile to be embedded. See
+# docs/development/privileged-features.md.
 probe-vmnet:
     #!/usr/bin/env bash
     set -euo pipefail
-    id="${HEPHAESTUS_SIGN_IDENTITY:-}"
-    [[ -n "$id" ]] || id="$(security find-identity -v -p codesigning | awk '/Apple Development/{print $2; exit}')"
-    [[ -n "$id" ]] || { echo "no Apple Development identity; set HEPHAESTUS_SIGN_IDENTITY"; exit 1; }
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-    xcrun swiftc -O scripts/vmnet-probe.swift -o "$tmp/vmnet-probe"
-    codesign --force --sign "$id" --entitlements hephaestus-vmnet.entitlements "$tmp/vmnet-probe"
-    echo "== running probe (no output / 'Killed: 9' => entitlement not authorized) =="
-    "$tmp/vmnet-probe"
+    sdk="$(env -u SDKROOT xcrun --sdk macosx --show-sdk-path)"
+    env -u SDKROOT xcrun --sdk macosx swiftc -sdk "$sdk" -O \
+      scripts/vmnet-probe.swift -o "$tmp/vmnet-probe"
+    scripts/package-vmnet-app.sh "$tmp/vmnet-probe" "$tmp/VMNetProbe.app"
+    echo "== running profile-authorized vmnet probe =="
+    "$tmp/VMNetProbe.app/Contents/MacOS/vmnet-probe"
 
-# Rebuild the workspace signed with the vmnet entitlement + your Apple
-# Development identity, so bridged-networking code can actually run. Requires a
-# provisioning profile with the Virtualization Networking capability installed.
+# Build hephaestus-firecracker and package it in an app bundle carrying the
+# provisioning profile that authorizes com.apple.vm.networking. Run the daemon
+# from build/HephaestusFirecracker.app/Contents/MacOS/hephaestus-firecracker.
 sign-vmnet:
     #!/usr/bin/env bash
     set -euo pipefail
-    id="${HEPHAESTUS_SIGN_IDENTITY:-}"
-    [[ -n "$id" ]] || id="$(security find-identity -v -p codesigning | awk '/Apple Development/{print $2; exit}')"
-    [[ -n "$id" ]] || { echo "no Apple Development identity; set HEPHAESTUS_SIGN_IDENTITY"; exit 1; }
-    HEPHAESTUS_ENTITLEMENTS="$PWD/hephaestus-vmnet.entitlements" \
-      HEPHAESTUS_SIGN_IDENTITY="$id" \
-      cargo build -p hephaestus-firecracker
-    echo "signed hephaestus-firecracker with vmnet entitlement ($id)"
+    env -u SDKROOT cargo build -p hephaestus-firecracker
+    scripts/package-vmnet-app.sh \
+      build/cargo_target/debug/hephaestus-firecracker \
+      build/HephaestusFirecracker.app
 
 # --- M4 (jailer productionization) ----------------------------------------
 # Verify the jailer's --rlimit-* caps reach the exec'd daemon. Root-free,
