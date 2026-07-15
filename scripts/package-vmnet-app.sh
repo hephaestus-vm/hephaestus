@@ -35,34 +35,15 @@ fi
     exit 1
 }
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+profile_tool="$script_dir/vmnet_profile.py"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 profile_matches() {
     local candidate="$1" decoded="$tmp/candidate.plist"
     security cms -D -i "$candidate" >"$decoded" 2>/dev/null || return 1
-    python3 - "$decoded" "$bundle_id" <<'PY'
-import datetime
-import plistlib
-import sys
-
-with open(sys.argv[1], "rb") as f:
-    profile = plistlib.load(f)
-entitlements = profile.get("Entitlements", {})
-app_id = entitlements.get("com.apple.application-identifier") or entitlements.get("application-identifier", "")
-platforms = profile.get("Platform", [])
-expires = profile.get("ExpirationDate")
-now = datetime.datetime.now(datetime.timezone.utc)
-if expires is not None and expires.tzinfo is None:
-    expires = expires.replace(tzinfo=datetime.timezone.utc)
-ok = (
-    app_id.endswith("." + sys.argv[2])
-    and entitlements.get("com.apple.vm.networking") is True
-    and "OSX" in platforms
-    and (expires is None or expires > now)
-)
-raise SystemExit(0 if ok else 1)
-PY
+    python3 "$profile_tool" matches "$decoded" "$bundle_id"
 }
 
 profile="${HEPHAESTUS_PROVISIONING_PROFILE:-}"
@@ -99,24 +80,8 @@ security cms -D -i "$profile" >"$profile_plist"
 # Build only the entitlements this executable needs. The application and team
 # identifiers must match the embedded profile; unrelated profile entitlements
 # (for example keychain wildcard groups) should not be claimed by the binary.
-python3 - "$profile_plist" "$tmp/entitlements.plist" <<'PY'
-import plistlib
-import sys
-
-with open(sys.argv[1], "rb") as f:
-    profile = plistlib.load(f)
-p = profile["Entitlements"]
-app_id = p.get("com.apple.application-identifier") or p.get("application-identifier")
-team_id = p["com.apple.developer.team-identifier"]
-entitlements = {
-    "com.apple.application-identifier": app_id,
-    "com.apple.developer.team-identifier": team_id,
-    "com.apple.security.virtualization": True,
-    "com.apple.vm.networking": True,
-}
-with open(sys.argv[2], "wb") as f:
-    plistlib.dump(entitlements, f, sort_keys=True)
-PY
+python3 "$profile_tool" write-entitlements \
+    "$profile_plist" "$tmp/entitlements.plist"
 
 exec_name="$(basename "$executable")"
 rm -rf "$output_app"
@@ -125,22 +90,8 @@ cp "$executable" "$output_app/Contents/MacOS/$exec_name"
 chmod 755 "$output_app/Contents/MacOS/$exec_name"
 cp "$profile" "$output_app/Contents/embedded.provisionprofile"
 
-python3 - "$output_app/Contents/Info.plist" "$bundle_id" "$exec_name" <<'PY'
-import plistlib
-import sys
-
-info = {
-    "CFBundleExecutable": sys.argv[3],
-    "CFBundleIdentifier": sys.argv[2],
-    "CFBundleName": "Hephaestus",
-    "CFBundlePackageType": "APPL",
-    "CFBundleShortVersionString": "1.0",
-    "CFBundleVersion": "1",
-    "LSBackgroundOnly": True,
-}
-with open(sys.argv[1], "wb") as f:
-    plistlib.dump(info, f, sort_keys=True)
-PY
+python3 "$profile_tool" write-info \
+    "$output_app/Contents/Info.plist" "$bundle_id" "$exec_name"
 
 codesign --force --sign "$identity" --timestamp=none \
     --entitlements "$tmp/entitlements.plist" "$output_app"
