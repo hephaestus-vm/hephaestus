@@ -6,6 +6,18 @@ numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Profile-authorized vmnet networking.** `just probe-vmnet` and
+  `just sign-vmnet` now build app bundles with an embedded provisioning profile
+  instead of placing a restricted entitlement on a standalone executable.
+  `hephaestus-firecracker --network-backend vmnet` attaches configured guest
+  NICs to a process-owned `VMNET_SHARED_MODE` network through
+  `VZVmnetNetworkDeviceAttachment`; NAT remains the default. With
+  `--host-mmds`, a root-free raw Ethernet/TCP responder claims
+  `169.254.169.254` inside that network, making MMDS reachable from stock guest
+  images without the agent shim or host route/interface changes.
+
 ## [0.4.0-alpha.1] — 2026-07-12
 
 ### Added
