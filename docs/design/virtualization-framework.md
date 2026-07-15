@@ -12,7 +12,7 @@ rejects operations where the hypervisors differ.
 | Machine configuration | `VZVirtualMachineConfiguration` CPU and memory |
 | Linux boot source | `VZLinuxBootLoader` |
 | Block drive | `VZVirtioBlockDeviceConfiguration` |
-| Network interface | `VZVirtioNetworkDeviceConfiguration` with VZ NAT |
+| Network interface | `VZVirtioNetworkDeviceConfiguration` with VZ NAT or shared vmnet |
 | Entropy device | `VZVirtioEntropyDeviceConfiguration` |
 | Memory balloon | `VZVirtioTraditionalMemoryBalloonDeviceConfiguration` |
 | Vsock | `VZVirtioSocketDeviceConfiguration` and host UDS bridge |
@@ -24,7 +24,8 @@ rejects operations where the hypervisors differ.
 
 VZ devices are generally fixed when constructing a VM, so live drive and NIC
 replacement are unavailable. NAT is managed by VZ rather than a caller-created
-tap device. VZ's save file is one hypervisor-specific blob rather than
+tap device. The opt-in vmnet path adds a user-space packet interface for
+transparent MMDS. VZ's save file is one hypervisor-specific blob rather than
 Firecracker's state and memory files.
 
 Several Firecracker features have no public VZ equivalent:

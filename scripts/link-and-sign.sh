@@ -58,13 +58,14 @@ fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Default: base virtualization entitlement, ad-hoc signature (works under SIP
-# for everything except restricted entitlements). Both are overridable so the
-# M1b vmnet track can sign with an Apple Development identity + the vmnet
-# entitlement set without editing this script:
+# Default: base virtualization entitlement, ad-hoc signature. Both remain
+# overridable for non-restricted development signatures:
 #   HEPHAESTUS_ENTITLEMENTS   path to an .entitlements plist (default: base)
 #   HEPHAESTUS_SIGN_IDENTITY  codesign identity (default: - for ad-hoc)
-# See docs/DEV_ENV.md.
+#
+# A restricted entitlement also needs an embedded provisioning profile, which a
+# standalone Mach-O cannot carry. Use scripts/package-vmnet-app.sh (or
+# `just sign-vmnet`) for com.apple.vm.networking builds.
 entitlements="${HEPHAESTUS_ENTITLEMENTS:-${script_dir}/../hephaestus.entitlements}"
 sign_identity="${HEPHAESTUS_SIGN_IDENTITY:--}"
 

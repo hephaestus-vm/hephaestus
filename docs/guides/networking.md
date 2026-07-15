@@ -1,7 +1,7 @@
 # Networking and MMDS
 
-Hephaestus has a base networking path that works with ad-hoc signing and an
-unfinished bridged path that requires a restricted Apple entitlement.
+Hephaestus has a base NAT path that works with ad-hoc signing and an
+experimental shared-vmnet path that requires a profile-authorized build.
 
 ## NAT networking
 
@@ -32,6 +32,26 @@ When working from the repository, `just network-check` wraps this workflow and
 adds an outbound HTTP request. Maintainers can use `just fc-compat-net-e2e` to
 validate the Firecracker API path.
 
+## Shared vmnet networking
+
+On macOS 26 or later, the Firecracker daemon can replace VZ's opaque NAT
+attachment with a `VZVmnetNetworkDeviceAttachment` backed by a process-owned
+`VMNET_SHARED_MODE` network:
+
+```console
+$ just sign-vmnet
+$ build/HephaestusFirecracker.app/Contents/MacOS/hephaestus-firecracker \
+    --network-backend vmnet \
+    --host-mmds \
+    --api-sock /tmp/hephaestus-firecracker.socket
+```
+
+The app bundle embeds the provisioning profile that authorizes
+`com.apple.vm.networking`; signing the standalone Mach-O is insufficient. Run
+`just probe-vmnet` first to validate both AMFI authorization and construction of
+the shared vmnet attachment. NAT remains the default and release builds do not
+claim the restricted entitlement.
+
 ## Metadata service
 
 The Firecracker MMDS endpoints store and return arbitrary JSON. For direct-VZ
@@ -53,7 +73,13 @@ Configured metadata is intentionally visible to guest processes. Do not place a 
 
 The agent shim provides the familiar link-local URL only to images that include the helper. Transparent MMDS for arbitrary images needs a network attachment where the host can answer on the guest's L2. VZ NAT is a black box and cannot be used for this.
 
-`hephaestus-firecracker --host-mmds` contains an experimental host listener, but real guest reachability still requires vmnet integration and the restricted `com.apple.vm.networking` entitlement. It is not a supported deployment path. See [Privileged features](../development/privileged-features.md).
+With `--host-mmds --network-backend vmnet`, Hephaestus claims
+`169.254.169.254` on the VM's virtual Ethernet segment, answers ARP, and serves
+MMDS using a small user-space TCP/HTTP responder. It does not add host interface
+aliases, routes, packet-filter rules, or require root. A stock guest with its
+NIC configured can therefore use the standard URL directly. Run
+`just fc-compat-vmnet-e2e` for the real-VM DHCP and HTTP smoke. See
+[Privileged features](../development/privileged-features.md) for signing setup.
 
 ## Vsock
 

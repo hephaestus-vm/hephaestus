@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Entitlements for the M1b (MMDS over the guest NIC) work: bridged vmnet
+  Entitlements for the M1b (MMDS over the guest NIC) work: vmnet-backed
   networking. com.apple.vm.networking is a RESTRICTED entitlement; AMFI only
   honors it when the signature is backed by a provisioning profile carrying
-  the Virtualization Networking capability. Ad-hoc signing embeds it but the
-  kernel ignores it, so a bridged VM fails to start. See docs/DEV_ENV.md.
+  the VM Networking capability. Ad-hoc signing embeds it but the
+  kernel ignores it, so an authorized vmnet path cannot start. See
+  docs/development/privileged-features.md.
   (XML comments must not contain a double-hyphen.)
 -->
 <plist version="1.0">

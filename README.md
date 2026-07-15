@@ -136,10 +136,10 @@ for the component and state-machine details.
 | Area | Current state |
 | :-- | :-- |
 | Firecracker API | Core lifecycle and the 14-call Go SDK sequence pass |
-| Guest networking | Virtualization.framework NAT; guest configures L3 |
+| Guest networking | VZ NAT by default; profile-authorized shared vmnet optional |
 | Snapshots | Save and restore between Hephaestus processes |
 | Warm pools | Agent and stock-init flavors supported |
-| MMDS | Control-plane API plus guest agent/vsock shim |
+| MMDS | Agent/vsock shim on NAT; transparent link-local service on vmnet |
 | Cross-hypervisor snapshots | Unsupported by the underlying formats |
 | CPU templates, pmem, memory hotplug | Unsupported by Virtualization.framework |
 | Untrusted multi-tenancy | **Unsupported**; jailer remains experimental |

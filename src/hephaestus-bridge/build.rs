@@ -109,7 +109,13 @@ fn main() {
     for lib in ["archive", "z", "bz2", "lzma", "iconv", "c++"] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
-    for framework in ["Foundation", "Virtualization", "Network", "Security"] {
+    for framework in [
+        "Foundation",
+        "Virtualization",
+        "Network",
+        "Security",
+        "vmnet",
+    ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
 

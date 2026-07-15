@@ -9,7 +9,8 @@ forward-looking; completed implementation history is kept in the
 
 The core HTTP lifecycle, CLI execution, NAT networking, data drives, entropy,
 ballooning, metrics, full snapshots, warm pools, vsock bridging, MMDS control
-plane, and experimental sandbox supervisor work end to end.
+plane, profile-authorized transparent MMDS over vmnet, and experimental sandbox
+supervisor work end to end.
 
 The project remains alpha because the deployment/security model and public
 stability contract are incomplete.
@@ -33,17 +34,7 @@ Remaining work includes:
 Completion requires more than a passing sandbox smoke. The security policy must
 explicitly support the intended tenant model.
 
-### 2. Transparent MMDS for stock images
-
-Goal: make `169.254.169.254` reachable from an arbitrary compatible guest image
-without the bundled agent shim.
-
-The likely implementation requires vmnet/bridged networking and the restricted
-`com.apple.vm.networking` entitlement. Work remains gated by an authorized
-signing and test environment. NAT plus the agent/vsock shim remains the default
-base-entitlement path.
-
-### 3. Public API and release stability
+### 2. Public API and release stability
 
 Before v1.0:
 

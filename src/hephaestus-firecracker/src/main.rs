@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
@@ -25,6 +25,14 @@ mod sandbox;
 mod server;
 
 use backend::VzBackend;
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum NetworkBackend {
+    /// Virtualization.framework's built-in NAT attachment.
+    Nat,
+    /// A customizable shared-mode network backed by the vmnet framework.
+    Vmnet,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "hephaestus-firecracker", version)]
@@ -41,6 +49,10 @@ struct Args {
     /// for the agent-init divergence note.
     #[arg(long)]
     pool_dir: Option<PathBuf>,
+    /// Host network attachment used for guest NICs configured through the
+    /// Firecracker API. vmnet requires a profile-authorized signed app bundle.
+    #[arg(long, value_enum, default_value_t = NetworkBackend::Nat)]
+    network_backend: NetworkBackend,
     /// Experimental macOS sandbox profile to enter before serving requests.
     /// The profile must allow the API socket plus all kernel/rootfs/log/snapshot
     /// paths the client will later configure. This is the first jailer hook, not
@@ -52,13 +64,11 @@ struct Args {
     /// e2e to prove the sandbox denies paths outside the generated allowlist.
     #[arg(long, hide = true)]
     sandbox_deny_probe: Option<PathBuf>,
-    /// Bind a host-side MMDS HTTP listener on `169.254.169.254:80` so
-    /// arbitrary guest images (without our agent's link-local shim) can
-    /// fetch metadata via `http://169.254.169.254/`. Requires a VM network
-    /// attachment that routes guest traffic to the host (e.g.
-    /// `VZVmnetNetworkDeviceAttachment` + the `com.apple.vm.networking`
-    /// entitlement) and a signed binary; bind fails with `EACCES` or
-    /// `EADDRNOTAVAIL` otherwise. See `docs/guides/networking.md`.
+    /// Serve MMDS transparently at `169.254.169.254:80` over the vmnet packet
+    /// interface so stock guest images do not need the agent shim. Requires
+    /// `--network-backend vmnet` and a profile-authorized app bundle. The
+    /// responder runs entirely in user space and does not modify host routes
+    /// or interfaces. See `docs/guides/networking.md`.
     #[arg(long)]
     host_mmds: bool,
 }
@@ -106,7 +116,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.api_sock.display()
     );
 
-    let mut backend = VzBackend::new(args.id);
+    if args.host_mmds && !matches!(args.network_backend, NetworkBackend::Vmnet) {
+        return Err("--host-mmds requires --network-backend vmnet".into());
+    }
+
+    let mut backend = VzBackend::new(args.id)
+        .with_vmnet_networking(matches!(args.network_backend, NetworkBackend::Vmnet))
+        .with_host_mmds(args.host_mmds);
     if let Some(dir) = args.pool_dir.as_deref() {
         match hephaestus_pool::Pool::open(dir) {
             Ok(pool) => {
@@ -135,17 +151,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 backend.lock().await.flush_metrics();
             }
         });
-    }
-
-    if args.host_mmds
-        && let Err(err) = host_mmds::spawn(backend.clone()).await
-    {
-        eprintln!(
-            "hephaestus-firecracker: --host-mmds listener failed to bind ({err}); \
-             this typically means the binary lacks the com.apple.vm.networking entitlement \
-             or the host has no interface on 169.254.169.254. See docs/guides/networking.md."
-        );
-        return Err(err.to_string().into());
     }
 
     loop {
