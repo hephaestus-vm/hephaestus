@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - run: shellcheck scripts/package-vmnet-app.sh
+      - run: shellcheck scripts/package-vmnet-app.sh scripts/fc-compat-net-e2e.sh
       - run: python3 -m compileall -q scripts
       - run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 

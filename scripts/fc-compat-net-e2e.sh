@@ -14,6 +14,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+net_tool="$repo_root/scripts/fc_compat_net_e2e.py"
 cd "$repo_root"
 
 cargo build -p hephaestus-firecracker
@@ -24,7 +25,7 @@ read -r -a firecracker_args <<< "${HEPHAESTUS_FIRECRACKER_ARGS:-}"
 network_label="${HEPHAESTUS_NETWORK_LABEL:-VZ NAT}"
 
 cdir="$HOME/Library/Application Support/com.apple.container"
-kernel="$(ls "$cdir"/kernels/vmlinux-* 2>/dev/null | head -1 || true)"
+kernel="$(find "$cdir/kernels" -maxdepth 1 -type f -name 'vmlinux-*' -print -quit 2>/dev/null || true)"
 snaps=("$cdir"/snapshots/*/snapshot)
 if [[ -z "$kernel" ]] || [[ ! -e "${snaps[0]:-}" ]]; then
   echo "no artifacts; run: just artifacts" >&2
@@ -81,14 +82,15 @@ api() {
 }
 
 api PUT /machine-config '{"vcpu_count":2,"mem_size_mib":512}'
-api PUT /vsock "$(python3 -c "import json,sys; print(json.dumps({'guest_cid':3,'uds_path':sys.argv[1]}))" "$vsock")"
+api PUT /vsock "$(python3 "$net_tool" vsock-config "$vsock")"
 # The interface that exercises this feature: a NIC with an explicit MAC.
-api PUT /network-interfaces/eth0 "$(python3 -c "print('{\"iface_id\":\"eth0\",\"host_dev_name\":\"tap0\",\"guest_mac\":\"AA:FC:00:00:00:01\"}')")"
+api PUT /network-interfaces/eth0 "$(python3 "$net_tool" network-config)"
 if [[ "${HEPHAESTUS_TEST_MMDS:-0}" == 1 ]]; then
   api PUT /mmds '{"latest":{"meta-data":{"instance-id":"i-hephaestus-vmnet"}}}'
 fi
-api PUT /boot-source "$(python3 -c "import json,sys; print(json.dumps({'kernel_image_path':sys.argv[1],'initrd_path':sys.argv[2],'boot_args':'console=hvc0 rdinit=/init quiet loglevel=3'}))" "$kernel" "$repo_root/build/agent.cpio.gz")"
-api PUT /drives/rootfs "$(python3 -c "import json,sys; print(json.dumps({'drive_id':'rootfs','path_on_host':sys.argv[1],'is_root_device':True,'is_read_only':False}))" "$rootfs")"
+api PUT /boot-source "$(python3 "$net_tool" boot-config \
+  "$kernel" "$repo_root/build/agent.cpio.gz")"
+api PUT /drives/rootfs "$(python3 "$net_tool" drive-config "$rootfs")"
 api PUT /actions '{"action_type":"InstanceStart"}'
 
 for _ in $(seq 1 100); do [[ -S "$vsock" ]] && break; sleep 0.1; done
@@ -98,74 +100,11 @@ if [[ ! -S "$vsock" ]]; then
   exit 1
 fi
 
-python3 - "$vsock" "${HEPHAESTUS_TEST_MMDS:-0}" <<'PY'
-import socket, struct, sys, time
-path = sys.argv[1]
-test_mmds = sys.argv[2] == "1"
-# The base smoke only checks that the NIC exists. The entitlement-gated MMDS
-# smoke also obtains a DHCP lease and performs a real guest HTTP request.
-if test_mmds:
-    cmd = b'''set -e
-iface="$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -1)"
-test -n "$iface"
-ip link set "$iface" up
-udhcpc -i "$iface" -n -q
-value="$(curl -fsS --max-time 10 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || wget -qO- -T 10 http://169.254.169.254/latest/meta-data/instance-id)"
-test "$value" = i-hephaestus-vmnet'''
-else:
-    # Pure sysfs; no iproute2/DHCP dependency.
-    cmd = b"test -n \"$(ls /sys/class/net 2>/dev/null | grep -v '^lo$')\""
-
-def connect_with_retry(port):
-    last = None
-    for _ in range(160):
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.connect(path)
-            s.sendall(f"CONNECT {port}\n".encode())
-            s.settimeout(0.05)
-            try:
-                data = s.recv(4, socket.MSG_PEEK)
-                if data.startswith(b"ERR "):
-                    raise RuntimeError(s.recv(256))
-            except TimeoutError:
-                pass
-            finally:
-                s.settimeout(None)
-            return s
-        except Exception as exc:
-            last = exc
-            time.sleep(0.25)
-    raise RuntimeError(f"could not connect to guest port {port}: {last}")
-
-last = None
-for _ in range(80):
-    try:
-        command = connect_with_retry(1234)
-        command.settimeout(30)
-        command.sendall(struct.pack("<I", len(cmd)) + cmd)
-        data = b""
-        while len(data) < 4:
-            chunk = command.recv(4 - len(data))
-            if not chunk:
-                raise RuntimeError("short exit-code read")
-            data += chunk
-        if data.startswith(b"ERR "):
-            raise RuntimeError(data + command.recv(256))
-        code = struct.unpack("<i", data)[0]
-        if code != 0:
-            raise RuntimeError(f"no non-loopback netdev in guest (agent exit {code}); NIC not attached")
-        if test_mmds:
-            print("guest fetched transparent MMDS over vmnet")
-        else:
-            print("guest sees a non-loopback network device")
-        raise SystemExit(0)
-    except Exception as exc:
-        sys.stderr.write(f"net-e2e attempt failed: {type(exc).__name__}: {exc!r}\n")
-        last = exc
-        time.sleep(0.25)
-raise SystemExit(f"could not complete net e2e: {last}")
-PY
+guest_check_args=()
+if [[ "${HEPHAESTUS_TEST_MMDS:-0}" == 1 ]]; then
+  guest_check_args+=(--mmds)
+fi
+python3 "$net_tool" check-guest "$vsock" "${guest_check_args[@]}"
 
 echo "network attachment verified: $network_label"
 echo "server log:  $tmp/server.err"
