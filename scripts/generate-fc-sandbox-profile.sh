@@ -21,8 +21,9 @@ EOF
   exit 64
 }
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+path_tool="$script_dir/sandbox_profile_paths.py"
 out=""
-work_dirs=()
 reads=()
 read_writes=()
 read_write_files=()
@@ -40,25 +41,12 @@ done
 
 [[ -n "$out" ]] || usage
 
-scheme_escape() {
-  python3 - "$1" <<'PY'
-import sys
-s = sys.argv[1]
-print(s.replace('\\', '\\\\').replace('"', '\\"'))
-PY
-}
-
 literal_form() {
-  local p
-  p="$(scheme_escape "$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")")"
-  printf '(literal "%s")' "$p"
+  python3 "$path_tool" literal "$1"
 }
 
 subpath_form() {
-  local p
-  mkdir -p "$1"
-  p="$(scheme_escape "$(cd "$1" && pwd -P)")"
-  printf '(subpath "%s")' "$p"
+  python3 "$path_tool" subpath "$1"
 }
 
 {
