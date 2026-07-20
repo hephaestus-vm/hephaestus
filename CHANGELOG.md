@@ -4,6 +4,19 @@ All notable changes to hephaestus. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [0.4.0-alpha.3](https://github.com/hephaestus-vm/hephaestus/compare/v0.4.0-alpha.2...v0.4.0-alpha.3) (2026-07-20)
+
+
+### Features
+
+* **networking:** serve transparent MMDS over authorized vmnet ([#22](https://github.com/hephaestus-vm/hephaestus/issues/22)) ([5025492](https://github.com/hephaestus-vm/hephaestus/commit/502549285dfd07d2676b766b9b49612f003cd51d))
+
+
+### Bug Fixes
+
+* **release:** tolerate no-op automation runs ([#28](https://github.com/hephaestus-vm/hephaestus/issues/28)) ([d12420f](https://github.com/hephaestus-vm/hephaestus/commit/d12420fa4a4fcc6e164d2d267182713e7b340e10))
+* **release:** use the generated pull request output ([#24](https://github.com/hephaestus-vm/hephaestus/issues/24)) ([23ebc59](https://github.com/hephaestus-vm/hephaestus/commit/23ebc59fad45ff7a8d29fd499beef75068948c06))
+
 ## [0.4.0-alpha.2](https://github.com/hephaestus-vm/hephaestus/compare/v0.4.0-alpha.1...v0.4.0-alpha.2) (2026-07-13)
 
 
