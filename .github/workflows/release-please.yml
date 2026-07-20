@@ -40,18 +40,34 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
-      - name: Check out release branch
+      # `pr` is intentionally unset when Release Please has nothing to update.
+      # Parse it in the shell only after `prs_created` is true: using fromJSON in
+      # step metadata makes GitHub evaluate an empty value before `if` can skip it.
+      - name: Resolve release branch
+        id: release_branch
         if: steps.release.outputs.prs_created == 'true'
+        env:
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: |
+          set -euo pipefail
+          branch="$(jq -er '.headBranchName | select(type == "string" and length > 0)' <<<"$RELEASE_PR")" || {
+            echo "Release Please reported a PR update without a valid pr output" >&2
+            exit 1
+          }
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Check out release branch
+        if: steps.release_branch.outputs.name != ''
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           fetch-depth: 0
-          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          ref: ${{ steps.release_branch.outputs.name }}
 
       - name: Synchronize release lockfile
-        if: steps.release.outputs.prs_created == 'true'
+        if: steps.release_branch.outputs.name != ''
         env:
-          RELEASE_BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          RELEASE_BRANCH: ${{ steps.release_branch.outputs.name }}
         run: |
           set -euo pipefail
           python3 scripts/sync-release-lock.py
