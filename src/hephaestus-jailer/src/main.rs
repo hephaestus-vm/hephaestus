@@ -9,7 +9,11 @@
 //!    caller-supplied paths (kernel/initramfs read-only, rootfs read/write,
 //!    pool base read-only + pool slots read/write) plus the per-VM work dir.
 //!    Paths are canonicalized during profile generation (see `profile.rs`).
-//! 3. Execs `hephaestus-firecracker` with `--sandbox-profile <profile>`
+//! 3. Optionally drops privileges to an unprivileged uid/gid (`--uid`,
+//!    `--gid`, `--user`). Requires root. The per-VM work dir is chown'd to
+//!    the target so the daemon can create the api socket after the drop;
+//!    the sandbox profile stays root-owned outside that writable directory.
+//! 4. Execs `hephaestus-firecracker` with `--sandbox-profile <profile>`
 //!    and `--api-sock <work_dir>/api.sock`. The child inherits the jail.
 //!
 //! The daemon is launched as its own process-group leader, and the jailer
@@ -18,20 +22,18 @@
 //! `SIGKILL` to the jailer can still orphan the daemon (macOS has no
 //! `PR_SET_PDEATHSIG`); a launchd-owned supervisor is the eventual fix.
 //!
-//! What this is NOT (yet):
-//! - Not a launchd job. The user runs `hephaestus-jailer` directly; the
-//!   child runs as a sibling process under the sandbox. A later iteration
-//!   can wrap this in a launchd plist or a longer-lived supervisor that
-//!   owns N VMs.
-//! - Not a full Firecracker jailer replacement yet. Isolation today is the
-//!   sandbox profile (file/network-scoped) plus optional `--rlimit-*` resource
-//!   caps on the daemon. Still missing: uid/gid drop and chroot (macOS has no
-//!   cgroups; per-VM cpu/memory caps are enforced by VZ itself).
-//! - Not entitlement-aware. The child still needs to be ad-hoc signed with
-//!   `com.apple.security.virtualization`; the jailer cannot grant that
-//!   for you. See `docs/guides/jailer.md` for the entitlement roadmap.
+//! With `--generate-launchd-plist`, the jailer writes a launchd plist to
+//! stdout (or `--launchd-plist-path`) instead of running. The plist wraps
+//! the same jailer invocation with `KeepAlive`, restarting the full jailer
+//! whenever the daemon exits.
+//!
+//! Privilege drop: `--uid`, `--gid`, and `--user` drop root privileges
+//! before exec'ing the daemon. Requires the jailer to be started as root.
+//! The order is setgroups → setgid → setuid: supplementary groups must be
+//! cleared while still root, and gid before uid (once uid is dropped,
+//! setgid would fail).
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -133,6 +135,38 @@ struct Args {
     /// Opt-in.
     #[arg(long)]
     rlimit_fsize: Option<u64>,
+
+    /// Numeric UID to drop privileges to before exec. Requires root (or
+    /// the appropriate privilege) — the jailer must be started as root
+    /// or with `sudo` for this to succeed. Mutually exclusive with
+    /// `--user`.
+    #[arg(long, conflicts_with = "user")]
+    uid: Option<libc::uid_t>,
+
+    /// Numeric GID to drop privileges to before exec. Requires root.
+    /// May be used alone or with `--uid`. Mutually exclusive with
+    /// `--user`.
+    #[arg(long, conflicts_with = "user")]
+    gid: Option<libc::gid_t>,
+
+    /// Username to look up and drop privileges to (sets both uid and
+    /// gid from the user's passwd entry). Requires root. Mutually
+    /// exclusive with `--uid` and `--gid`.
+    #[arg(long, conflicts_with_all = ["uid", "gid"])]
+    user: Option<String>,
+
+    /// Instead of running, generate a launchd plist that wraps this
+    /// jailer invocation and write it to stdout. The plist uses
+    /// `KeepAlive` so launchd restarts the full jailer whenever the
+    /// daemon exits.
+    #[arg(long)]
+    generate_launchd_plist: bool,
+
+    /// Path to write the launchd plist to (implies
+    /// `--generate-launchd-plist`). Defaults to stdout when
+    /// `--generate-launchd-plist` is used without this flag.
+    #[arg(long)]
+    launchd_plist_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -170,6 +204,28 @@ enum JailerError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to write launchd plist to {}: {source}", path.display())]
+    WritePlist {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to resolve privilege-drop target: {source}")]
+    PrivilegeDrop {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to chown {} for privilege drop: {source}", path.display())]
+    Chown {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to resolve the jailer executable path: {source}")]
+    CurrentExe {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -189,6 +245,7 @@ fn main() -> std::process::ExitCode {
 /// generation — is unit-testable without actually exec'ing the daemon.
 struct Plan {
     binary: PathBuf,
+    work_root: PathBuf,
     work_dir: PathBuf,
     api_sock: PathBuf,
     profile_path: PathBuf,
@@ -234,7 +291,8 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
     // read/write/create/delete on the whole subtree so the daemon can
     // create them without us having to enumerate each one upfront.
     let work_root = args.work_dir.clone().unwrap_or_else(default_work_root);
-    secure_work_root(&work_root)?;
+    let drop_requested = args.uid.is_some() || args.gid.is_some() || args.user.is_some();
+    secure_work_root(&work_root, drop_requested)?;
     let work_dir = work_root.join(&args.id);
     // Refuse a pre-planted symlink at the exact work-dir path: `create_dir_all`
     // follows symlinks, so without this a local user could seed
@@ -253,8 +311,22 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
         source,
     })?;
 
+    // The daemon owns this directory after a privilege drop. Normalize its
+    // mode on every run so a stale invocation cannot make the next launch
+    // inaccessible. The parent is root-owned and not writable by the daemon,
+    // so the daemon cannot replace this directory with a symlink.
+    std::fs::set_permissions(&work_dir, std::fs::Permissions::from_mode(0o700)).map_err(|_| {
+        JailerError::UnsafeWorkDir {
+            path: work_dir.clone(),
+            reason: "cannot enforce private per-VM work-dir permissions",
+        }
+    })?;
+
     let api_sock = work_dir.join("api.sock");
-    let profile_path = work_dir.join("sandbox.profile");
+    // Keep the profile out of the daemon-writable work directory. Otherwise a
+    // compromised dropped-uid daemon could replace it with a symlink and make
+    // the next root launch overwrite or chown an arbitrary path.
+    let profile_path = work_root.join(format!(".{}.sandbox.profile", args.id));
 
     // Generate the sandbox profile. We grant:
     // - read-only on the kernel and initramfs (caller-supplied inputs)
@@ -302,6 +374,14 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
         path: profile_path.clone(),
         source,
     })?;
+    // A dropped uid must be able to read the profile before applying it, but
+    // only root/the invoking owner may replace it (the parent is 0711/0700).
+    let profile_mode = if drop_requested { 0o644 } else { 0o600 };
+    std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(profile_mode))
+        .map_err(|source| JailerError::WriteProfile {
+            path: profile_path.clone(),
+            source,
+        })?;
     eprintln!(
         "hephaestus-jailer: wrote profile to {}",
         profile_path.display()
@@ -309,6 +389,7 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
 
     Ok(Plan {
         binary,
+        work_root,
         work_dir,
         api_sock,
         profile_path,
@@ -319,7 +400,12 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
 /// side effects at call time (a test can assert the args/env it produces); it
 /// does register a `pre_exec` hook that runs in the child at spawn to put it in
 /// its own process group.
-fn build_command(plan: &Plan, args: &Args) -> Command {
+fn build_command(
+    plan: &Plan,
+    args: &Args,
+    target_uid: Option<libc::uid_t>,
+    target_gid: Option<libc::gid_t>,
+) -> Command {
     let mut cmd = Command::new(&plan.binary);
     cmd.env("HEPHAESTUS_FC_WORK_DIR", &plan.work_dir);
     cmd.arg("--api-sock").arg(&plan.api_sock);
@@ -336,9 +422,12 @@ fn build_command(plan: &Plan, args: &Args) -> Command {
     let nproc = args.rlimit_nproc;
     let fsize = args.rlimit_fsize;
     // Run the daemon as its own process-group leader (so the jailer can signal
-    // the whole subtree on teardown) and apply any resource caps before exec.
-    // SAFETY: `setpgid`/`setrlimit` are async-signal-safe and touch no Rust
-    // heap state; the closure only reads captured Copy values.
+    // the whole subtree on teardown), apply any resource caps, and drop
+    // privileges before exec. The uid/gid were resolved in the parent (a
+    // `getpwnam` lookup allocates and must never run post-fork).
+    // SAFETY: `setpgid`/`setrlimit`/`setgroups`/`setgid`/`setuid` are
+    // async-signal-safe and touch no Rust heap state; the closure only reads
+    // captured Copy values.
     unsafe {
         cmd.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
@@ -347,6 +436,7 @@ fn build_command(plan: &Plan, args: &Args) -> Command {
             apply_rlimit(libc::RLIMIT_NOFILE, nofile)?;
             apply_rlimit(libc::RLIMIT_NPROC, nproc)?;
             apply_rlimit(libc::RLIMIT_FSIZE, fsize)?;
+            drop_privileges(target_uid, target_gid)?;
             Ok(())
         });
     }
@@ -372,13 +462,232 @@ fn apply_rlimit(resource: libc::c_int, value: Option<u64>) -> std::io::Result<()
     Ok(())
 }
 
+/// Drop privileges from root to an unprivileged uid/gid before exec. Called
+/// from the child's `pre_exec`, so it must stay async-signal-safe: no
+/// allocation, only raw syscalls on `Copy` values resolved before fork.
+/// The order matters: setgroups → setgid → setuid. Supplementary groups
+/// must be cleared while we still have privilege, and gid before uid (once
+/// uid is dropped, setgid would fail).
+fn drop_privileges(uid: Option<libc::uid_t>, gid: Option<libc::gid_t>) -> std::io::Result<()> {
+    if uid.is_none() && gid.is_none() {
+        return Ok(());
+    }
+    // Replace root's supplementary groups with exactly the target gid (or
+    // the current gid when only `--uid` was given). Without this the
+    // "unprivileged" daemon keeps wheel/admin/... membership inherited from
+    // root, so group-based access is never actually dropped.
+    // SAFETY: getgid is an async-signal-safe raw syscall.
+    let groups_gid = gid.unwrap_or_else(|| unsafe { libc::getgid() });
+    // SAFETY: setgroups is async-signal-safe; the pointer references one gid.
+    if unsafe { libc::setgroups(1, &groups_gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if let Some(g) = gid {
+        // SAFETY: setgid is async-signal-safe.
+        if unsafe { libc::setgid(g) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    if let Some(u) = uid {
+        // SAFETY: setuid is async-signal-safe.
+        if unsafe { libc::setuid(u) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // setuid from root drops real, effective, and saved uid together, so
+        // regaining root must now fail. `from_raw_os_error` because we are
+        // post-fork and must not allocate an error message.
+        // SAFETY: setuid is async-signal-safe; a success here is the failure.
+        if u != 0 && unsafe { libc::setuid(0) } == 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the target uid/gid from the three possible privilege-drop inputs.
+/// When `--user` is given, looks up the passwd entry. Otherwise uses the
+/// explicit `--uid`/`--gid` values (which may be partial). `getpwnam` may
+/// allocate, so this runs in the parent (from `run`, before spawn); only the
+/// resolved `Copy` values cross into the child's `pre_exec`.
+fn resolve_user(
+    user: Option<&str>,
+    uid: Option<libc::uid_t>,
+    gid: Option<libc::gid_t>,
+) -> std::io::Result<(Option<libc::uid_t>, Option<libc::gid_t>)> {
+    if let Some(name) = user {
+        let cname = std::ffi::CString::new(name).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "username contains NUL")
+        })?;
+        // SAFETY: cname is a valid NUL-terminated string for the lookup.
+        let entry = unsafe { libc::getpwnam(cname.as_ptr()) };
+        if entry.is_null() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("user {name:?} not found"),
+            ));
+        }
+        // SAFETY: entry is non-null, so the fields are valid.
+        let pw = unsafe { *entry };
+        Ok((Some(pw.pw_uid), Some(pw.pw_gid)))
+    } else {
+        Ok((uid, gid))
+    }
+}
+
+/// Minimal XML text-node escaping for plist string values. Paths and
+/// arguments are interpolated into the plist verbatim otherwise, and a
+/// stray `&` or `<` would corrupt the document.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Render a path for embedding in the plist. launchd runs jobs from `/`, not
+/// the shell the plist was generated in, so a relative path would break at
+/// load time — canonicalize when the path resolves, and fall back to it as
+/// given (e.g. a not-yet-created target) otherwise.
+fn plist_path(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Generate a launchd plist that wraps this jailer invocation. The plist
+/// uses `KeepAlive` so launchd restarts the full jailer whenever the daemon
+/// exits. Intended for
+/// `/Library/LaunchDaemons`: the jailer must start as root to generate the
+/// sandbox profile and drop privileges; the daemon itself then runs as
+/// `--user`/`--uid`/`--gid`.
+fn generate_launchd_plist(args: &Args, plan: &Plan) -> Result<String, JailerError> {
+    let label = format!("com.hephaestus.vm.{}", args.id);
+    // Reconstruct the jailer command line for launchd. argv[0] must be this
+    // jailer executable, not the daemon — launchd re-runs the whole jail
+    // setup on each restart. The daemon path `prepare` resolved is pinned
+    // via --firecracker-binary so a $PATH lookup at load time cannot pick a
+    // different binary.
+    let jailer_exe =
+        std::env::current_exe().map_err(|source| JailerError::CurrentExe { source })?;
+    let mut program_args = vec![
+        jailer_exe.to_string_lossy().into_owned(),
+        format!("--id={}", args.id),
+        format!("--kernel={}", plist_path(&args.kernel)),
+        format!("--rootfs={}", plist_path(&args.rootfs)),
+        format!("--work-dir={}", plist_path(&plan.work_root)),
+        format!("--firecracker-binary={}", plist_path(&plan.binary)),
+    ];
+    if let Some(initramfs) = args.initramfs.as_deref() {
+        program_args.push(format!("--initramfs={}", plist_path(initramfs)));
+    }
+    if let Some(pool_dir) = args.pool_dir.as_deref() {
+        program_args.push(format!("--pool-dir={}", plist_path(pool_dir)));
+    }
+    if let Some(probe) = args.deny_probe.as_deref() {
+        program_args.push(format!("--deny-probe={}", plist_path(probe)));
+    }
+    if let Some(uid) = args.uid {
+        program_args.push(format!("--uid={uid}"));
+    }
+    if let Some(gid) = args.gid {
+        program_args.push(format!("--gid={gid}"));
+    }
+    if let Some(ref user) = args.user {
+        program_args.push(format!("--user={user}"));
+    }
+    if let Some(nofile) = args.rlimit_nofile {
+        program_args.push(format!("--rlimit-nofile={nofile}"));
+    }
+    if let Some(nproc) = args.rlimit_nproc {
+        program_args.push(format!("--rlimit-nproc={nproc}"));
+    }
+    if let Some(fsize) = args.rlimit_fsize {
+        program_args.push(format!("--rlimit-fsize={fsize}"));
+    }
+
+    // launchd opens logs before starting the job, so use the already
+    // materialized absolute per-VM work directory.
+    let work_dir_abs =
+        std::fs::canonicalize(&plan.work_dir).unwrap_or_else(|_| plan.work_dir.clone());
+    let program_args_xml = program_args
+        .iter()
+        .map(|a| format!("        <string>{}</string>", xml_escape(a)))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+{program_args_xml}
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{work_dir}/launchd.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>{work_dir}/launchd.stderr.log</string>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+</dict>
+</plist>
+"#,
+        label = label,
+        program_args_xml = program_args_xml,
+        work_dir = xml_escape(&work_dir_abs.to_string_lossy()),
+    ))
+}
+
 fn run(args: Args) -> Result<u8, JailerError> {
     let plan = prepare(&args)?;
+
+    // Resolve the privilege-drop target up front: a `--user` lookup goes
+    // through `getpwnam`, which may allocate, so it must happen here in the
+    // parent — never inside the child's `pre_exec`. This also fails fast on
+    // an unknown user before anything is spawned (or a plist emitted).
+    let (target_uid, target_gid) = resolve_user(args.user.as_deref(), args.uid, args.gid)
+        .map_err(|source| JailerError::PrivilegeDrop { source })?;
+
+    if args.generate_launchd_plist || args.launchd_plist_path.is_some() {
+        let plist = generate_launchd_plist(&args, &plan)?;
+        if let Some(ref path) = args.launchd_plist_path {
+            std::fs::write(path, &plist).map_err(|source| JailerError::WritePlist {
+                path: path.clone(),
+                source,
+            })?;
+            eprintln!(
+                "hephaestus-jailer: wrote launchd plist to {}",
+                path.display()
+            );
+        } else {
+            print!("{plist}");
+        }
+        return Ok(0);
+    }
+
+    // Hand only the per-VM work dir to the drop target so it can create the
+    // API socket, logs, metrics, and snapshots. The profile deliberately
+    // remains owner/root-owned outside this writable directory.
+    if target_uid.is_some() || target_gid.is_some() {
+        std::os::unix::fs::chown(&plan.work_dir, target_uid, target_gid).map_err(|source| {
+            JailerError::Chown {
+                path: plan.work_dir.clone(),
+                source,
+            }
+        })?;
+    }
 
     // Exec the firecracker binary under the generated profile. The child
     // enters the sandbox before serving the API socket, so every API
     // request is bound by the profile.
-    let mut cmd = build_command(&plan, &args);
+    let mut cmd = build_command(&plan, &args, target_uid, target_gid);
     eprintln!(
         "hephaestus-jailer: exec {} {}",
         plan.binary.display(),
@@ -439,9 +748,14 @@ fn validate_id(id: &str) -> Result<(), JailerError> {
 /// us. The default root lives under world-writable `/tmp`, so a local attacker
 /// could otherwise pre-plant `hephaestus-jail` as a symlink to a victim dir
 /// (which `create_dir_all` would follow, widening the sandbox grant) or seed a
-/// guessable `<root>/<id>` for us to descend into. Forcing `0700` fails closed
-/// (EPERM) if another user already owns the path.
-fn secure_work_root(root: &Path) -> Result<(), JailerError> {
+/// guessable `<root>/<id>` for us to descend into. Forcing owner-only perms
+/// fails closed (EPERM) if another user already owns the path.
+///
+/// When a privilege drop is requested the root gets `0711` instead of `0700`:
+/// still owner-writable/listable only, but traversable, so the dropped-uid
+/// daemon can reach its own (chowned) per-VM dir beneath it. With `0700` the
+/// child would fail path traversal on everything under the root after setuid.
+fn secure_work_root(root: &Path, drop_requested: bool) -> Result<(), JailerError> {
     match std::fs::symlink_metadata(root) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -454,6 +768,16 @@ fn secure_work_root(root: &Path) -> Result<(), JailerError> {
                 return Err(JailerError::UnsafeWorkDir {
                     path: root.to_path_buf(),
                     reason: "work root exists but is not a directory",
+                });
+            }
+            // Root can chmod directories owned by anyone, so permission
+            // normalization alone does not prove ownership when the jailer is
+            // privileged. Reject a pre-planted root owned by another uid.
+            // SAFETY: geteuid has no preconditions and only reads process state.
+            if meta.uid() != unsafe { libc::geteuid() } {
+                return Err(JailerError::UnsafeWorkDir {
+                    path: root.to_path_buf(),
+                    reason: "work root is not owned by the invoking uid",
                 });
             }
         }
@@ -472,10 +796,11 @@ fn secure_work_root(root: &Path) -> Result<(), JailerError> {
     }
     // Enforce private perms on every run. If we don't own the directory this
     // fails with EPERM, which is the fail-closed outcome we want.
-    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).map_err(|_| {
+    let mode = if drop_requested { 0o711 } else { 0o700 };
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode)).map_err(|_| {
         JailerError::UnsafeWorkDir {
             path: root.to_path_buf(),
-            reason: "cannot enforce private 0700 perms (not owner?)",
+            reason: "cannot enforce private owner-only perms (not owner?)",
         }
     })
 }
@@ -538,6 +863,11 @@ mod tests {
             rlimit_nofile: None,
             rlimit_nproc: None,
             rlimit_fsize: None,
+            uid: None,
+            gid: None,
+            user: None,
+            generate_launchd_plist: false,
+            launchd_plist_path: None,
         }
     }
 
@@ -589,7 +919,14 @@ mod tests {
         assert!(plan.work_dir.is_dir(), "work dir should be created");
         assert_eq!(plan.work_dir.file_name().unwrap(), "vm-test");
         assert_eq!(plan.api_sock, plan.work_dir.join("api.sock"));
-        assert_eq!(plan.profile_path, plan.work_dir.join("sandbox.profile"));
+        assert_eq!(
+            plan.profile_path,
+            plan.work_root.join(".vm-test.sandbox.profile")
+        );
+        assert!(
+            !plan.profile_path.starts_with(&plan.work_dir),
+            "the profile must stay outside the daemon-writable directory"
+        );
 
         let profile = fs::read_to_string(&plan.profile_path).expect("profile written");
         assert!(!profile.is_empty(), "profile should be non-empty");
@@ -605,7 +942,7 @@ mod tests {
         let dir = scratch("cmd-core");
         let args = args_in(&dir);
         let plan = prepare(&args).unwrap();
-        let cmd = build_command(&plan, &args);
+        let cmd = build_command(&plan, &args, None, None);
 
         let got = arg_strings(&cmd);
         assert!(
@@ -638,7 +975,7 @@ mod tests {
         args.pool_dir = Some(pool);
         args.deny_probe = Some(dir.join("secret"));
         let plan = prepare(&args).unwrap();
-        let cmd = build_command(&plan, &args);
+        let cmd = build_command(&plan, &args, None, None);
 
         let got = arg_strings(&cmd);
         assert!(got.iter().any(|a| a == "--pool-dir"));
@@ -674,6 +1011,114 @@ mod tests {
         let mut args = args_in(&dir);
         args.id = "../../escape".into();
         assert!(matches!(prepare(&args), Err(JailerError::InvalidId { .. })));
+    }
+
+    #[test]
+    fn resolve_user_with_explicit_uid_gid() {
+        let (uid, gid) = resolve_user(None, Some(1000), Some(1000)).unwrap();
+        assert_eq!(uid, Some(1000));
+        assert_eq!(gid, Some(1000));
+    }
+
+    #[test]
+    fn resolve_user_with_uid_only() {
+        let (uid, gid) = resolve_user(None, Some(1001), None).unwrap();
+        assert_eq!(uid, Some(1001));
+        assert_eq!(gid, None);
+    }
+
+    #[test]
+    fn resolve_user_with_gid_only() {
+        let (uid, gid) = resolve_user(None, None, Some(1002)).unwrap();
+        assert_eq!(uid, None);
+        assert_eq!(gid, Some(1002));
+    }
+
+    #[test]
+    fn resolve_user_with_none() {
+        let (uid, gid) = resolve_user(None, None, None).unwrap();
+        assert_eq!(uid, None);
+        assert_eq!(gid, None);
+    }
+
+    #[test]
+    fn resolve_user_lookup_existing_user() {
+        // "nobody" exists on every macOS system.
+        let (uid, gid) = resolve_user(Some("nobody"), None, None).unwrap();
+        assert!(uid.is_some(), "nobody should have a uid");
+        assert!(gid.is_some(), "nobody should have a gid");
+    }
+
+    #[test]
+    fn resolve_user_lookup_nonexistent_user() {
+        let err = resolve_user(Some("this-user-does-not-exist-42"), None, None);
+        assert!(err.is_err(), "nonexistent user should produce an error");
+    }
+
+    #[test]
+    fn args_user_conflicts_with_uid_and_gid() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["hephaestus-jailer", "--kernel", "k", "--rootfs", "r"];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv)
+        };
+        parse(&["--user", "nobody", "--uid", "1"]).unwrap_err();
+        parse(&["--user", "nobody", "--gid", "1"]).unwrap_err();
+        parse(&["--user", "nobody"]).unwrap();
+        parse(&["--uid", "1", "--gid", "2"]).unwrap();
+    }
+
+    #[test]
+    fn args_launchd_plist_path_implies_generation() {
+        let parsed = Args::try_parse_from([
+            "hephaestus-jailer",
+            "--kernel",
+            "k",
+            "--rootfs",
+            "r",
+            "--launchd-plist-path",
+            "/tmp/x.plist",
+        ])
+        .unwrap();
+        assert!(
+            !parsed.generate_launchd_plist && parsed.launchd_plist_path.is_some(),
+            "path alone must parse; run() treats it as implying generation"
+        );
+    }
+
+    #[test]
+    fn prepare_makes_work_root_traversable_only_when_dropping_privileges() {
+        let dir = scratch("privdrop-root-mode");
+        let mut args = args_in(&dir);
+        let plan = prepare(&args).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&plan.work_root), 0o700, "no drop → fully private root");
+        assert_eq!(mode(&plan.work_dir), 0o700, "work dir stays private");
+        assert_eq!(
+            mode(&plan.profile_path),
+            0o600,
+            "profile is owner-readable without a drop"
+        );
+
+        args.uid = Some(1);
+        let plan = prepare(&args).unwrap();
+        assert_eq!(
+            mode(&plan.work_root),
+            0o711,
+            "drop requested → root must be traversable for the dropped uid"
+        );
+        assert_eq!(mode(&plan.work_dir), 0o700, "work dir stays private");
+        assert_eq!(
+            mode(&plan.profile_path),
+            0o644,
+            "profile must be readable by the dropped uid"
+        );
+    }
+
+    #[test]
+    fn xml_escape_escapes_markup() {
+        assert_eq!(xml_escape("a&b<c>d"), "a&amp;b&lt;c&gt;d");
+        assert_eq!(xml_escape("/plain/path"), "/plain/path");
     }
 
     #[test]
@@ -713,5 +1158,83 @@ mod tests {
                 "{slot} should be read/write:\n{profile}"
             );
         }
+    }
+
+    #[test]
+    fn generate_launchd_plist_contains_label_and_keepalive() {
+        let dir = scratch("launchd-plist");
+        let args = args_in(&dir);
+        let plan = prepare(&args).unwrap();
+        let plist = generate_launchd_plist(&args, &plan).unwrap();
+
+        assert!(
+            plist.contains("com.hephaestus.vm.vm-test"),
+            "plist should contain the label"
+        );
+        assert!(plist.contains("RunAtLoad"), "plist should run at load");
+        assert!(
+            plist.contains("ThrottleInterval"),
+            "plist should have a throttle interval"
+        );
+        assert!(plist.contains("KeepAlive"), "plist should have KeepAlive");
+        assert!(
+            plist.contains("<key>KeepAlive</key>\n    <true/>"),
+            "launchd should restart the jailer after every daemon exit"
+        );
+    }
+
+    #[test]
+    fn generate_launchd_plist_includes_uid_gid_when_set() {
+        let dir = scratch("launchd-plist-uid");
+        let mut args = args_in(&dir);
+        args.uid = Some(1001);
+        args.gid = Some(1002);
+        let plan = prepare(&args).unwrap();
+        let plist = generate_launchd_plist(&args, &plan).unwrap();
+
+        assert!(plist.contains("--uid=1001"), "plist should include --uid");
+        assert!(plist.contains("--gid=1002"), "plist should include --gid");
+    }
+
+    #[test]
+    fn generate_launchd_plist_includes_user_when_set() {
+        let dir = scratch("launchd-plist-user");
+        let mut args = args_in(&dir);
+        args.user = Some("nobody".into());
+        let plan = prepare(&args).unwrap();
+        let plist = generate_launchd_plist(&args, &plan).unwrap();
+
+        assert!(
+            plist.contains("--user=nobody"),
+            "plist should include --user"
+        );
+    }
+
+    #[test]
+    fn generate_launchd_plist_runs_the_jailer_not_the_daemon() {
+        let dir = scratch("launchd-plist-argv0");
+        let args = args_in(&dir);
+        let plan = prepare(&args).unwrap();
+        let plist = generate_launchd_plist(&args, &plan).unwrap();
+
+        // argv[0] must be this executable (the jailer), so launchd re-runs
+        // the whole jail setup — not the bare daemon with jailer flags.
+        let exe = std::env::current_exe().unwrap();
+        assert!(
+            plist.contains(&format!(
+                "<string>{}</string>",
+                xml_escape(&exe.to_string_lossy())
+            )),
+            "plist argv[0] should be the jailer executable"
+        );
+        // The resolved daemon path is pinned (canonicalized) so launchd
+        // never re-does a $PATH lookup at load time.
+        assert!(
+            plist.contains(&format!(
+                "--firecracker-binary={}",
+                fs::canonicalize(&plan.binary).unwrap().to_string_lossy()
+            )),
+            "plist should pin the resolved daemon binary"
+        );
     }
 }
