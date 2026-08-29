@@ -502,3 +502,43 @@ jailer-rlimit-check: build
     [[ "$out" == "NOFILE=64" ]] \
         && echo "OK: jailer applied RLIMIT_NOFILE=64 to the daemon" \
         || { echo "FAIL: got '$out'"; exit 1; }
+
+# Verify the jailer's --uid/--gid/--user privilege drop. Requires sudo.
+# Uses a stand-in binary that prints its own uid/gid.
+jailer-privdrop-check: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    j="./build/cargo_target/debug/hephaestus-jailer"
+    # Must live under world-traversable /tmp, NOT `mktemp -d`'s default
+    # $TMPDIR: darwin per-user temp dirs (/var/folders/.../T) are 0700, so
+    # after the jailer setuids to the target user the child's exec would
+    # fail path traversal with EACCES before reaching the fake binary.
+    tmp="$(mktemp -d /tmp/hephaestus-privdrop.XXXXXX)"
+    chmod a+rx "$tmp"
+    trap 'sudo rm -rf "$tmp"' EXIT
+    touch "$tmp/vmlinux" "$tmp/rootfs.ext4"
+    printf '#!/bin/sh\necho "UID=$(id -u) GID=$(id -g)"\nexit 0\n' > "$tmp/fake-fc"
+    chmod a+rx "$tmp/fake-fc"
+    user="${HEPHAESTUS_TEST_USER:-nobody}"
+    expected_uid="$(id -u "$user")"
+    expected_gid="$(id -g "$user")"
+    echo "--- Testing --user $user (expect uid=$expected_uid gid=$expected_gid) ---"
+    out="$(sudo "$j" --id priv-check --work-dir "$tmp/work" --kernel "$tmp/vmlinux" \
+        --rootfs "$tmp/rootfs.ext4" --firecracker-binary "$tmp/fake-fc" \
+        --user "$user" 2>&1)" || true
+    echo "$out"
+    # The jailer prints the child's stdout before its own stderr. Extract the
+    # last line that looks like "UID=... GID=..." (the child's output).
+    child_out="$(echo "$out" | grep -E '^UID=[0-9]+ GID=[0-9]+$' | tail -1 || true)"
+    [[ "$child_out" == "UID=$expected_uid GID=$expected_gid" ]] \
+        && echo "OK: jailer dropped to $user (uid=$expected_uid gid=$expected_gid)" \
+        || { echo "FAIL: got '$child_out' (expected uid=$expected_uid gid=$expected_gid)"; exit 1; }
+    echo "--- Testing --uid $expected_uid --gid $expected_gid ---"
+    out="$(sudo "$j" --id priv-check-ug --work-dir "$tmp/work" --kernel "$tmp/vmlinux" \
+        --rootfs "$tmp/rootfs.ext4" --firecracker-binary "$tmp/fake-fc" \
+        --uid "$expected_uid" --gid "$expected_gid" 2>&1)" || true
+    echo "$out"
+    child_out="$(echo "$out" | grep -E '^UID=[0-9]+ GID=[0-9]+$' | tail -1 || true)"
+    [[ "$child_out" == "UID=$expected_uid GID=$expected_gid" ]] \
+        && echo "OK: jailer dropped to uid=$expected_uid gid=$expected_gid" \
+        || { echo "FAIL: got '$child_out'"; exit 1; }

@@ -22,10 +22,13 @@ stability contract are incomplete.
 Goal: replace the trusted-workload-only warning with a defensible local service
 model.
 
-Remaining work includes:
+Completed:
 
 - privilege drop to a dedicated uid/gid where deployment permits it;
-- launchd ownership and restart behavior;
+- launchd ownership and restart behavior (plist generation).
+
+Remaining work includes:
+
 - complete per-VM path and lifecycle ownership;
 - release-gated restrictive real-Mac tests;
 - a reviewed threat model for shared host resources;
