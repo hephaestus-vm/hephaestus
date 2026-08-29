@@ -115,6 +115,7 @@ jail_work="$tmp/jail-work"
 jail_id="jail-e2e"
 jail_dir="$jail_work/$jail_id"
 jail_sock="$jail_dir/api.sock"
+jail_profile="$jail_work/.$jail_id.sandbox.profile"
 jail_log="$jail_dir/fc-compat.log"
 "$jailer" \
   --id "$jail_id" \
@@ -141,8 +142,8 @@ if [[ ! -S "$jail_sock" ]]; then
   echo "--- jailer stderr ---" >&2; cat "$tmp/jailer.err" >&2 || true
   exit 1
 fi
-if [[ ! -s "$jail_dir/sandbox.profile" ]]; then
-  echo "jailer did not write $jail_dir/sandbox.profile" >&2
+if [[ ! -s "$jail_profile" ]]; then
+  echo "jailer did not write $jail_profile" >&2
   echo "--- jailer stderr ---" >&2; cat "$tmp/jailer.err" >&2 || true
   exit 1
 fi
@@ -155,7 +156,7 @@ if ! compat/firectl-harness/firectl-harness \
   -pause \
   -skip-vsock; then
   echo "--- jailer stderr ---" >&2; cat "$tmp/jailer.err" >&2 || true
-  echo "--- sandbox profile ---" >&2; cat "$jail_dir/sandbox.profile" >&2 || true
+  echo "--- sandbox profile ---" >&2; cat "$jail_profile" >&2 || true
   exit 1
 fi
 echo "hephaestus-jailer real-VM e2e passed"

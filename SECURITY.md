@@ -4,7 +4,8 @@
 
 Hephaestus runs **trusted guest code**. There is no supported multi-tenant
 isolation story yet. The `hephaestus-jailer` generates a per-VM deny-by-default
-sandbox profile, owns daemon launch, and supports privilege drop to an
+sandbox profile, owns daemon launch and per-VM lifecycle (instance locking,
+stale-socket cleanup, `--teardown`), and supports privilege drop to an
 unprivileged user (`--uid`/`--gid`/`--user`) and launchd supervision
 (`--generate-launchd-plist`). `hephaestus-firecracker` retains a low-level
 `--sandbox-profile <file>` hook. Signing/entitlement distribution and

@@ -13,6 +13,7 @@ bench = false
 [dependencies]
 clap = { version = "4.6.1", features = ["derive", "string"] }
 libc = "0.2"
+nix = { version = "0.31", features = ["fs"] }
 thiserror = "2.0.18"
 
 [lints]

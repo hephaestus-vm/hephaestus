@@ -25,11 +25,12 @@ model.
 Completed:
 
 - privilege drop to a dedicated uid/gid where deployment permits it;
-- launchd ownership and restart behavior (plist generation).
+- launchd ownership and restart behavior (plist generation);
+- per-VM path and lifecycle ownership (instance locking, stale-socket
+  cleanup, `--clean-work-dir`, `--teardown`).
 
 Remaining work includes:
 
-- complete per-VM path and lifecycle ownership;
 - release-gated restrictive real-Mac tests;
 - a reviewed threat model for shared host resources;
 - signed distribution and entitlement guidance.
