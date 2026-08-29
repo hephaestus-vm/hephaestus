@@ -11,17 +11,53 @@
 Before launching the daemon, the jailer:
 
 1. Validates the VM identifier as one safe path component.
-2. Creates a private `<work-dir>/<id>/` directory.
-3. Canonicalizes the kernel, rootfs, initramfs, pool, and daemon paths.
-4. Generates a sandbox profile allowing required framework access, the VM's
+2. Claims the instance with an exclusive lock on `<work-dir>/.<id>.lock`, so
+   a second jailer for the same id is refused instead of silently stealing
+   the live API socket.
+3. Creates a private `<work-dir>/<id>/` directory and removes a stale
+   `api.sock` left by a previous run.
+4. Canonicalizes the kernel, rootfs, initramfs, pool, and daemon paths.
+5. Generates a sandbox profile allowing required framework access, the VM's
    inputs, and its work directory.
-5. Places the API socket under the per-VM work directory and keeps the
+6. Places the API socket under the per-VM work directory and keeps the
    generated profile in the root-owned parent.
-6. Applies optional file-descriptor, process, and file-size limits.
-7. Optionally drops privileges to an unprivileged uid/gid (requires root),
+7. Applies optional file-descriptor, process, and file-size limits.
+8. Optionally drops privileges to an unprivileged uid/gid (requires root),
    handing the per-VM work dir to the target user while keeping the generated
    sandbox profile root-owned outside that writable directory.
-8. Starts the daemon in a process group and forwards termination signals.
+9. Starts the daemon in a process group and forwards termination signals.
+
+## Lifecycle
+
+Each instance id owns three kinds of on-disk state under the work root: the
+per-VM work dir `<work-dir>/<id>/` (API socket, logs, metrics, snapshots),
+and the root-owned dot-siblings `.<id>.sandbox.profile` and `.<id>.lock`
+(plus `.<id>.launchd.*.log` under launchd). The dot-siblings deliberately
+live outside the daemon-writable work dir so a compromised dropped-uid
+daemon cannot replace them.
+
+The instance lock is a `flock` held for the life of the supervised daemon.
+The lock file descriptor is inherited by the daemon, so the claim survives
+even a `SIGKILL`ed jailer for as long as the daemon runs — a relaunch cannot
+steal a live socket. The lock releases automatically when both processes
+exit; a crashed instance needs no stale-lock recovery.
+
+By default everything in the work dir persists across restarts, which is
+what a `KeepAlive` launchd job wants: snapshots and logs survive. Two
+opt-in operations manage that state:
+
+- `--clean-work-dir` empties the per-VM work dir before launch — a one-shot
+  retire-and-recreate. It is never carried into generated launchd plists,
+  so supervised restarts always preserve state.
+- `--teardown` (with `--id` and `--work-dir`) removes the instance's
+  on-disk state entirely — work dir, profile, launchd logs, and lock — and
+  exits without launching. It refuses while the instance is running. Under
+  launchd, run `sudo launchctl bootout system/com.hephaestus.vm.<id>`
+  first; a still-loaded `KeepAlive` job would simply re-create everything.
+
+```console
+$ sudo hephaestus-jailer --id example --teardown
+```
 
 ## Privilege drop
 
@@ -85,6 +121,18 @@ $ sudo hephaestus-jailer \
 $ sudo launchctl bootstrap system /Library/LaunchDaemons/com.hephaestus.vm.example.plist
 ```
 
+The job's stdout/stderr land in root-owned `.<id>.launchd.stdout.log` and
+`.<id>.launchd.stderr.log` next to the profile in the work root — outside
+the daemon-writable work dir, because launchd reopens these paths as root on
+every restart. launchd does not rotate them; for a long-lived VM add a
+`newsyslog.d` entry, e.g.:
+
+```
+# /etc/newsyslog.d/hephaestus-example.conf
+/tmp/hephaestus-jail/.example.launchd.stdout.log  644  5  1024  *  NJ
+/tmp/hephaestus-jail/.example.launchd.stderr.log  644  5  1024  *  NJ
+```
+
 ## Example
 
 Examples assume `hephaestus-jailer` and `hephaestus-firecracker` are on `PATH`.
@@ -117,6 +165,13 @@ prints its uid/gid):
 $ just jailer-privdrop-check
 ```
 
+Validate lifecycle plumbing — instance-lock refusal, stale-socket removal,
+and teardown (root-free, VM-free):
+
+```console
+$ just jailer-lifecycle-check
+```
+
 Restrictive sandbox tests cover config-only, cold boot, vsock/MMDS, snapshots,
 and both pool flavors. See [Testing](../development/testing.md).
 
@@ -136,6 +191,8 @@ What it does provide:
   (`--generate-launchd-plist`).
 - **macOS sandbox** — deny-by-default filesystem profile.
 - **Resource limits** — `--rlimit-nofile`, `--rlimit-nproc`, `--rlimit-fsize`.
+- **Lifecycle ownership** — a per-instance lock refuses double launches, and
+  the jailer owns stale-socket cleanup and state retirement (`--teardown`).
 
 Virtualization.framework remains the primary guest/host boundary. The macOS
 sandbox narrows the daemon's filesystem and process access, but profile

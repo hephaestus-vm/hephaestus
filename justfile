@@ -503,6 +503,46 @@ jailer-rlimit-check: build
         && echo "OK: jailer applied RLIMIT_NOFILE=64 to the daemon" \
         || { echo "FAIL: got '$out'"; exit 1; }
 
+# Verify the jailer's per-VM lifecycle ownership: the instance lock refuses
+# a second same-id launch, a stale api.sock is replaced, and --teardown
+# retires the on-disk state. Root-free, VM-free (stand-in daemon binaries).
+jailer-lifecycle-check: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    j="./build/cargo_target/debug/hephaestus-jailer"
+    tmp="$(mktemp -d)"; first=""
+    trap '[[ -n "$first" ]] && kill "$first" 2>/dev/null; rm -rf "$tmp"' EXIT
+    touch "$tmp/vmlinux" "$tmp/rootfs.ext4"
+    printf '#!/bin/sh\nsleep 30\n' > "$tmp/sleep-fc"; chmod +x "$tmp/sleep-fc"
+    printf '#!/bin/sh\nexit 0\n' > "$tmp/exit-fc"; chmod +x "$tmp/exit-fc"
+    echo "--- A second jailer for the same --id must be refused ---"
+    "$j" --id lc-check --work-dir "$tmp/work" --kernel "$tmp/vmlinux" \
+        --rootfs "$tmp/rootfs.ext4" --firecracker-binary "$tmp/sleep-fc" \
+        2>/dev/null & first=$!
+    sleep 1
+    if out="$("$j" --id lc-check --work-dir "$tmp/work" --kernel "$tmp/vmlinux" \
+        --rootfs "$tmp/rootfs.ext4" --firecracker-binary "$tmp/exit-fc" 2>&1)"; then
+        echo "FAIL: second same-id jailer was not refused"; exit 1
+    fi
+    echo "$out" | grep -q "already running" \
+        && echo "OK: second claim refused while the instance runs" \
+        || { echo "FAIL: unexpected refusal: $out"; exit 1; }
+    kill "$first"; wait "$first" 2>/dev/null || true; first=""
+    echo "--- A stale api.sock is removed on the next launch ---"
+    touch "$tmp/work/lc-check/api.sock"
+    "$j" --id lc-check --work-dir "$tmp/work" --kernel "$tmp/vmlinux" \
+        --rootfs "$tmp/rootfs.ext4" --firecracker-binary "$tmp/exit-fc" \
+        2>&1 | grep -q "removed stale api socket" \
+        && echo "OK: stale socket removed" \
+        || { echo "FAIL: stale socket not removed"; exit 1; }
+    echo "--- --teardown retires the work dir, profile, and lock ---"
+    "$j" --id lc-check --work-dir "$tmp/work" --teardown 2>/dev/null
+    for leftover in "$tmp/work/lc-check" \
+        "$tmp/work/.lc-check.sandbox.profile" "$tmp/work/.lc-check.lock"; do
+        [[ -e "$leftover" ]] && { echo "FAIL: $leftover survived teardown"; exit 1; }
+    done
+    echo "OK: teardown removed the instance state"
+
 # Verify the jailer's --uid/--gid/--user privilege drop. Requires sudo.
 # Uses a stand-in binary that prints its own uid/gid.
 jailer-privdrop-check: build

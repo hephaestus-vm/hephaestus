@@ -5,15 +5,23 @@
 //! 1. Validates `--id` (Firecracker's `[A-Za-z0-9_-]{1,64}`) so it is a safe
 //!    single path component, and materializes a private per-VM work dir
 //!    (`<work-root>/<id>/`) holding the api socket, log, metrics, snapshot.
-//! 2. Generates a deny-by-default sandbox profile granting only the
+//! 2. Claims the instance: an exclusive `flock` on `<work-root>/.<id>.lock`
+//!    refuses a second jailer for the same id (which would otherwise steal
+//!    the live api socket). The lock fd is inherited by the daemon, so the
+//!    claim survives even a SIGKILLed jailer for as long as the daemon runs.
+//! 3. Removes a stale `api.sock` left by a previous run. Everything else in
+//!    the work dir (logs, metrics, snapshots) persists across restarts;
+//!    `--clean-work-dir` empties it first, and `--teardown` retires the
+//!    instance's on-disk state entirely instead of launching.
+//! 4. Generates a deny-by-default sandbox profile granting only the
 //!    caller-supplied paths (kernel/initramfs read-only, rootfs read/write,
 //!    pool base read-only + pool slots read/write) plus the per-VM work dir.
 //!    Paths are canonicalized during profile generation (see `profile.rs`).
-//! 3. Optionally drops privileges to an unprivileged uid/gid (`--uid`,
+//! 5. Optionally drops privileges to an unprivileged uid/gid (`--uid`,
 //!    `--gid`, `--user`). Requires root. The per-VM work dir is chown'd to
 //!    the target so the daemon can create the api socket after the drop;
 //!    the sandbox profile stays root-owned outside that writable directory.
-//! 4. Execs `hephaestus-firecracker` with `--sandbox-profile <profile>`
+//! 6. Execs `hephaestus-firecracker` with `--sandbox-profile <profile>`
 //!    and `--api-sock <work_dir>/api.sock`. The child inherits the jail.
 //!
 //! The daemon is launched as its own process-group leader, and the jailer
@@ -33,6 +41,8 @@
 //! cleared while still root, and gid before uid (once uid is dropped,
 //! setgid would fail).
 
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -40,6 +50,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use clap::Parser;
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use thiserror::Error;
 
 mod profile;
@@ -93,16 +105,16 @@ struct Args {
     #[arg(long)]
     firecracker_binary: Option<PathBuf>,
 
-    /// Path to the guest kernel image. Required (the profile grants read
-    /// access to this path).
-    #[arg(long)]
-    kernel: PathBuf,
+    /// Path to the guest kernel image. Required except with `--teardown`
+    /// (the profile grants read access to this path).
+    #[arg(long, required_unless_present = "teardown")]
+    kernel: Option<PathBuf>,
 
-    /// Path to the guest rootfs ext4 image. Required (the profile grants
-    /// read/write access to this path because root drives are commonly
-    /// configured writable).
-    #[arg(long)]
-    rootfs: PathBuf,
+    /// Path to the guest rootfs ext4 image. Required except with
+    /// `--teardown` (the profile grants read/write access to this path
+    /// because root drives are commonly configured writable).
+    #[arg(long, required_unless_present = "teardown")]
+    rootfs: Option<PathBuf>,
 
     /// Optional path to the initramfs (typically `build/agent.cpio.gz`).
     /// Granted read access if supplied.
@@ -167,6 +179,24 @@ struct Args {
     /// `--generate-launchd-plist` is used without this flag.
     #[arg(long)]
     launchd_plist_path: Option<PathBuf>,
+
+    /// Empty the per-VM work dir before launch, discarding stale sockets,
+    /// logs, metrics, and snapshots. One-shot operator action; deliberately
+    /// never emitted into generated launchd plists, so `KeepAlive` restarts
+    /// preserve state.
+    #[arg(long)]
+    clean_work_dir: bool,
+
+    /// Instead of launching, remove this instance's on-disk state — the
+    /// per-VM work dir, sandbox profile, instance lock, and launchd logs —
+    /// and exit. Refuses while the instance is running (its lock is held).
+    /// Unload any launchd plist first (`launchctl bootout`), or launchd
+    /// will simply re-create everything on the next restart.
+    #[arg(
+        long,
+        conflicts_with_all = ["generate_launchd_plist", "launchd_plist_path", "clean_work_dir"]
+    )]
+    teardown: bool,
 }
 
 #[derive(Debug, Error)]
@@ -226,6 +256,24 @@ enum JailerError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "instance {id:?} is already running (lock held on {}): stop it first \
+         (kill its jailer, or `launchctl bootout` its plist)",
+        lock_path.display()
+    )]
+    InstanceBusy { id: String, lock_path: PathBuf },
+    #[error("failed to acquire instance lock {}: {source}", path.display())]
+    Lock {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to remove {}: {source}", path.display())]
+    Remove {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -249,6 +297,61 @@ struct Plan {
     work_dir: PathBuf,
     api_sock: PathBuf,
     profile_path: PathBuf,
+    /// Exclusive claim on this instance id. Unlocks on drop, and the child
+    /// inherits the same open file description, so `run` must keep the plan
+    /// alive past `child.wait()` — dropping it early would release the
+    /// daemon's claim too.
+    lock: Flock<File>,
+}
+
+/// Claim an instance id by taking an exclusive non-blocking `flock` on its
+/// lock file. A held lock means a jailer (or its inherited-fd daemon) is
+/// alive for this id, so a second claim refuses instead of stealing the
+/// api socket. The file itself persists between runs — unlinking a lock
+/// file while others may open it is racy, so only `--teardown` removes it,
+/// unlinking before it releases; the inode re-check below closes the
+/// remaining window where this open races that unlink.
+fn acquire_instance_lock(lock_path: &Path, id: &str) -> Result<Flock<File>, JailerError> {
+    let io_err = |source| JailerError::Lock {
+        path: lock_path.to_path_buf(),
+        source,
+    };
+    for _ in 0..3 {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(io_err)?;
+        let lock = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => lock,
+            Err((_, Errno::EWOULDBLOCK)) => {
+                return Err(JailerError::InstanceBusy {
+                    id: id.to_string(),
+                    lock_path: lock_path.to_path_buf(),
+                });
+            }
+            Err((_, errno)) => {
+                return Err(io_err(std::io::Error::from_raw_os_error(errno as i32)));
+            }
+        };
+        // The daemon never opens the lock by path, so it needs no read bit.
+        std::fs::set_permissions(lock_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(io_err)?;
+        // A concurrent teardown may have unlinked the file between our open
+        // and the flock, leaving us locking an orphaned inode no future open
+        // can see. Verify the path still names the inode we locked; retry
+        // with a fresh open otherwise.
+        let held = lock.metadata().map_err(io_err)?;
+        match std::fs::symlink_metadata(lock_path) {
+            Ok(disk) if disk.ino() == held.ino() && disk.dev() == held.dev() => return Ok(lock),
+            _ => continue,
+        }
+    }
+    Err(io_err(std::io::Error::other(
+        "lock file kept changing underneath (concurrent teardown?)",
+    )))
 }
 
 /// Validate inputs, materialize the per-VM work dir, and write the generated
@@ -261,14 +364,18 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
     // (which also guarantees a single, safe path component).
     validate_id(&args.id)?;
 
-    if !args.kernel.exists() {
+    // clap enforces both flags whenever `--teardown` is absent, and teardown
+    // is dispatched before `prepare` is ever called.
+    let kernel = args.kernel.as_deref().expect("--kernel enforced by clap");
+    let rootfs = args.rootfs.as_deref().expect("--rootfs enforced by clap");
+    if !kernel.exists() {
         return Err(JailerError::KernelNotFound {
-            path: args.kernel.clone(),
+            path: kernel.to_path_buf(),
         });
     }
-    if !args.rootfs.exists() {
+    if !rootfs.exists() {
         return Err(JailerError::RootfsNotFound {
-            path: args.rootfs.clone(),
+            path: rootfs.to_path_buf(),
         });
     }
 
@@ -293,6 +400,14 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
     let work_root = args.work_dir.clone().unwrap_or_else(default_work_root);
     let drop_requested = args.uid.is_some() || args.gid.is_some() || args.user.is_some();
     secure_work_root(&work_root, drop_requested)?;
+
+    // Claim the instance before touching any of its state. Like the profile,
+    // the lock file is a root-owned dot-sibling outside the (chowned, daemon-
+    // writable) work dir, so a compromised dropped-uid daemon cannot unlink
+    // or replace it.
+    let lock_path = work_root.join(format!(".{}.lock", args.id));
+    let lock = acquire_instance_lock(&lock_path, &args.id)?;
+
     let work_dir = work_root.join(&args.id);
     // Refuse a pre-planted symlink at the exact work-dir path: `create_dir_all`
     // follows symlinks, so without this a local user could seed
@@ -305,6 +420,16 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
             path: work_dir,
             reason: "path is a symlink",
         });
+    }
+    // One-shot retire-and-recreate: under the lock, so a running instance's
+    // state can never be wiped. `remove_dir_all` does not follow the leaf
+    // symlink (refused above) or interior symlinks.
+    if args.clean_work_dir && std::fs::symlink_metadata(&work_dir).is_ok() {
+        std::fs::remove_dir_all(&work_dir).map_err(|source| JailerError::Remove {
+            path: work_dir.clone(),
+            source,
+        })?;
+        eprintln!("hephaestus-jailer: cleaned work dir {}", work_dir.display());
     }
     std::fs::create_dir_all(&work_dir).map_err(|source| JailerError::CreateWorkDir {
         path: work_dir.clone(),
@@ -323,6 +448,21 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
     })?;
 
     let api_sock = work_dir.join("api.sock");
+    // Remove a stale api socket from a previous run while still privileged
+    // and under the lock. `remove_file` unlinks without following, so a
+    // daemon-planted symlink at this name is removed, not traversed. The
+    // daemon would unlink the path itself before binding, but staleness is
+    // this supervisor's job — the daemon's unlink is bare-daemon compat.
+    if std::fs::symlink_metadata(&api_sock).is_ok() {
+        std::fs::remove_file(&api_sock).map_err(|source| JailerError::Remove {
+            path: api_sock.clone(),
+            source,
+        })?;
+        eprintln!(
+            "hephaestus-jailer: removed stale api socket {}",
+            api_sock.display()
+        );
+    }
     // Keep the profile out of the daemon-writable work directory. Otherwise a
     // compromised dropped-uid daemon could replace it with a symlink and make
     // the next root launch overwrite or chown an arbitrary path.
@@ -353,11 +493,11 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
         }
     }
 
-    let mut reads: Vec<&Path> = vec![&args.kernel];
+    let mut reads: Vec<&Path> = vec![kernel];
     if let Some(initramfs) = args.initramfs.as_deref() {
         reads.push(initramfs);
     }
-    let read_write_files: Vec<&Path> = vec![&args.rootfs];
+    let read_write_files: Vec<&Path> = vec![rootfs];
     let mut work_dirs: Vec<&Path> = vec![work_dir.as_path()];
     for slot in &pool_slot_dirs_rw {
         work_dirs.push(slot.as_path());
@@ -393,6 +533,7 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
         work_dir,
         api_sock,
         profile_path,
+        lock,
     })
 }
 
@@ -421,16 +562,25 @@ fn build_command(
     let nofile = args.rlimit_nofile;
     let nproc = args.rlimit_nproc;
     let fsize = args.rlimit_fsize;
+    // The instance-lock fd is deliberately inherited by the daemon: macOS has
+    // no `PR_SET_PDEATHSIG`, so a SIGKILLed jailer orphans the daemon — the
+    // shared open file description keeps the flock claim alive for as long as
+    // either process lives, and a relaunch cannot steal a live api socket.
+    let lock_fd = plan.lock.as_raw_fd();
     // Run the daemon as its own process-group leader (so the jailer can signal
     // the whole subtree on teardown), apply any resource caps, and drop
     // privileges before exec. The uid/gid were resolved in the parent (a
     // `getpwnam` lookup allocates and must never run post-fork).
-    // SAFETY: `setpgid`/`setrlimit`/`setgroups`/`setgid`/`setuid` are
+    // SAFETY: `setpgid`/`fcntl`/`setrlimit`/`setgroups`/`setgid`/`setuid` are
     // async-signal-safe and touch no Rust heap state; the closure only reads
     // captured Copy values.
     unsafe {
         cmd.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Clear FD_CLOEXEC so the lock survives the exec (see above).
+            if libc::fcntl(lock_fd, libc::F_SETFD, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             apply_rlimit(libc::RLIMIT_NOFILE, nofile)?;
@@ -569,11 +719,15 @@ fn generate_launchd_plist(args: &Args, plan: &Plan) -> Result<String, JailerErro
     // different binary.
     let jailer_exe =
         std::env::current_exe().map_err(|source| JailerError::CurrentExe { source })?;
+    // `--clean-work-dir` is deliberately never reconstructed here: a
+    // `KeepAlive` plist carrying it would wipe snapshots on every restart.
+    let kernel = args.kernel.as_deref().expect("--kernel enforced by clap");
+    let rootfs = args.rootfs.as_deref().expect("--rootfs enforced by clap");
     let mut program_args = vec![
         jailer_exe.to_string_lossy().into_owned(),
         format!("--id={}", args.id),
-        format!("--kernel={}", plist_path(&args.kernel)),
-        format!("--rootfs={}", plist_path(&args.rootfs)),
+        format!("--kernel={}", plist_path(kernel)),
+        format!("--rootfs={}", plist_path(rootfs)),
         format!("--work-dir={}", plist_path(&plan.work_root)),
         format!("--firecracker-binary={}", plist_path(&plan.binary)),
     ];
@@ -605,10 +759,14 @@ fn generate_launchd_plist(args: &Args, plan: &Plan) -> Result<String, JailerErro
         program_args.push(format!("--rlimit-fsize={fsize}"));
     }
 
-    // launchd opens logs before starting the job, so use the already
-    // materialized absolute per-VM work directory.
-    let work_dir_abs =
-        std::fs::canonicalize(&plan.work_dir).unwrap_or_else(|_| plan.work_dir.clone());
+    // launchd opens the log paths as root before each (re)start, so they
+    // must NOT live inside the daemon-writable (chowned after a privilege
+    // drop) work dir — a compromised daemon could symlink-swap them and have
+    // root append to an arbitrary path. Keep them as root-owned dot-siblings
+    // in the work root, like the profile and lock; the daemon still writes
+    // to them via the fds launchd hands it. `--teardown` removes them.
+    let work_root_abs =
+        std::fs::canonicalize(&plan.work_root).unwrap_or_else(|_| plan.work_root.clone());
     let program_args_xml = program_args
         .iter()
         .map(|a| format!("        <string>{}</string>", xml_escape(a)))
@@ -631,9 +789,9 @@ fn generate_launchd_plist(args: &Args, plan: &Plan) -> Result<String, JailerErro
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>{work_dir}/launchd.stdout.log</string>
+    <string>{work_root}/.{id}.launchd.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>{work_dir}/launchd.stderr.log</string>
+    <string>{work_root}/.{id}.launchd.stderr.log</string>
     <key>ThrottleInterval</key>
     <integer>5</integer>
 </dict>
@@ -641,11 +799,15 @@ fn generate_launchd_plist(args: &Args, plan: &Plan) -> Result<String, JailerErro
 "#,
         label = label,
         program_args_xml = program_args_xml,
-        work_dir = xml_escape(&work_dir_abs.to_string_lossy()),
+        work_root = xml_escape(&work_root_abs.to_string_lossy()),
+        id = xml_escape(&args.id),
     ))
 }
 
 fn run(args: Args) -> Result<u8, JailerError> {
+    if args.teardown {
+        return teardown(&args);
+    }
     let plan = prepare(&args)?;
 
     // Resolve the privilege-drop target up front: a `--user` lookup goes
@@ -709,6 +871,10 @@ fn run(args: Args) -> Result<u8, JailerError> {
         binary: plan.binary.clone(),
         source,
     })?;
+    // The instance lock in `plan` must outlive the child: parent and child
+    // share one open file description, so dropping the `Flock` earlier would
+    // release the running daemon's claim too. It unlocks here, after wait.
+    drop(plan);
     Ok(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1))
 }
 
@@ -756,6 +922,28 @@ fn validate_id(id: &str) -> Result<(), JailerError> {
 /// daemon can reach its own (chowned) per-VM dir beneath it. With `0700` the
 /// child would fail path traversal on everything under the root after setuid.
 fn secure_work_root(root: &Path, drop_requested: bool) -> Result<(), JailerError> {
+    if !assert_trusted_work_root(root)? {
+        std::fs::create_dir_all(root).map_err(|source| JailerError::CreateWorkDir {
+            path: root.to_path_buf(),
+            source,
+        })?;
+    }
+    // Enforce private perms on every run. If we don't own the directory this
+    // fails with EPERM, which is the fail-closed outcome we want.
+    let mode = if drop_requested { 0o711 } else { 0o700 };
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode)).map_err(|_| {
+        JailerError::UnsafeWorkDir {
+            path: root.to_path_buf(),
+            reason: "cannot enforce private owner-only perms (not owner?)",
+        }
+    })
+}
+
+/// Refusal checks shared by launch (`secure_work_root`) and `--teardown`:
+/// an existing root must be a non-symlink directory owned by the invoking
+/// euid. Returns `Ok(false)` when the root does not exist, so teardown can
+/// treat that as "nothing to remove" without creating it as a side effect.
+fn assert_trusted_work_root(root: &Path) -> Result<bool, JailerError> {
     match std::fs::symlink_metadata(root) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -780,29 +968,81 @@ fn secure_work_root(root: &Path, drop_requested: bool) -> Result<(), JailerError
                     reason: "work root is not owned by the invoking uid",
                 });
             }
+            Ok(true)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(root).map_err(|source| JailerError::CreateWorkDir {
-                path: root.to_path_buf(),
-                source,
-            })?;
-        }
-        Err(source) => {
-            return Err(JailerError::CreateWorkDir {
-                path: root.to_path_buf(),
-                source,
-            });
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(JailerError::CreateWorkDir {
+            path: root.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Retire an instance's on-disk state: the per-VM work dir and the root-owned
+/// dot-siblings (`.{id}.sandbox.profile`, `.{id}.launchd.*.log`, and last the
+/// `.{id}.lock` file). Refuses while the instance is running — its flock is
+/// held — and is idempotent when nothing exists. The lock file is unlinked
+/// *before* the flock is released: a concurrent launch either still sees the
+/// held lock or re-opens a fresh file, and `acquire_instance_lock`'s inode
+/// re-check catches the window in between.
+fn teardown(args: &Args) -> Result<u8, JailerError> {
+    validate_id(&args.id)?;
+    let work_root = args.work_dir.clone().unwrap_or_else(default_work_root);
+    if !assert_trusted_work_root(&work_root)? {
+        eprintln!(
+            "hephaestus-jailer: nothing to remove under {}",
+            work_root.display()
+        );
+        return Ok(0);
+    }
+
+    let lock_path = work_root.join(format!(".{}.lock", args.id));
+    let lock = if std::fs::symlink_metadata(&lock_path).is_ok() {
+        Some(acquire_instance_lock(&lock_path, &args.id)?)
+    } else {
+        None
+    };
+
+    let work_dir = work_root.join(&args.id);
+    // Same leaf guard as launch: never descend into (or delete through) a
+    // planted symlink at the exact per-VM path.
+    if let Ok(meta) = std::fs::symlink_metadata(&work_dir)
+        && meta.file_type().is_symlink()
+    {
+        return Err(JailerError::UnsafeWorkDir {
+            path: work_dir,
+            reason: "path is a symlink",
+        });
+    }
+
+    let remove_err = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| JailerError::Remove { path, source }
+    };
+    if std::fs::symlink_metadata(&work_dir).is_ok() {
+        std::fs::remove_dir_all(&work_dir).map_err(remove_err(&work_dir))?;
+    }
+    for name in [
+        format!(".{}.sandbox.profile", args.id),
+        format!(".{}.launchd.stdout.log", args.id),
+        format!(".{}.launchd.stderr.log", args.id),
+    ] {
+        let path = work_root.join(name);
+        if std::fs::symlink_metadata(&path).is_ok() {
+            std::fs::remove_file(&path).map_err(remove_err(&path))?;
         }
     }
-    // Enforce private perms on every run. If we don't own the directory this
-    // fails with EPERM, which is the fail-closed outcome we want.
-    let mode = if drop_requested { 0o711 } else { 0o700 };
-    std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode)).map_err(|_| {
-        JailerError::UnsafeWorkDir {
-            path: root.to_path_buf(),
-            reason: "cannot enforce private owner-only perms (not owner?)",
-        }
-    })
+    if lock.is_some() && std::fs::symlink_metadata(&lock_path).is_ok() {
+        std::fs::remove_file(&lock_path).map_err(remove_err(&lock_path))?;
+    }
+    drop(lock);
+
+    eprintln!(
+        "hephaestus-jailer: tore down instance {:?} under {}",
+        args.id,
+        work_root.display()
+    );
+    Ok(0)
 }
 
 /// Existing `slot-*` subdirectories of a warm pool. Pool slots are pre-created
@@ -855,8 +1095,8 @@ mod tests {
             id: "vm-test".into(),
             work_dir: Some(dir.join("work")),
             firecracker_binary: Some(touch(dir.join("fake-firecracker"))),
-            kernel: touch(dir.join("vmlinux")),
-            rootfs: touch(dir.join("rootfs.ext4")),
+            kernel: Some(touch(dir.join("vmlinux"))),
+            rootfs: Some(touch(dir.join("rootfs.ext4"))),
             initramfs: None,
             pool_dir: None,
             deny_probe: None,
@@ -868,6 +1108,8 @@ mod tests {
             user: None,
             generate_launchd_plist: false,
             launchd_plist_path: None,
+            clean_work_dir: false,
+            teardown: false,
         }
     }
 
@@ -881,7 +1123,7 @@ mod tests {
     fn prepare_rejects_missing_kernel() {
         let dir = scratch("missing-kernel");
         let mut args = args_in(&dir);
-        args.kernel = dir.join("no-such-kernel");
+        args.kernel = Some(dir.join("no-such-kernel"));
         assert!(matches!(
             prepare(&args),
             Err(JailerError::KernelNotFound { .. })
@@ -892,7 +1134,7 @@ mod tests {
     fn prepare_rejects_missing_rootfs() {
         let dir = scratch("missing-rootfs");
         let mut args = args_in(&dir);
-        args.rootfs = dir.join("no-such-rootfs");
+        args.rootfs = Some(dir.join("no-such-rootfs"));
         assert!(matches!(
             prepare(&args),
             Err(JailerError::RootfsNotFound { .. })
@@ -1100,6 +1342,10 @@ mod tests {
             "profile is owner-readable without a drop"
         );
 
+        // Release the first run's instance lock before re-preparing the
+        // same id — a live Plan holds the flock and the second claim would
+        // be refused as InstanceBusy.
+        drop(plan);
         args.uid = Some(1);
         let plan = prepare(&args).unwrap();
         assert_eq!(
@@ -1235,6 +1481,223 @@ mod tests {
                 fs::canonicalize(&plan.binary).unwrap().to_string_lossy()
             )),
             "plist should pin the resolved daemon binary"
+        );
+    }
+
+    #[test]
+    fn prepare_refuses_second_claim_on_the_same_id() {
+        let dir = scratch("lock-second-claim");
+        let args = args_in(&dir);
+        let first = prepare(&args).expect("first claim should succeed");
+        assert!(
+            matches!(prepare(&args), Err(JailerError::InstanceBusy { .. })),
+            "a live instance must refuse a second jailer for the same id"
+        );
+        drop(first);
+        prepare(&args).expect("a released id should be claimable again");
+    }
+
+    #[test]
+    fn prepare_removes_stale_api_sock() {
+        let dir = scratch("stale-sock");
+        let args = args_in(&dir);
+        let plan = prepare(&args).unwrap();
+        let sock = plan.api_sock.clone();
+        drop(plan);
+        // Stand-in for a dead daemon's leftover socket. (Binding a real UDS
+        // here would exceed SUN_LEN on macOS's deep per-user temp paths;
+        // removal goes through symlink_metadata + remove_file either way.)
+        touch(sock.clone());
+        assert!(sock.exists());
+        let _plan = prepare(&args).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&sock).is_err(),
+            "prepare should unlink a stale api socket"
+        );
+    }
+
+    #[test]
+    fn prepare_reuses_existing_work_dir_preserving_contents() {
+        let dir = scratch("reuse-dir");
+        let args = args_in(&dir);
+        let plan = prepare(&args).unwrap();
+        let snapshot = plan.work_dir.join("snapshot.bin");
+        drop(plan);
+        touch(snapshot.clone());
+        fs::set_permissions(
+            snapshot.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let plan = prepare(&args).unwrap();
+        assert!(
+            snapshot.exists(),
+            "restarts must preserve work-dir contents by default"
+        );
+        let mode = fs::metadata(&plan.work_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "work-dir mode is renormalized on every run");
+    }
+
+    #[test]
+    fn clean_work_dir_empties_the_per_vm_dir() {
+        let dir = scratch("clean-dir");
+        let mut args = args_in(&dir);
+        let plan = prepare(&args).unwrap();
+        let stale = touch(plan.work_dir.join("snapshot.bin"));
+        drop(plan);
+
+        args.clean_work_dir = true;
+        let plan = prepare(&args).unwrap();
+        assert!(plan.work_dir.is_dir(), "work dir is recreated");
+        assert!(
+            !stale.exists(),
+            "--clean-work-dir must discard old contents"
+        );
+    }
+
+    #[test]
+    fn teardown_removes_work_dir_profile_and_lock() {
+        let dir = scratch("teardown-happy");
+        let mut args = args_in(&dir);
+        let plan = prepare(&args).unwrap();
+        let (work_dir, profile_path, work_root) = (
+            plan.work_dir.clone(),
+            plan.profile_path.clone(),
+            plan.work_root.clone(),
+        );
+        drop(plan);
+
+        args.teardown = true;
+        assert_eq!(teardown(&args).unwrap(), 0);
+        assert!(!work_dir.exists(), "work dir should be removed");
+        assert!(!profile_path.exists(), "profile should be removed");
+        assert!(
+            !work_root.join(".vm-test.lock").exists(),
+            "lock file should be removed"
+        );
+    }
+
+    #[test]
+    fn teardown_refuses_while_the_instance_is_running() {
+        let dir = scratch("teardown-busy");
+        let mut args = args_in(&dir);
+        let plan = prepare(&args).unwrap();
+        args.teardown = true;
+        assert!(
+            matches!(teardown(&args), Err(JailerError::InstanceBusy { .. })),
+            "teardown must refuse while the instance lock is held"
+        );
+        assert!(plan.work_dir.is_dir(), "a running instance keeps its state");
+    }
+
+    #[test]
+    fn teardown_refuses_a_symlinked_work_dir() {
+        let dir = scratch("teardown-symlink");
+        let mut args = args_in(&dir);
+        let root = dir.join("work");
+        fs::create_dir_all(&root).unwrap();
+        let victim = dir.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        std::os::unix::fs::symlink(&victim, root.join("vm-test")).unwrap();
+
+        args.teardown = true;
+        assert!(
+            matches!(teardown(&args), Err(JailerError::UnsafeWorkDir { .. })),
+            "teardown must not delete through a planted symlink"
+        );
+        assert!(victim.exists(), "the symlink target must be untouched");
+    }
+
+    #[test]
+    fn teardown_is_idempotent_when_nothing_exists() {
+        let dir = scratch("teardown-idempotent");
+        let mut args = args_in(&dir);
+        args.work_dir = Some(dir.join("never-created"));
+        args.teardown = true;
+        assert_eq!(teardown(&args).unwrap(), 0, "missing root → nothing to do");
+        assert_eq!(teardown(&args).unwrap(), 0, "and it stays repeatable");
+    }
+
+    #[test]
+    fn secure_work_root_rejects_symlink_and_non_directory_roots() {
+        let dir = scratch("root-rejects");
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let link = dir.join("link-root");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            secure_work_root(&link, false),
+            Err(JailerError::UnsafeWorkDir {
+                reason: "work root is a symlink",
+                ..
+            })
+        ));
+
+        let file = touch(dir.join("file-root"));
+        assert!(matches!(
+            secure_work_root(&file, false),
+            Err(JailerError::UnsafeWorkDir {
+                reason: "work root exists but is not a directory",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn args_teardown_waives_kernel_and_rootfs() {
+        Args::try_parse_from(["hephaestus-jailer", "--teardown"]).unwrap();
+        Args::try_parse_from(["hephaestus-jailer"]).unwrap_err();
+        Args::try_parse_from(["hephaestus-jailer", "--kernel", "k"]).unwrap_err();
+    }
+
+    #[test]
+    fn args_teardown_conflicts_with_plist_and_clean() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["hephaestus-jailer", "--teardown"];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv)
+        };
+        parse(&["--generate-launchd-plist"]).unwrap_err();
+        parse(&["--launchd-plist-path", "/tmp/x.plist"]).unwrap_err();
+        parse(&["--clean-work-dir"]).unwrap_err();
+    }
+
+    #[test]
+    fn launchd_plist_logs_live_outside_the_chowned_work_dir() {
+        let dir = scratch("launchd-log-paths");
+        let args = args_in(&dir);
+        let plan = prepare(&args).unwrap();
+        let plist = generate_launchd_plist(&args, &plan).unwrap();
+
+        let root = fs::canonicalize(&plan.work_root).unwrap();
+        for stream in ["stdout", "stderr"] {
+            assert!(
+                plist.contains(&format!(
+                    "<string>{}/.vm-test.launchd.{stream}.log</string>",
+                    root.to_string_lossy()
+                )),
+                "launchd {stream} log must be a root-owned work-root sibling:\n{plist}"
+            );
+        }
+        assert!(
+            !plist.contains("vm-test/launchd."),
+            "launchd logs must not live inside the daemon-writable work dir"
+        );
+    }
+
+    #[test]
+    fn launchd_plist_never_carries_clean_work_dir() {
+        let dir = scratch("launchd-no-clean");
+        let mut args = args_in(&dir);
+        // clap allows --clean-work-dir alongside plist generation (it only
+        // conflicts with --teardown), so the builder itself must drop it.
+        args.clean_work_dir = true;
+        let plan = prepare(&args).unwrap();
+        let plist = generate_launchd_plist(&args, &plan).unwrap();
+        assert!(
+            !plist.contains("--clean-work-dir"),
+            "a KeepAlive plist carrying --clean-work-dir would wipe snapshots on every restart"
         );
     }
 }
