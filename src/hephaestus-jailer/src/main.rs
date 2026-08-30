@@ -18,8 +18,12 @@
 //!    pool base read-only + pool slots read/write) plus the per-VM work dir.
 //!    Paths are canonicalized during profile generation (see `profile.rs`).
 //! 5. Optionally drops privileges to an unprivileged uid/gid (`--uid`,
-//!    `--gid`, `--user`). Requires root. The per-VM work dir is chown'd to
-//!    the target so the daemon can create the api socket after the drop;
+//!    `--gid`, `--user`), or allocates a dedicated per-instance uid from
+//!    `--uid-base` (recorded in the root-owned `.uid-allocations` registry;
+//!    stable across restarts, released by `--teardown`). Requires root. A
+//!    launch is refused while another live instance runs under the same
+//!    uid (`--allow-shared-uid` overrides). The per-VM work dir is chown'd
+//!    to the target so the daemon can create the api socket after the drop;
 //!    the sandbox profile stays root-owned outside that writable directory.
 //! 6. Execs `hephaestus-firecracker` with `--sandbox-profile <profile>`
 //!    and `--api-sock <work_dir>/api.sock`. The child inherits the jail.
@@ -55,6 +59,12 @@ use nix::fcntl::{Flock, FlockArg};
 use thiserror::Error;
 
 mod profile;
+mod uid_registry;
+
+/// Width of the `--uid-base` allocation window. 1000 instances per work
+/// root is far beyond what one host runs; a fixed width keeps the flag
+/// surface minimal.
+const UID_ALLOC_RANGE: libc::uid_t = 1000;
 
 /// Process-group id of the launched `hephaestus-firecracker` child (equal to
 /// its pid, since we make it a group leader). Read from a signal handler, so
@@ -167,6 +177,21 @@ struct Args {
     #[arg(long, conflicts_with_all = ["uid", "gid"])]
     user: Option<String>,
 
+    /// Base of a per-instance dedicated-uid range: each instance id is
+    /// allocated — and keeps, across restarts — its own uid from
+    /// [base, base+1000), with gid set equal to the uid. The recommended
+    /// mode for running multiple VMs: instances sharing one uid can signal
+    /// and ptrace each other. Requires root. Mutually exclusive with
+    /// `--uid`/`--gid`/`--user`.
+    #[arg(long, conflicts_with_all = ["uid", "gid", "user"])]
+    uid_base: Option<libc::uid_t>,
+
+    /// Proceed even when another live instance already runs under the same
+    /// uid (the jailer otherwise refuses to launch). Escape hatch for
+    /// deliberate shared-uid deployments; weakens instance separation.
+    #[arg(long)]
+    allow_shared_uid: bool,
+
     /// Instead of running, generate a launchd plist that wraps this
     /// jailer invocation and write it to stdout. The plist uses
     /// `KeepAlive` so launchd restarts the full jailer whenever the
@@ -188,10 +213,11 @@ struct Args {
     clean_work_dir: bool,
 
     /// Instead of launching, remove this instance's on-disk state — the
-    /// per-VM work dir, sandbox profile, instance lock, and launchd logs —
-    /// and exit. Refuses while the instance is running (its lock is held).
-    /// Unload any launchd plist first (`launchctl bootout`), or launchd
-    /// will simply re-create everything on the next restart.
+    /// per-VM work dir, sandbox profile, instance lock, launchd logs, and
+    /// its uid-registry entry — and exit. Refuses while the instance is
+    /// running (its lock is held). Unload any launchd plist first
+    /// (`launchctl bootout`), or launchd will simply re-create everything
+    /// on the next restart.
     #[arg(
         long,
         conflicts_with_all = ["generate_launchd_plist", "launchd_plist_path", "clean_work_dir"]
@@ -274,6 +300,18 @@ enum JailerError {
         #[source]
         source: std::io::Error,
     },
+    #[error("uid registry: {0}")]
+    UidRegistry(#[from] uid_registry::RegistryError),
+    #[error(
+        "refusing to run instance {id:?} as uid {uid}: instance {other_id:?} is live \
+         under the same uid (same-uid daemons can signal and ptrace each other; pass \
+         --allow-shared-uid to override)"
+    )]
+    SharedUidLive {
+        id: String,
+        other_id: String,
+        uid: libc::uid_t,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -297,11 +335,127 @@ struct Plan {
     work_dir: PathBuf,
     api_sock: PathBuf,
     profile_path: PathBuf,
+    /// The uid/gid the daemon will run as: allocated from `--uid-base`, or
+    /// the resolved `--uid`/`--gid`/`--user` values, or `None` (no drop).
+    target_uid: Option<libc::uid_t>,
+    target_gid: Option<libc::gid_t>,
     /// Exclusive claim on this instance id. Unlocks on drop, and the child
     /// inherits the same open file description, so `run` must keep the plan
     /// alive past `child.wait()` — dropping it early would release the
     /// daemon's claim too.
     lock: Flock<File>,
+}
+
+/// Whether a real user account owns `uid`. Allocation skips such uids so a
+/// dedicated-uid VM never aliases an existing account. Runs in the parent,
+/// pre-fork — like `getpwnam`, `getpwuid` may allocate and must never run
+/// in the child. Note this check fails open (a lookup error looks like a
+/// free uid); it narrows collisions with real accounts but the hard floor
+/// is the registry's unconditional refusal of uid 0.
+fn passwd_entry_exists(uid: libc::uid_t) -> bool {
+    // SAFETY: getpwuid only reads process-global passwd state; the result
+    // is only null-checked, never dereferenced.
+    unsafe { !libc::getpwuid(uid).is_null() }
+}
+
+/// Non-destructively probe whether an instance's flock is currently held.
+/// Opens WITHOUT create — an absent lock file means no live holder — and
+/// releases the probe lock immediately on drop. Same idiom as the pool's
+/// `stats()`.
+fn instance_lock_held(lock_path: &Path) -> Result<bool, JailerError> {
+    let file = match File::options().read(true).write(true).open(lock_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(JailerError::Lock {
+                path: lock_path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(_freed) => Ok(false),
+        Err((_, Errno::EWOULDBLOCK)) => Ok(true),
+        Err((_, errno)) => Err(JailerError::Lock {
+            path: lock_path.to_path_buf(),
+            source: std::io::Error::from_raw_os_error(errno as i32),
+        }),
+    }
+}
+
+/// Decide the uid/gid this instance will run as, registering it so other
+/// launches can see it. MUST be called with the instance lock held. Lock
+/// order is fixed and one-way: instance flock first, registry flock second
+/// (the registry's liveness probes are non-blocking, so no cycle can
+/// block). Registering before probing, inside one registry critical
+/// section, is the race invariant: of two concurrent launches picking the
+/// same uid, whichever enters the registry second sees the first's entry
+/// and its held instance lock, and refuses. The registry flock is released
+/// when this function returns — only the instance lock lives as long as
+/// the daemon.
+fn resolve_instance_identity(
+    args: &Args,
+    explicit: (Option<libc::uid_t>, Option<libc::gid_t>),
+    work_root: &Path,
+) -> Result<(Option<libc::uid_t>, Option<libc::gid_t>), JailerError> {
+    if let Some(base) = args.uid_base {
+        let mut reg = uid_registry::Registry::open(work_root)?;
+        let uid = reg.allocate(&args.id, base, UID_ALLOC_RANGE, passwd_entry_exists)?;
+        reg.upsert(&args.id, uid)?;
+        refuse_live_shared_uid(work_root, &reg, &args.id, uid, args.allow_shared_uid)?;
+        // A dedicated uid gets a matching dedicated gid: sharing a group
+        // would put every allocated-uid VM back into one mutual-access set.
+        return Ok((Some(uid), Some(uid)));
+    }
+    if let Some(uid) = explicit.0 {
+        // Explicit --uid/--user launches register too, so allocation and
+        // the liveness refusal see every dropping instance's uid.
+        let mut reg = uid_registry::Registry::open(work_root)?;
+        reg.upsert(&args.id, uid)?;
+        refuse_live_shared_uid(work_root, &reg, &args.id, uid, args.allow_shared_uid)?;
+    }
+    Ok(explicit)
+}
+
+/// Refuse to launch `id` as `uid` while another instance is live under the
+/// same uid. The registry names every dropping instance's uid; each other
+/// entry with our uid is probed for a held instance lock. The self-skip is
+/// load-bearing: flock is per open-file-description, so probing our own
+/// (already held) lock from a fresh fd would report *us* as the conflict.
+fn refuse_live_shared_uid(
+    work_root: &Path,
+    registry: &uid_registry::Registry,
+    id: &str,
+    uid: libc::uid_t,
+    allow: bool,
+) -> Result<(), JailerError> {
+    for (other_id, other_uid) in registry.entries() {
+        if other_id == id || *other_uid != uid {
+            continue;
+        }
+        // Entries were charset-validated at parse time, so joining them
+        // into a lock-file name cannot traverse; validate again anyway to
+        // keep this path safe against future registry format changes.
+        if validate_id(other_id).is_err() {
+            continue;
+        }
+        let lock_path = work_root.join(format!(".{other_id}.lock"));
+        if instance_lock_held(&lock_path)? {
+            if allow {
+                eprintln!(
+                    "hephaestus-jailer: warning: sharing uid {uid} with live instance \
+                     {other_id:?} (--allow-shared-uid)"
+                );
+                continue;
+            }
+            return Err(JailerError::SharedUidLive {
+                id: id.to_string(),
+                other_id: other_id.clone(),
+                uid,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Claim an instance id by taking an exclusive non-blocking `flock` on its
@@ -356,7 +510,14 @@ fn acquire_instance_lock(lock_path: &Path, id: &str) -> Result<Flock<File>, Jail
 
 /// Validate inputs, materialize the per-VM work dir, and write the generated
 /// sandbox profile. Returns the resolved paths; performs no exec.
-fn prepare(args: &Args) -> Result<Plan, JailerError> {
+/// `explicit` is the pre-resolved `--uid`/`--gid`/`--user` target (uid,
+/// gid), resolved by the caller so `getpwnam` stays out of this function;
+/// `--uid-base` allocation happens here because it must run under the
+/// instance lock.
+fn prepare(
+    args: &Args,
+    explicit: (Option<libc::uid_t>, Option<libc::gid_t>),
+) -> Result<Plan, JailerError> {
     // The id becomes a path component of the per-VM work dir and is emitted
     // verbatim into the sandbox profile. An unvalidated id like `../../etc`
     // would path-traverse out of the work root and widen the deny-by-default
@@ -398,7 +559,7 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
     // read/write/create/delete on the whole subtree so the daemon can
     // create them without us having to enumerate each one upfront.
     let work_root = args.work_dir.clone().unwrap_or_else(default_work_root);
-    let drop_requested = args.uid.is_some() || args.gid.is_some() || args.user.is_some();
+    let drop_requested = explicit.0.is_some() || explicit.1.is_some() || args.uid_base.is_some();
     secure_work_root(&work_root, drop_requested)?;
 
     // Claim the instance before touching any of its state. Like the profile,
@@ -407,6 +568,8 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
     // or replace it.
     let lock_path = work_root.join(format!(".{}.lock", args.id));
     let lock = acquire_instance_lock(&lock_path, &args.id)?;
+
+    let (target_uid, target_gid) = resolve_instance_identity(args, explicit, &work_root)?;
 
     let work_dir = work_root.join(&args.id);
     // Refuse a pre-planted symlink at the exact work-dir path: `create_dir_all`
@@ -533,6 +696,8 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
         work_dir,
         api_sock,
         profile_path,
+        target_uid,
+        target_gid,
         lock,
     })
 }
@@ -541,12 +706,7 @@ fn prepare(args: &Args) -> Result<Plan, JailerError> {
 /// side effects at call time (a test can assert the args/env it produces); it
 /// does register a `pre_exec` hook that runs in the child at spawn to put it in
 /// its own process group.
-fn build_command(
-    plan: &Plan,
-    args: &Args,
-    target_uid: Option<libc::uid_t>,
-    target_gid: Option<libc::gid_t>,
-) -> Command {
+fn build_command(plan: &Plan, args: &Args) -> Command {
     let mut cmd = Command::new(&plan.binary);
     cmd.env("HEPHAESTUS_FC_WORK_DIR", &plan.work_dir);
     cmd.arg("--api-sock").arg(&plan.api_sock);
@@ -558,10 +718,12 @@ fn build_command(
     if let Some(probe) = args.deny_probe.as_deref() {
         cmd.arg("--sandbox-deny-probe").arg(probe);
     }
-    // Capture the (Copy) resource caps so the child closure is self-contained.
+    // Capture the (Copy) resource caps and drop target so the child closure
+    // is self-contained.
     let nofile = args.rlimit_nofile;
     let nproc = args.rlimit_nproc;
     let fsize = args.rlimit_fsize;
+    let (target_uid, target_gid) = (plan.target_uid, plan.target_gid);
     // The instance-lock fd is deliberately inherited by the daemon: macOS has
     // no `PR_SET_PDEATHSIG`, so a SIGKILLed jailer orphans the daemon — the
     // shared open file description keeps the flock claim alive for as long as
@@ -740,6 +902,17 @@ fn generate_launchd_plist(args: &Args, plan: &Plan) -> Result<String, JailerErro
     if let Some(probe) = args.deny_probe.as_deref() {
         program_args.push(format!("--deny-probe={}", plist_path(probe)));
     }
+    if args.uid_base.is_some() {
+        // Pin the allocated identity (like --firecracker-binary): restarts
+        // must land on the same uid without re-running allocation, and
+        // --uid-base itself is deliberately never reconstructed. Explicit
+        // launches re-register on every run, so the registry entry
+        // self-heals even if the file is lost.
+        let uid = plan.target_uid.expect("--uid-base always allocates a uid");
+        let gid = plan.target_gid.expect("--uid-base always allocates a gid");
+        program_args.push(format!("--uid={uid}"));
+        program_args.push(format!("--gid={gid}"));
+    }
     if let Some(uid) = args.uid {
         program_args.push(format!("--uid={uid}"));
     }
@@ -748,6 +921,11 @@ fn generate_launchd_plist(args: &Args, plan: &Plan) -> Result<String, JailerErro
     }
     if let Some(ref user) = args.user {
         program_args.push(format!("--user={user}"));
+    }
+    if args.allow_shared_uid {
+        // A KeepAlive restart must not start refusing where the original
+        // launch was explicitly allowed to share.
+        program_args.push("--allow-shared-uid".to_string());
     }
     if let Some(nofile) = args.rlimit_nofile {
         program_args.push(format!("--rlimit-nofile={nofile}"));
@@ -808,14 +986,15 @@ fn run(args: Args) -> Result<u8, JailerError> {
     if args.teardown {
         return teardown(&args);
     }
-    let plan = prepare(&args)?;
-
-    // Resolve the privilege-drop target up front: a `--user` lookup goes
-    // through `getpwnam`, which may allocate, so it must happen here in the
-    // parent — never inside the child's `pre_exec`. This also fails fast on
-    // an unknown user before anything is spawned (or a plist emitted).
-    let (target_uid, target_gid) = resolve_user(args.user.as_deref(), args.uid, args.gid)
+    // Resolve any explicit privilege-drop target up front: a `--user`
+    // lookup goes through `getpwnam`, which may allocate, so it must happen
+    // here in the parent — never inside the child's `pre_exec`. This also
+    // fails fast on an unknown user before anything is touched on disk.
+    // `--uid-base` allocation happens inside `prepare`, under the instance
+    // lock; the final identity comes back in the plan either way.
+    let explicit = resolve_user(args.user.as_deref(), args.uid, args.gid)
         .map_err(|source| JailerError::PrivilegeDrop { source })?;
+    let plan = prepare(&args, explicit)?;
 
     if args.generate_launchd_plist || args.launchd_plist_path.is_some() {
         let plist = generate_launchd_plist(&args, &plan)?;
@@ -837,19 +1016,19 @@ fn run(args: Args) -> Result<u8, JailerError> {
     // Hand only the per-VM work dir to the drop target so it can create the
     // API socket, logs, metrics, and snapshots. The profile deliberately
     // remains owner/root-owned outside this writable directory.
-    if target_uid.is_some() || target_gid.is_some() {
-        std::os::unix::fs::chown(&plan.work_dir, target_uid, target_gid).map_err(|source| {
-            JailerError::Chown {
+    if plan.target_uid.is_some() || plan.target_gid.is_some() {
+        std::os::unix::fs::chown(&plan.work_dir, plan.target_uid, plan.target_gid).map_err(
+            |source| JailerError::Chown {
                 path: plan.work_dir.clone(),
                 source,
-            }
-        })?;
+            },
+        )?;
     }
 
     // Exec the firecracker binary under the generated profile. The child
     // enters the sandbox before serving the API socket, so every API
     // request is bound by the profile.
-    let mut cmd = build_command(&plan, &args, target_uid, target_gid);
+    let mut cmd = build_command(&plan, &args);
     eprintln!(
         "hephaestus-jailer: exec {} {}",
         plan.binary.display(),
@@ -1032,6 +1211,14 @@ fn teardown(args: &Args) -> Result<u8, JailerError> {
             std::fs::remove_file(&path).map_err(remove_err(&path))?;
         }
     }
+    // Release the id's uid allocation. Guarded on the registry's existence:
+    // `Registry::open` creates the file, and teardown of a never-launched
+    // (or non-dropping) id must stay a pure no-op. Instance lock is still
+    // held here, preserving the instance-before-registry lock order.
+    if std::fs::symlink_metadata(work_root.join(".uid-allocations")).is_ok() {
+        let mut reg = uid_registry::Registry::open(&work_root)?;
+        reg.remove(&args.id)?;
+    }
     if lock.is_some() && std::fs::symlink_metadata(&lock_path).is_ok() {
         std::fs::remove_file(&lock_path).map_err(remove_err(&lock_path))?;
     }
@@ -1110,7 +1297,15 @@ mod tests {
             launchd_plist_path: None,
             clean_work_dir: false,
             teardown: false,
+            uid_base: None,
+            allow_shared_uid: false,
         }
+    }
+
+    /// `prepare` with the explicit target derived from the args, the way
+    /// `run` does it (minus the `--user` passwd lookup, which tests avoid).
+    fn prep(args: &Args) -> Result<Plan, JailerError> {
+        prepare(args, (args.uid, args.gid))
     }
 
     fn arg_strings(cmd: &Command) -> Vec<String> {
@@ -1125,7 +1320,7 @@ mod tests {
         let mut args = args_in(&dir);
         args.kernel = Some(dir.join("no-such-kernel"));
         assert!(matches!(
-            prepare(&args),
+            prep(&args),
             Err(JailerError::KernelNotFound { .. })
         ));
     }
@@ -1136,7 +1331,7 @@ mod tests {
         let mut args = args_in(&dir);
         args.rootfs = Some(dir.join("no-such-rootfs"));
         assert!(matches!(
-            prepare(&args),
+            prep(&args),
             Err(JailerError::RootfsNotFound { .. })
         ));
     }
@@ -1147,7 +1342,7 @@ mod tests {
         let mut args = args_in(&dir);
         args.firecracker_binary = Some(dir.join("no-such-binary"));
         assert!(matches!(
-            prepare(&args),
+            prep(&args),
             Err(JailerError::BinaryNotFound { .. })
         ));
     }
@@ -1156,7 +1351,7 @@ mod tests {
     fn prepare_materializes_work_dir_and_profile() {
         let dir = scratch("happy");
         let args = args_in(&dir);
-        let plan = prepare(&args).expect("prepare should succeed");
+        let plan = prep(&args).expect("prepare should succeed");
 
         assert!(plan.work_dir.is_dir(), "work dir should be created");
         assert_eq!(plan.work_dir.file_name().unwrap(), "vm-test");
@@ -1183,8 +1378,8 @@ mod tests {
     fn build_command_wires_core_args_and_env() {
         let dir = scratch("cmd-core");
         let args = args_in(&dir);
-        let plan = prepare(&args).unwrap();
-        let cmd = build_command(&plan, &args, None, None);
+        let plan = prep(&args).unwrap();
+        let cmd = build_command(&plan, &args);
 
         let got = arg_strings(&cmd);
         assert!(
@@ -1216,8 +1411,8 @@ mod tests {
         fs::create_dir_all(pool.join("slot-0")).unwrap();
         args.pool_dir = Some(pool);
         args.deny_probe = Some(dir.join("secret"));
-        let plan = prepare(&args).unwrap();
-        let cmd = build_command(&plan, &args, None, None);
+        let plan = prep(&args).unwrap();
+        let cmd = build_command(&plan, &args);
 
         let got = arg_strings(&cmd);
         assert!(got.iter().any(|a| a == "--pool-dir"));
@@ -1252,7 +1447,7 @@ mod tests {
         let dir = scratch("traversal-id");
         let mut args = args_in(&dir);
         args.id = "../../escape".into();
-        assert!(matches!(prepare(&args), Err(JailerError::InvalidId { .. })));
+        assert!(matches!(prep(&args), Err(JailerError::InvalidId { .. })));
     }
 
     #[test]
@@ -1332,7 +1527,7 @@ mod tests {
     fn prepare_makes_work_root_traversable_only_when_dropping_privileges() {
         let dir = scratch("privdrop-root-mode");
         let mut args = args_in(&dir);
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&plan.work_root), 0o700, "no drop → fully private root");
         assert_eq!(mode(&plan.work_dir), 0o700, "work dir stays private");
@@ -1347,7 +1542,7 @@ mod tests {
         // be refused as InstanceBusy.
         drop(plan);
         args.uid = Some(1);
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         assert_eq!(
             mode(&plan.work_root),
             0o711,
@@ -1379,7 +1574,7 @@ mod tests {
         fs::create_dir_all(pool.join("slot-1")).unwrap();
         args.pool_dir = Some(pool.clone());
 
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         let profile = fs::read_to_string(&plan.profile_path).unwrap();
         let pool_canon = fs::canonicalize(&pool).unwrap();
 
@@ -1410,7 +1605,7 @@ mod tests {
     fn generate_launchd_plist_contains_label_and_keepalive() {
         let dir = scratch("launchd-plist");
         let args = args_in(&dir);
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         let plist = generate_launchd_plist(&args, &plan).unwrap();
 
         assert!(
@@ -1435,7 +1630,7 @@ mod tests {
         let mut args = args_in(&dir);
         args.uid = Some(1001);
         args.gid = Some(1002);
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         let plist = generate_launchd_plist(&args, &plan).unwrap();
 
         assert!(plist.contains("--uid=1001"), "plist should include --uid");
@@ -1447,7 +1642,7 @@ mod tests {
         let dir = scratch("launchd-plist-user");
         let mut args = args_in(&dir);
         args.user = Some("nobody".into());
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         let plist = generate_launchd_plist(&args, &plan).unwrap();
 
         assert!(
@@ -1460,7 +1655,7 @@ mod tests {
     fn generate_launchd_plist_runs_the_jailer_not_the_daemon() {
         let dir = scratch("launchd-plist-argv0");
         let args = args_in(&dir);
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         let plist = generate_launchd_plist(&args, &plan).unwrap();
 
         // argv[0] must be this executable (the jailer), so launchd re-runs
@@ -1488,20 +1683,20 @@ mod tests {
     fn prepare_refuses_second_claim_on_the_same_id() {
         let dir = scratch("lock-second-claim");
         let args = args_in(&dir);
-        let first = prepare(&args).expect("first claim should succeed");
+        let first = prep(&args).expect("first claim should succeed");
         assert!(
-            matches!(prepare(&args), Err(JailerError::InstanceBusy { .. })),
+            matches!(prep(&args), Err(JailerError::InstanceBusy { .. })),
             "a live instance must refuse a second jailer for the same id"
         );
         drop(first);
-        prepare(&args).expect("a released id should be claimable again");
+        prep(&args).expect("a released id should be claimable again");
     }
 
     #[test]
     fn prepare_removes_stale_api_sock() {
         let dir = scratch("stale-sock");
         let args = args_in(&dir);
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         let sock = plan.api_sock.clone();
         drop(plan);
         // Stand-in for a dead daemon's leftover socket. (Binding a real UDS
@@ -1509,7 +1704,7 @@ mod tests {
         // removal goes through symlink_metadata + remove_file either way.)
         touch(sock.clone());
         assert!(sock.exists());
-        let _plan = prepare(&args).unwrap();
+        let _plan = prep(&args).unwrap();
         assert!(
             std::fs::symlink_metadata(&sock).is_err(),
             "prepare should unlink a stale api socket"
@@ -1520,7 +1715,7 @@ mod tests {
     fn prepare_reuses_existing_work_dir_preserving_contents() {
         let dir = scratch("reuse-dir");
         let args = args_in(&dir);
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         let snapshot = plan.work_dir.join("snapshot.bin");
         drop(plan);
         touch(snapshot.clone());
@@ -1530,7 +1725,7 @@ mod tests {
         )
         .unwrap();
 
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         assert!(
             snapshot.exists(),
             "restarts must preserve work-dir contents by default"
@@ -1543,12 +1738,12 @@ mod tests {
     fn clean_work_dir_empties_the_per_vm_dir() {
         let dir = scratch("clean-dir");
         let mut args = args_in(&dir);
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         let stale = touch(plan.work_dir.join("snapshot.bin"));
         drop(plan);
 
         args.clean_work_dir = true;
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         assert!(plan.work_dir.is_dir(), "work dir is recreated");
         assert!(
             !stale.exists(),
@@ -1560,7 +1755,7 @@ mod tests {
     fn teardown_removes_work_dir_profile_and_lock() {
         let dir = scratch("teardown-happy");
         let mut args = args_in(&dir);
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         let (work_dir, profile_path, work_root) = (
             plan.work_dir.clone(),
             plan.profile_path.clone(),
@@ -1582,7 +1777,7 @@ mod tests {
     fn teardown_refuses_while_the_instance_is_running() {
         let dir = scratch("teardown-busy");
         let mut args = args_in(&dir);
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         args.teardown = true;
         assert!(
             matches!(teardown(&args), Err(JailerError::InstanceBusy { .. })),
@@ -1667,7 +1862,7 @@ mod tests {
     fn launchd_plist_logs_live_outside_the_chowned_work_dir() {
         let dir = scratch("launchd-log-paths");
         let args = args_in(&dir);
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         let plist = generate_launchd_plist(&args, &plan).unwrap();
 
         let root = fs::canonicalize(&plan.work_root).unwrap();
@@ -1693,11 +1888,212 @@ mod tests {
         // clap allows --clean-work-dir alongside plist generation (it only
         // conflicts with --teardown), so the builder itself must drop it.
         args.clean_work_dir = true;
-        let plan = prepare(&args).unwrap();
+        let plan = prep(&args).unwrap();
         let plist = generate_launchd_plist(&args, &plan).unwrap();
         assert!(
             !plist.contains("--clean-work-dir"),
             "a KeepAlive plist carrying --clean-work-dir would wipe snapshots on every restart"
+        );
+    }
+
+    #[test]
+    fn args_uid_base_conflicts_with_explicit_identity_flags() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "hephaestus-jailer",
+                "--kernel",
+                "k",
+                "--rootfs",
+                "r",
+                "--uid-base",
+                "61000",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv)
+        };
+        parse(&[]).unwrap();
+        parse(&["--allow-shared-uid"]).unwrap();
+        parse(&["--uid", "1"]).unwrap_err();
+        parse(&["--gid", "1"]).unwrap_err();
+        parse(&["--user", "nobody"]).unwrap_err();
+    }
+
+    #[test]
+    fn uid_base_allocates_and_registers_a_dedicated_identity() {
+        let dir = scratch("uid-alloc");
+        let mut args = args_in(&dir);
+        args.uid_base = Some(61000);
+        let plan = prep(&args).unwrap();
+
+        assert_eq!(plan.target_uid, Some(61000));
+        assert_eq!(
+            plan.target_gid,
+            Some(61000),
+            "gid follows the allocated uid"
+        );
+        let registry = fs::read_to_string(plan.work_root.join(".uid-allocations")).unwrap();
+        assert!(
+            registry.contains("vm-test 61000"),
+            "entry recorded: {registry}"
+        );
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&plan.work_root.join(".uid-allocations")), 0o600);
+        // --uid-base alone counts as a privilege drop for the mode split.
+        assert_eq!(mode(&plan.work_root), 0o711);
+        assert_eq!(mode(&plan.profile_path), 0o644);
+    }
+
+    #[test]
+    fn uid_base_allocation_is_stable_across_relaunches() {
+        let dir = scratch("uid-stable");
+        let mut args = args_in(&dir);
+        args.uid_base = Some(61000);
+        let plan = prep(&args).unwrap();
+        let first = plan.target_uid;
+        drop(plan);
+        let plan = prep(&args).unwrap();
+        assert_eq!(
+            plan.target_uid, first,
+            "an id keeps its uid across restarts"
+        );
+    }
+
+    #[test]
+    fn two_ids_get_distinct_uids() {
+        let dir = scratch("uid-distinct");
+        let mut a = args_in(&dir);
+        a.uid_base = Some(61000);
+        let mut b = args_in(&dir);
+        b.id = "vm-test-2".into();
+        b.uid_base = Some(61000);
+
+        let plan_a = prep(&a).unwrap();
+        let plan_b = prep(&b).unwrap();
+        assert_eq!(plan_a.target_uid, Some(61000));
+        assert_eq!(
+            plan_b.target_uid,
+            Some(61001),
+            "sibling gets the next free uid"
+        );
+    }
+
+    #[test]
+    fn live_shared_uid_is_refused_and_allow_flag_overrides() {
+        let dir = scratch("uid-shared-live");
+        let mut a = args_in(&dir);
+        a.uid = Some(61000);
+        let _live = prep(&a).expect("first instance claims the uid");
+
+        let mut b = args_in(&dir);
+        b.id = "vm-test-2".into();
+        b.uid = Some(61000);
+        let err = prep(&b)
+            .err()
+            .expect("second live same-uid launch must fail");
+        match err {
+            JailerError::SharedUidLive { id, other_id, uid } => {
+                assert_eq!(id, "vm-test-2");
+                assert_eq!(other_id, "vm-test");
+                assert_eq!(uid, 61000);
+            }
+            other => panic!("expected SharedUidLive, got {other}"),
+        }
+        b.allow_shared_uid = true;
+        prep(&b).expect("--allow-shared-uid overrides the refusal");
+    }
+
+    #[test]
+    fn dead_instance_does_not_refuse_its_uid() {
+        let dir = scratch("uid-shared-dead");
+        let mut a = args_in(&dir);
+        a.uid = Some(61000);
+        drop(prep(&a).unwrap());
+
+        let mut b = args_in(&dir);
+        b.id = "vm-test-2".into();
+        b.uid = Some(61000);
+        prep(&b).expect("a stale registry entry with no held lock is not a conflict");
+    }
+
+    #[test]
+    fn allocation_skips_a_uid_taken_by_an_explicit_instance() {
+        let dir = scratch("uid-cross-mode");
+        let mut a = args_in(&dir);
+        a.uid = Some(61000);
+        let _live = prep(&a).unwrap();
+
+        let mut b = args_in(&dir);
+        b.id = "vm-test-2".into();
+        b.uid_base = Some(61000);
+        let plan = prep(&b).unwrap();
+        assert_eq!(
+            plan.target_uid,
+            Some(61001),
+            "allocation must not collide with an explicit-uid instance"
+        );
+    }
+
+    #[test]
+    fn teardown_removes_only_this_ids_registry_entry() {
+        let dir = scratch("uid-teardown");
+        let mut a = args_in(&dir);
+        a.uid_base = Some(61000);
+        drop(prep(&a).unwrap());
+        let mut b = args_in(&dir);
+        b.id = "vm-test-2".into();
+        b.uid_base = Some(61000);
+        drop(prep(&b).unwrap());
+
+        a.teardown = true;
+        assert_eq!(teardown(&a).unwrap(), 0);
+        let registry_path = a.work_dir.as_ref().unwrap().join(".uid-allocations");
+        let registry = fs::read_to_string(&registry_path).unwrap();
+        assert!(
+            !registry.contains("vm-test "),
+            "torn-down entry gone: {registry}"
+        );
+        assert!(
+            registry.contains("vm-test-2 "),
+            "sibling entry survives: {registry}"
+        );
+    }
+
+    #[test]
+    fn gid_only_drop_creates_no_registry() {
+        let dir = scratch("gid-only");
+        let mut args = args_in(&dir);
+        args.gid = Some(61000);
+        let plan = prep(&args).unwrap();
+        assert!(
+            !plan.work_root.join(".uid-allocations").exists(),
+            "a gid-only drop has no uid to register"
+        );
+    }
+
+    #[test]
+    fn launchd_plist_pins_allocated_uid_and_omits_uid_base() {
+        let dir = scratch("uid-plist");
+        let mut args = args_in(&dir);
+        args.uid_base = Some(61000);
+        args.allow_shared_uid = true;
+        let plan = prep(&args).unwrap();
+        let plist = generate_launchd_plist(&args, &plan).unwrap();
+
+        assert!(
+            plist.contains("--uid=61000"),
+            "allocated uid pinned:\n{plist}"
+        );
+        assert!(
+            plist.contains("--gid=61000"),
+            "allocated gid pinned:\n{plist}"
+        );
+        assert!(
+            !plist.contains("--uid-base"),
+            "restarts must not re-run allocation:\n{plist}"
+        );
+        assert!(
+            plist.contains("--allow-shared-uid"),
+            "a KeepAlive restart must not fail where the launch was allowed:\n{plist}"
         );
     }
 }

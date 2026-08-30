@@ -543,6 +543,70 @@ jailer-lifecycle-check: build
     done
     echo "OK: teardown removed the instance state"
 
+# Verify per-VM dedicated uid allocation (--uid-base): distinct uids per id,
+# allocation persistence, the live-shared-uid refusal + --allow-shared-uid,
+# and registry release on --teardown. Requires sudo; VM-free.
+jailer-uid-check: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    j="./build/cargo_target/debug/hephaestus-jailer"
+    base=61000
+    for probe in $base $((base+1)); do
+        if id "$probe" >/dev/null 2>&1; then
+            echo "SKIP: uid $probe belongs to a real account; set a different base"
+            exit 0
+        fi
+    done
+    # World-traversable /tmp for the same setuid path-traversal reason as
+    # jailer-privdrop-check.
+    tmp="$(mktemp -d /tmp/hephaestus-uidcheck.XXXXXX)"
+    chmod a+rx "$tmp"
+    trap 'sudo rm -rf "$tmp"' EXIT
+    touch "$tmp/vmlinux" "$tmp/rootfs.ext4"
+    printf '#!/bin/sh\necho "UID=$(id -u) GID=$(id -g)"\nexit 0\n' > "$tmp/fake-fc"
+    printf '#!/bin/sh\necho "UID=$(id -u) GID=$(id -g)"\nsleep 5\n' > "$tmp/sleep-fc"
+    chmod a+rx "$tmp/fake-fc" "$tmp/sleep-fc"
+    run() { sudo "$j" --work-dir "$tmp/work" --kernel "$tmp/vmlinux" \
+        --rootfs "$tmp/rootfs.ext4" "$@"; }
+    echo "--- Each id gets its own uid from --uid-base $base ---"
+    out="$(run --id uid-a --firecracker-binary "$tmp/fake-fc" --uid-base $base 2>&1)"
+    echo "$out" | grep -q "UID=$base GID=$base" \
+        && echo "OK: uid-a allocated $base" \
+        || { echo "FAIL: uid-a got: $out"; exit 1; }
+    out="$(run --id uid-b --firecracker-binary "$tmp/fake-fc" --uid-base $base 2>&1)"
+    echo "$out" | grep -q "UID=$((base+1)) GID=$((base+1))" \
+        && echo "OK: uid-b allocated $((base+1)) (uid-a's entry persists)" \
+        || { echo "FAIL: uid-b got: $out"; exit 1; }
+    echo "--- A live instance's uid is refused to others ---"
+    run --id uid-a --firecracker-binary "$tmp/sleep-fc" --uid-base $base \
+        2>/dev/null & first=$!
+    sleep 1
+    if out="$(run --id uid-c --firecracker-binary "$tmp/fake-fc" --uid $base 2>&1)"; then
+        echo "FAIL: same-uid launch beside live uid-a was not refused"; exit 1
+    fi
+    echo "$out" | grep -q "same uid" \
+        && echo "OK: live shared uid refused" \
+        || { echo "FAIL: unexpected refusal: $out"; exit 1; }
+    out="$(run --id uid-c --firecracker-binary "$tmp/fake-fc" --uid $base \
+        --allow-shared-uid 2>&1)"
+    echo "$out" | grep -q "UID=$base" \
+        && echo "OK: --allow-shared-uid overrides" \
+        || { echo "FAIL: override run got: $out"; exit 1; }
+    # Backgrounding the `run` function backgrounds a subshell, and killing a
+    # subshell does not signal its sudo/jailer/daemon children — so don't
+    # kill at all: the stand-in daemon exits on its own, and `wait` is the
+    # deterministic release of uid-a's flock.
+    wait "$first" 2>/dev/null || true
+    echo "--- Teardown releases the registry entries ---"
+    for id in uid-a uid-b uid-c; do
+        out="$(run --id "$id" --teardown 2>&1)" \
+            || { echo "FAIL: teardown $id: $out"; exit 1; }
+    done
+    if sudo grep -qE "^uid-(a|b|c) " "$tmp/work/.uid-allocations"; then
+        echo "FAIL: registry still holds torn-down entries"; exit 1
+    fi
+    echo "OK: registry entries released"
+
 # Verify the jailer's --uid/--gid/--user privilege drop. Requires sudo.
 # Uses a stand-in binary that prints its own uid/gid.
 jailer-privdrop-check: build
