@@ -1553,6 +1553,11 @@ private func startVmnetPacketInterface(
     let state = VmnetStartState()
     let descriptor = xpc_dictionary_create(nil, nil, 0)
     xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, true)
+    // Isolation severs traffic to any OTHER interface that also sets this
+    // key — i.e. other daemons' MMDS packet interfaces. The VM's own NIC is
+    // started internally by VZ with no key, so it still reaches this
+    // interface and MMDS keeps working (verified by fc-compat-vmnet-e2e).
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, true)
 
     guard let interface = vmnet_interface_start_with_network(
         network,
@@ -1587,6 +1592,99 @@ private func startVmnetPacketInterface(
         )
     }
     return (interface, queue, state.maxPacketSize)
+}
+
+/// Create this VM's own vmnet network. Every daemon (one process per VM)
+/// gets a distinct network object, which vmnet auto-assigns its own /24 —
+/// that separation is the measured cross-VM isolation guarantee (see
+/// `just vmnet-isolation-check`). The subnet is persisted in a sidecar file
+/// so a snapshot restore in the same work dir lands the guest on the subnet
+/// its DHCP lease came from; delete the sidecar to reallocate.
+@available(macOS 26.0, *)
+private func createIsolatedVmnetNetwork(subnetSidecar: URL) throws -> vmnet_network_ref {
+    var status: vmnet_return_t = .VMNET_FAILURE
+    guard let networkConfig = vmnet_network_configuration_create(.VMNET_SHARED_MODE, &status)
+    else {
+        throw NSError(
+            domain: "HephaestusVmnet",
+            code: Int(status.rawValue),
+            userInfo: [NSLocalizedDescriptionKey: "failed to create vmnet configuration (status: \(status))"]
+        )
+    }
+    if let recorded = try? String(contentsOf: subnetSidecar, encoding: .utf8) {
+        // Fail closed on a corrupt or rejected pin: silently falling back
+        // to a fresh subnet would strand a restored guest's lease.
+        let parts = recorded.split(whereSeparator: { $0 == " " || $0 == "\n" }).map(String.init)
+        var addr = in_addr()
+        var mask = in_addr()
+        guard parts.count == 2,
+              inet_pton(AF_INET, parts[0], &addr) == 1,
+              inet_pton(AF_INET, parts[1], &mask) == 1
+        else {
+            throw NSError(
+                domain: "HephaestusVmnet",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "corrupt vmnet subnet sidecar \(subnetSidecar.path); delete it to reallocate"]
+            )
+        }
+        status = vmnet_network_configuration_set_ipv4_subnet(networkConfig, &addr, &mask)
+        guard status == .VMNET_SUCCESS else {
+            throw NSError(
+                domain: "HephaestusVmnet",
+                code: Int(status.rawValue),
+                userInfo: [NSLocalizedDescriptionKey:
+                    "failed to pin vmnet subnet \(parts[0])/\(parts[1]) (status: \(status)); "
+                    + "delete \(subnetSidecar.path) to reallocate"]
+            )
+        }
+    }
+    guard let network = vmnet_network_create(networkConfig, &status), status == .VMNET_SUCCESS
+    else {
+        if status == .VMNET_NOT_AUTHORIZED {
+            throw NSError(
+                domain: "HephaestusVmnet",
+                code: Int(status.rawValue),
+                userInfo: [NSLocalizedDescriptionKey:
+                    "com.apple.vm.networking not authorized: run the daemon from the "
+                    + "profile-authorized app bundle (validate with `just probe-vmnet`)"]
+            )
+        }
+        throw NSError(
+            domain: "HephaestusVmnet",
+            code: Int(status.rawValue),
+            userInfo: [NSLocalizedDescriptionKey:
+                "failed to create vmnet network (status: \(status)); if the pinned subnet in "
+                + "\(subnetSidecar.path) is held by another live network, delete it to reallocate"]
+        )
+    }
+    var subnet = in_addr()
+    var subnetMask = in_addr()
+    vmnet_network_get_ipv4_subnet(network, &subnet, &subnetMask)
+    // s_addr is network byte order; an all-zero subnet means the query
+    // produced nothing worth pinning.
+    if subnet.s_addr != 0 {
+        let dotted = { (raw: in_addr_t) -> String in
+            let v = UInt32(bigEndian: raw)
+            return "\(v >> 24 & 255).\(v >> 16 & 255).\(v >> 8 & 255).\(v & 255)"
+        }
+        let subnetText = dotted(subnet.s_addr)
+        let maskText = dotted(subnetMask.s_addr)
+        do {
+            try "\(subnetText) \(maskText)\n".write(to: subnetSidecar, atomically: true, encoding: .utf8)
+        } catch {
+            // Not fatal (this boot is unaffected), but without the pin the
+            // next relaunch gets a fresh subnet and a stale guest lease —
+            // the operator deserves the clue now, not then.
+            let message = "hephaestus-firecracker: warning: could not record vmnet subnet pin at "
+                + "\(subnetSidecar.path): \(error.localizedDescription)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+        }
+        // Operators and the isolation e2e observe the per-VM subnet here.
+        FileHandle.standardError.write(
+            Data("hephaestus-firecracker: vmnet network subnet=\(subnetText) mask=\(maskText)\n".utf8))
+    }
+    return network
 }
 
 /// Build a VZVirtualMachineConfiguration for the long-running path.
@@ -1629,6 +1727,7 @@ private func buildLongRunningConfig(
     commandLine: String,
     readOnly: Bool,
     networkMode: UInt32,
+    startPacketInterface: Bool,
     macAddress: String?,
     extraDrives: [(url: URL, readOnly: Bool)]
 ) throws -> LongRunningConfiguration {
@@ -1692,8 +1791,8 @@ private func buildLongRunningConfig(
     config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
 
     // Network mode is selected by the daemon at startup. NAT remains the
-    // base-entitlement default. vmnet creates a process-owned shared network
-    // whose DHCP/NAT topology can be customized through the vmnet framework.
+    // base-entitlement default. vmnet creates this VM's own isolated
+    // network object with a subnet pinned across restarts.
     if networkMode != 0 {
         let netDevice = VZVirtioNetworkDeviceConfiguration()
         switch networkMode {
@@ -1707,23 +1806,10 @@ private func buildLongRunningConfig(
                     userInfo: [NSLocalizedDescriptionKey: "vmnet networking requires macOS 26 or later"]
                 )
             }
-            var status: vmnet_return_t = .VMNET_FAILURE
-            guard let networkConfig = vmnet_network_configuration_create(.VMNET_SHARED_MODE, &status)
-            else {
-                throw NSError(
-                    domain: "HephaestusVmnet",
-                    code: Int(status.rawValue),
-                    userInfo: [NSLocalizedDescriptionKey: "failed to create vmnet configuration (status: \(status))"]
-                )
-            }
-            guard let network = vmnet_network_create(networkConfig, &status),
-                  status == .VMNET_SUCCESS else {
-                throw NSError(
-                    domain: "HephaestusVmnet",
-                    code: Int(status.rawValue),
-                    userInfo: [NSLocalizedDescriptionKey: "failed to create vmnet network (status: \(status))"]
-                )
-            }
+            // Sidecar lives next to the log (like the machine-id file), so
+            // cold boot and same-work-dir restore resolve the same pin.
+            let subnetSidecar = logURL.deletingPathExtension().appendingPathExtension("vmnet-subnet")
+            let network = try createIsolatedVmnetNetwork(subnetSidecar: subnetSidecar)
             retainedVmnetNetwork = network
             netDevice.attachment = VZVmnetNetworkDeviceAttachment(network: network)
         default:
@@ -1743,7 +1829,10 @@ private func buildLongRunningConfig(
     if #available(macOS 14.0, *) {
         try config.validateSaveRestoreSupport()
     }
-    if #available(macOS 26.0, *), let network = retainedVmnetNetwork {
+    // The packet interface is an extra host-side NIC on the VM's segment;
+    // it exists only for the transparent MMDS responder, so it starts only
+    // when the daemon asked for one (--host-mmds).
+    if #available(macOS 26.0, *), let network = retainedVmnetNetwork, startPacketInterface {
         let packet = try startVmnetPacketInterface(network: network)
         packetInterface = packet.0
         packetQueue = packet.1
@@ -1769,6 +1858,7 @@ public func hb_vz_long_new(
     memoryMib: UInt64,
     readOnly: Bool,
     networkMode: UInt32,
+    startPacketInterface: Bool,
     macAddress: UnsafePointer<CChar>?,
     extraDriveCount: Int,
     extraDrivePaths: UnsafePointer<UnsafePointer<CChar>?>?,
@@ -1807,6 +1897,7 @@ public func hb_vz_long_new(
             commandLine: commandLine,
             readOnly: readOnly,
             networkMode: networkMode,
+            startPacketInterface: startPacketInterface,
             macAddress: mac,
             extraDrives: extraDrives
         )
@@ -2437,6 +2528,7 @@ public func hb_vz_long_restore(
     memoryMib: UInt64,
     readOnly: Bool,
     networkMode: UInt32,
+    startPacketInterface: Bool,
     macAddress: UnsafePointer<CChar>?,
     extraDriveCount: Int,
     extraDrivePaths: UnsafePointer<UnsafePointer<CChar>?>?,
@@ -2476,6 +2568,7 @@ public func hb_vz_long_restore(
             commandLine: commandLine,
             readOnly: readOnly,
             networkMode: networkMode,
+            startPacketInterface: startPacketInterface,
             macAddress: mac,
             extraDrives: extraDrives
         )

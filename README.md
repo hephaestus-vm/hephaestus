@@ -138,7 +138,7 @@ for the component and state-machine details.
 | Area | Current state |
 | :-- | :-- |
 | Firecracker API | Core lifecycle and the 14-call Go SDK sequence pass |
-| Guest networking | VZ NAT by default; profile-authorized shared vmnet optional |
+| Guest networking | VZ NAT by default; profile-authorized per-VM vmnet optional; both measured cross-VM isolated |
 | Snapshots | Save and restore between Hephaestus processes |
 | Warm pools | Agent and stock-init flavors supported |
 | MMDS | Agent/vsock shim on NAT; transparent link-local service on vmnet |

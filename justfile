@@ -317,9 +317,27 @@ fc-compat-net-e2e:
 fc-compat-vmnet-e2e: sign-vmnet
     HEPHAESTUS_FIRECRACKER_BIN="$PWD/build/HephaestusFirecracker.app/Contents/MacOS/hephaestus-firecracker" \
       HEPHAESTUS_FIRECRACKER_ARGS="--network-backend vmnet --host-mmds" \
-      HEPHAESTUS_NETWORK_LABEL="shared vmnet + transparent MMDS" \
+      HEPHAESTUS_NETWORK_LABEL="per-VM vmnet + transparent MMDS" \
       HEPHAESTUS_TEST_MMDS=1 \
       scripts/fc-compat-net-e2e.sh
+
+# vmnet WITHOUT --host-mmds: guest netdev + DHCP still work, and the
+# metadata fetch must FAIL — observable proof the host packet interface
+# only exists when the MMDS responder asked for it. Requires the managed
+# capability, profile, and identity.
+fc-compat-vmnet-nommds-e2e: sign-vmnet
+    HEPHAESTUS_FIRECRACKER_BIN="$PWD/build/HephaestusFirecracker.app/Contents/MacOS/hephaestus-firecracker" \
+      HEPHAESTUS_FIRECRACKER_ARGS="--network-backend vmnet" \
+      HEPHAESTUS_NETWORK_LABEL="per-VM vmnet, no host MMDS" \
+      HEPHAESTUS_TEST_NO_MMDS=1 \
+      scripts/fc-compat-net-e2e.sh
+
+# Two boots of one instance must land on the same vmnet subnet (the
+# `.vmnet-subnet` sidecar pins it), keeping a restored guest's DHCP lease
+# valid. Requires the managed capability, profile, and identity.
+vmnet-subnet-pin-check: sign-vmnet build-agent
+    HEPHAESTUS_FIRECRACKER_BIN="$PWD/build/HephaestusFirecracker.app/Contents/MacOS/hephaestus-firecracker" \
+      scripts/vmnet-subnet-pin-e2e.sh
 
 # Real-VM e2e for vz-exec --stdin, stderr split, and hephaestus-jailer.
 # Requires apple/container kernel/rootfs artifacts; not CI-safe.
@@ -560,6 +578,61 @@ jailer-lifecycle-check: build
         [[ -e "$leftover" ]] && { echo "FAIL: $leftover survived teardown"; exit 1; }
     done
     echo "OK: teardown removed the instance state"
+
+# Jailed vmnet smoke: the jailer launches the profile-authorized bundle
+# daemon with --network-backend vmnet under the generated deny-by-default
+# sandbox, boots a VM, and asserts the per-VM subnet line appears and the
+# instance reports Running — proving the sandbox permits vmnet's XPC path.
+# Requires sudo, the managed capability/profile/identity, and artifacts.
+jailer-vmnet-check: sign-vmnet build-agent
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Run as yourself: codesign needs your login keychain, so the sign-vmnet
+    # dependency must not run as root. Only the jailer below is elevated.
+    if [[ "$(id -u)" == 0 ]]; then
+        echo "run 'just jailer-vmnet-check' WITHOUT sudo; it elevates only the jailer"
+        exit 1
+    fi
+    j="./build/cargo_target/debug/hephaestus-jailer"
+    fc="$PWD/build/HephaestusFirecracker.app/Contents/MacOS/hephaestus-firecracker"
+    cdir="$HOME/Library/Application Support/com.apple.container"
+    kernel="$(ls "$cdir"/kernels/vmlinux-* 2>/dev/null | head -1 || true)"
+    snaps=("$cdir"/snapshots/*/snapshot)
+    [[ -n "$kernel" && -e "${snaps[0]:-}" ]] || { echo "no artifacts; run: just artifacts"; exit 1; }
+    rootfs_src=$(stat -f '%z %N' "${snaps[@]}" | sort -nr | head -1 | cut -d' ' -f2-)
+    tmp="$(mktemp -d /tmp/heph-jailer-vmnet.XXXXXX)"
+    chmod a+rx "$tmp"
+    jailer=""
+    trap '[[ -n "$jailer" ]] && sudo kill "$jailer" 2>/dev/null; sudo rm -rf "$tmp"' EXIT
+    cp -c "$rootfs_src" "$tmp/rootfs.ext4"
+    sudo "$j" --id vmnet-check --work-dir "$tmp/work" --kernel "$kernel" \
+        --rootfs "$tmp/rootfs.ext4" --initramfs "$PWD/build/agent.cpio.gz" \
+        --firecracker-binary "$fc" --network-backend vmnet \
+        >"$tmp/jailer.out" 2>"$tmp/jailer.err" & jailer=$!
+    sock="$tmp/work/vmnet-check/api.sock"
+    # The work root is root-owned 0700, so the socket check must elevate
+    # like every other access below it.
+    for _ in $(seq 1 80); do sudo test -S "$sock" && break; sleep 0.25; done
+    sudo test -S "$sock" || { echo "FAIL: no api socket"; cat "$tmp/jailer.err"; exit 1; }
+    api() {
+        local body="$tmp/api-response" status
+        status="$(sudo curl -sS -o "$body" -w '%{http_code}' --unix-socket "$sock" -X "$1" \
+            -H 'content-type: application/json' ${3:+--data "$3"} "http://localhost$2")"
+        [[ "$status" =~ ^2 ]] \
+            || { echo "FAIL: API $1 $2 -> HTTP $status: $(sudo cat "$body")"; exit 1; }
+        sudo cat "$body"
+    }
+    api PUT /machine-config '{"vcpu_count":1,"mem_size_mib":256}' >/dev/null
+    api PUT /network-interfaces/eth0 "$(python3 scripts/fc_compat_net_e2e.py network-config)" >/dev/null
+    api PUT /boot-source "$(python3 scripts/fc_compat_net_e2e.py boot-config "$kernel" "$PWD/build/agent.cpio.gz")" >/dev/null
+    api PUT /drives/rootfs "$(python3 scripts/fc_compat_net_e2e.py drive-config "$tmp/rootfs.ext4")" >/dev/null
+    api PUT /actions '{"action_type":"InstanceStart"}' >/dev/null
+    grep -q "vmnet network subnet=" "$tmp/jailer.err" \
+        && echo "OK: jailed daemon created its per-VM vmnet network" \
+        || { echo "FAIL: no subnet line"; tail -5 "$tmp/jailer.err"; exit 1; }
+    api GET / | grep -q '"state":"Running"' \
+        && echo "OK: jailed vmnet VM is running under the sandbox" \
+        || { echo "FAIL: instance not running"; exit 1; }
 
 # Verify per-VM dedicated uid allocation (--uid-base): distinct uids per id,
 # allocation persistence, the live-shared-uid refusal + --allow-shared-uid,

@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use thiserror::Error;
@@ -93,6 +93,25 @@ fn install_signal_forwarding() {
     unsafe {
         libc::signal(libc::SIGTERM, handler);
         libc::signal(libc::SIGINT, handler);
+    }
+}
+
+/// Mirrors the daemon's `--network-backend` values. Kept as a local enum
+/// (the two binaries share no library crate) so the jailer can validate
+/// the flag pre-fork instead of crash-looping a launchd job on a daemon
+/// startup error.
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum NetworkBackend {
+    Nat,
+    Vmnet,
+}
+
+impl NetworkBackend {
+    fn as_flag_value(self) -> &'static str {
+        match self {
+            Self::Nat => "nat",
+            Self::Vmnet => "vmnet",
+        }
     }
 }
 
@@ -191,6 +210,21 @@ struct Args {
     /// deliberate shared-uid deployments; weakens instance separation.
     #[arg(long)]
     allow_shared_uid: bool,
+
+    /// Host network attachment forwarded to the daemon. `vmnet` gives the
+    /// VM its own isolated per-process network but requires
+    /// `--firecracker-binary` to point at the profile-authorized app-bundle
+    /// binary (validate with `just probe-vmnet` before installing a
+    /// launchd plist — the jailer cannot detect the entitlement itself).
+    #[arg(long, value_enum, default_value_t = NetworkBackend::Nat)]
+    network_backend: NetworkBackend,
+
+    /// Forward `--host-mmds` to the daemon (transparent MMDS over the
+    /// vmnet packet interface). Requires `--network-backend vmnet`; the
+    /// jailer refuses the combination pre-fork so a launchd job fails at
+    /// generation time instead of crash-looping on daemon startup.
+    #[arg(long)]
+    host_mmds: bool,
 
     /// Instead of running, generate a launchd plist that wraps this
     /// jailer invocation and write it to stdout. The plist uses
@@ -302,6 +336,8 @@ enum JailerError {
     },
     #[error("uid registry: {0}")]
     UidRegistry(#[from] uid_registry::RegistryError),
+    #[error("--host-mmds requires --network-backend vmnet")]
+    HostMmdsRequiresVmnet,
     #[error(
         "refusing to run instance {id:?} as uid {uid}: instance {other_id:?} is live \
          under the same uid (same-uid daemons can signal and ptrace each other; pass \
@@ -718,6 +754,13 @@ fn build_command(plan: &Plan, args: &Args) -> Command {
     if let Some(probe) = args.deny_probe.as_deref() {
         cmd.arg("--sandbox-deny-probe").arg(probe);
     }
+    // Always explicit (even for the nat default) so the exec line and the
+    // tests state the daemon's network mode rather than implying it.
+    cmd.arg("--network-backend")
+        .arg(args.network_backend.as_flag_value());
+    if args.host_mmds {
+        cmd.arg("--host-mmds");
+    }
     // Capture the (Copy) resource caps and drop target so the child closure
     // is self-contained.
     let nofile = args.rlimit_nofile;
@@ -902,6 +945,13 @@ fn generate_launchd_plist(args: &Args, plan: &Plan) -> Result<String, JailerErro
     if let Some(probe) = args.deny_probe.as_deref() {
         program_args.push(format!("--deny-probe={}", plist_path(probe)));
     }
+    program_args.push(format!(
+        "--network-backend={}",
+        args.network_backend.as_flag_value()
+    ));
+    if args.host_mmds {
+        program_args.push("--host-mmds".to_string());
+    }
     if args.uid_base.is_some() {
         // Pin the allocated identity (like --firecracker-binary): restarts
         // must land on the same uid without re-running allocation, and
@@ -985,6 +1035,11 @@ fn generate_launchd_plist(args: &Args, plan: &Plan) -> Result<String, JailerErro
 fn run(args: Args) -> Result<u8, JailerError> {
     if args.teardown {
         return teardown(&args);
+    }
+    // Mirror the daemon's own validation pre-fork: under launchd this
+    // combination would otherwise crash-loop on daemon startup.
+    if args.host_mmds && args.network_backend != NetworkBackend::Vmnet {
+        return Err(JailerError::HostMmdsRequiresVmnet);
     }
     // Resolve any explicit privilege-drop target up front: a `--user`
     // lookup goes through `getpwnam`, which may allocate, so it must happen
@@ -1299,6 +1354,8 @@ mod tests {
             teardown: false,
             uid_base: None,
             allow_shared_uid: false,
+            network_backend: NetworkBackend::Nat,
+            host_mmds: false,
         }
     }
 
@@ -1879,6 +1936,63 @@ mod tests {
             !plist.contains("vm-test/launchd."),
             "launchd logs must not live inside the daemon-writable work dir"
         );
+    }
+
+    #[test]
+    fn build_command_states_the_network_backend_explicitly() {
+        let dir = scratch("net-backend-default");
+        let args = args_in(&dir);
+        let plan = prep(&args).unwrap();
+        let got = arg_strings(&build_command(&plan, &args));
+        assert!(
+            got.windows(2)
+                .any(|w| w == ["--network-backend".to_string(), "nat".to_string()]),
+            "the default backend is stated, not implied: {got:?}"
+        );
+        assert!(
+            !got.contains(&"--host-mmds".to_string()),
+            "--host-mmds must be absent unless requested"
+        );
+    }
+
+    #[test]
+    fn build_command_forwards_vmnet_and_host_mmds() {
+        let dir = scratch("net-backend-vmnet");
+        let mut args = args_in(&dir);
+        args.network_backend = NetworkBackend::Vmnet;
+        args.host_mmds = true;
+        let plan = prep(&args).unwrap();
+        let got = arg_strings(&build_command(&plan, &args));
+        assert!(
+            got.windows(2)
+                .any(|w| w == ["--network-backend".to_string(), "vmnet".to_string()])
+        );
+        assert!(got.contains(&"--host-mmds".to_string()));
+    }
+
+    #[test]
+    fn run_refuses_host_mmds_without_vmnet_before_touching_disk() {
+        let dir = scratch("host-mmds-refusal");
+        let mut args = args_in(&dir);
+        args.host_mmds = true;
+        let work_root = args.work_dir.clone().unwrap();
+        assert!(matches!(run(args), Err(JailerError::HostMmdsRequiresVmnet)));
+        assert!(
+            !work_root.exists(),
+            "pre-fork validation must not materialize the work root"
+        );
+    }
+
+    #[test]
+    fn launchd_plist_reconstructs_network_flags() {
+        let dir = scratch("plist-net-flags");
+        let mut args = args_in(&dir);
+        args.network_backend = NetworkBackend::Vmnet;
+        args.host_mmds = true;
+        let plan = prep(&args).unwrap();
+        let plist = generate_launchd_plist(&args, &plan).unwrap();
+        assert!(plist.contains("--network-backend=vmnet"));
+        assert!(plist.contains("<string>--host-mmds</string>"));
     }
 
     #[test]

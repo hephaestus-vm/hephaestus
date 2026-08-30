@@ -53,7 +53,9 @@ trap cleanup EXIT
 
 cp -c "$rootfs_src" "$rootfs"
 
-"$firecracker" "${firecracker_args[@]}" \
+# Per-run work dir: the serial log and the vmnet subnet sidecar live and
+# die with this run, so no pin leaks into an unrelated later run.
+HEPHAESTUS_FC_WORK_DIR="$tmp" "$firecracker" "${firecracker_args[@]}" \
   --api-sock "$sock" \
   --id fc-net-e2e \
   >"$tmp/server.out" \
@@ -88,7 +90,11 @@ api PUT /network-interfaces/eth0 "$(python3 "$net_tool" network-config)"
 if [[ "${HEPHAESTUS_TEST_MMDS:-0}" == 1 ]]; then
   api PUT /mmds '{"latest":{"meta-data":{"instance-id":"i-hephaestus-vmnet"}}}'
 fi
-api PUT /boot-source "$(python3 "$net_tool" boot-config \
+boot_config_args=()
+if [[ "${HEPHAESTUS_TEST_NO_MMDS:-0}" == 1 ]]; then
+  boot_config_args+=(--mmds-off)
+fi
+api PUT /boot-source "$(python3 "$net_tool" boot-config "${boot_config_args[@]}" \
   "$kernel" "$repo_root/build/agent.cpio.gz")"
 api PUT /drives/rootfs "$(python3 "$net_tool" drive-config "$rootfs")"
 api PUT /actions '{"action_type":"InstanceStart"}'
@@ -103,6 +109,9 @@ fi
 guest_check_args=()
 if [[ "${HEPHAESTUS_TEST_MMDS:-0}" == 1 ]]; then
   guest_check_args+=(--mmds)
+fi
+if [[ "${HEPHAESTUS_TEST_NO_MMDS:-0}" == 1 ]]; then
+  guest_check_args+=(--expect-no-mmds)
 fi
 python3 "$net_tool" check-guest "$vsock" "${guest_check_args[@]}"
 

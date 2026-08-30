@@ -218,9 +218,12 @@ host-side confinement. Per-VM dedicated uids now exist: `--uid-base`
 allocates each instance its own uid/gid (persisted in the root-owned
 `.uid-allocations` registry), and the jailer refuses to launch two live
 instances under one uid regardless of drop mode (`--allow-shared-uid`
-opts out). Claiming the tier still requires: isolated per-VM networking
-as the multi-tenant default with shared vmnet strictly opt-in, and a
-review of the generated profile's non-filesystem allow surface.
+opts out). Per-VM networking is measured and configured: both NAT and
+vmnet are cross-VM isolated (see the network-segment section), vmnet
+subnets are pinned per instance, the host-side packet interface exists
+only for the MMDS responder, and the jailer forwards the network mode.
+Claiming the tier still requires one thing: a review of the generated
+sandbox profile's non-filesystem allow surface.
 
 ## Non-claims
 

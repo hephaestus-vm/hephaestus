@@ -30,7 +30,9 @@ use backend::VzBackend;
 enum NetworkBackend {
     /// Virtualization.framework's built-in NAT attachment.
     Nat,
-    /// A customizable shared-mode network backed by the vmnet framework.
+    /// This VM's own isolated vmnet network: a per-process network object
+    /// with its own /24, pinned across restarts (macOS 26+, requires the
+    /// profile-authorized app bundle).
     Vmnet,
 }
 

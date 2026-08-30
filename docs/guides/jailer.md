@@ -182,6 +182,15 @@ Use `--initramfs` and `--pool-dir` when those files are part of the VM. The
 jailer defaults to finding `hephaestus-firecracker` on `PATH`; pass
 `--firecracker-binary` to select a specific build.
 
+`--network-backend {nat|vmnet}` and `--host-mmds` are forwarded to the
+daemon. For vmnet, `--firecracker-binary` must point at the
+profile-authorized app-bundle binary
+(`build/HephaestusFirecracker.app/Contents/MacOS/hephaestus-firecracker`);
+the jailer cannot detect the entitlement itself, so validate with
+`just probe-vmnet` before installing a launchd plist, which would otherwise
+crash-loop. `--host-mmds` without vmnet is refused before anything touches
+the filesystem.
+
 Validate resource-limit plumbing without booting a VM:
 
 ```console
