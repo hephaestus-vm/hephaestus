@@ -1,5 +1,6 @@
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -38,6 +39,24 @@ class FcCompatNetE2eTests(unittest.TestCase):
                 "is_read_only": False,
             },
         )
+
+    def test_network_config_honors_an_explicit_mac(self) -> None:
+        # The isolation probe boots two VMs; each must carry its own MAC.
+        self.assertEqual(
+            fc_compat_net_e2e.network_config("AA:FC:00:00:00:0B")["guest_mac"],
+            "AA:FC:00:00:00:0B",
+        )
+
+    def test_run_guest_parses_with_and_without_no_wait(self) -> None:
+        parser_args = ["run-guest", "/tmp/vsock", "echo hi"]
+        with unittest.mock.patch.object(sys, "argv", ["prog", *parser_args]):
+            parsed = fc_compat_net_e2e.parse_args()
+        self.assertEqual(parsed.command, "run-guest")
+        self.assertEqual(parsed.guest_command, "echo hi")
+        self.assertFalse(parsed.no_wait)
+        with unittest.mock.patch.object(sys, "argv", ["prog", *parser_args, "--no-wait"]):
+            parsed = fc_compat_net_e2e.parse_args()
+        self.assertTrue(parsed.no_wait)
 
     def test_base_guest_command_only_requires_a_network_device(self) -> None:
         command = fc_compat_net_e2e.guest_command(False)

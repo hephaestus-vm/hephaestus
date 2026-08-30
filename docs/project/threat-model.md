@@ -149,13 +149,27 @@ uid unless explicitly allowed), and the pool base is read-only.
 
 ### The network segment
 
-NAT attachments give each VM a VZ-managed private network. The shared-vmnet
-path intentionally puts participating VMs **on one L2 segment**: guests can
-reach each other, and nothing in Hephaestus claims otherwise. Under the
-trusted-workload tenant model that is a feature; do not put a guest you
-would not let talk to the others on the shared segment. The transparent
-MMDS shim on that segment serves per-instance metadata keyed by the
-requesting VM, but the segment itself provides no guest-to-guest isolation.
+Cross-VM reachability is **measured, not inferred** — the permanent smokes
+`just net-isolation-check` (NAT) and `just vmnet-isolation-check` (vmnet)
+boot two VMs and assert that neither TCP nor ICMP crosses between them,
+with a gateway-reachability control proving the probe itself works. As
+measured on macOS 26.5.2:
+
+- **VZ NAT**: both guests lease addresses in one `192.168.64.0/24`, and
+  still cannot reach each other — VZ's opaque NAT fences guests despite
+  the shared subnet. VZ documents none of this, so the claim rests on the
+  measurement; the smoke exists to catch an OS update changing it.
+- **vmnet**: each daemon creates its own network object, which vmnet
+  assigns a distinct `/24` under `192.168/16`; guests cannot reach each
+  other. A multi-VM *shared* vmnet segment is not constructible in
+  Hephaestus at all: `VZVmnetNetworkDeviceAttachment` requires the network
+  object to be created in the attaching process, and Hephaestus runs one
+  process per VM. Shared segments are a non-feature — the only sanctioned
+  future path is an explicit serialized-network handoff.
+
+The transparent MMDS responder serves the daemon's own single metadata
+document; per-instance scoping is a consequence of one process per VM, not
+of request keying.
 
 ### MMDS metadata
 

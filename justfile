@@ -77,6 +77,24 @@ hello: build
 shell: build
     scripts/run-vm.sh /bin/sh -c 'uname -a; cat /etc/os-release; ls /'
 
+# Assert cross-VM isolation on VZ NAT: two VMs, distinct leases in one /24,
+# and neither TCP nor ICMP crosses between them (with a gateway-reachability
+# control). Root-free, entitlement-free; needs apple/container artifacts.
+# Measured `isolated` on macOS 26.5.2 — if this ever fails, an OS update
+# changed VZ NAT's semantics and the threat model needs a revisit.
+net-isolation-check: build build-agent
+    HEPHAESTUS_EXPECT_CROSS_VM=isolated scripts/net-isolation-e2e.sh
+
+# Same measurement across two per-VM vmnet networks (profile-authorized
+# bundle required). Distinct /24 subnets and no cross-VM reachability are
+# the product guarantee for the vmnet path.
+vmnet-isolation-check: sign-vmnet build-agent
+    HEPHAESTUS_FIRECRACKER_BIN="$PWD/build/HephaestusFirecracker.app/Contents/MacOS/hephaestus-firecracker" \
+        HEPHAESTUS_FIRECRACKER_ARGS="--network-backend vmnet" \
+        HEPHAESTUS_EXPECT_CROSS_VM=isolated \
+        HEPHAESTUS_EXPECT_DISTINCT_SUBNETS=1 \
+        scripts/net-isolation-e2e.sh
+
 # Preset: boot with networking on + try an outbound wget against example.com.
 network-check: build
     HEPHAESTUS_NETWORK=1 scripts/run-vm.sh /bin/sh -c 'ip addr; ip route; wget -q -O- http://example.com | head -c 200'

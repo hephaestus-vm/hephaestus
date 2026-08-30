@@ -18,11 +18,11 @@ def vsock_config(path: str) -> JsonObject:
     return {"guest_cid": 3, "uds_path": path}
 
 
-def network_config() -> JsonObject:
+def network_config(mac: str = "AA:FC:00:00:00:01") -> JsonObject:
     return {
         "iface_id": "eth0",
         "host_dev_name": "tap0",
-        "guest_mac": "AA:FC:00:00:00:01",
+        "guest_mac": mac,
     }
 
 
@@ -78,6 +78,53 @@ def connect_with_retry(path: str, port: int) -> socket.socket:
     raise RuntimeError(f"could not connect to guest port {port}: {last}")
 
 
+def run_guest(path: str, command: str, no_wait: bool) -> int:
+    """Run a command in the guest; return the agent's exit code.
+
+    The agent serves exactly ONE command per boot and powers the VM off
+    after replying. Two consequences shape this function: a probe VM that
+    must stay alive gets a command ending in a long sleep, sent with
+    `no_wait` (the exit code is never collected — process exit closes the
+    socket, which is safe because the length-prefixed command was already
+    delivered); and a command must NEVER be re-sent, because a retry after
+    delivery would land on a powered-off VM at best and double-execute at
+    worst. Only pre-delivery failures — connect errors and the bridge's
+    explicit "ERR" refusal while the guest port is not yet listening — are
+    retried, inside connect_with_retry and the ERR check below.
+    """
+    command_bytes = command.encode()
+    for _ in range(40):
+        connection = connect_with_retry(path, 1234)
+        # Give a late bridge refusal a real chance to arrive before we
+        # commit the command (connect_with_retry's own peek is 50ms).
+        connection.settimeout(0.5)
+        try:
+            data = connection.recv(4, socket.MSG_PEEK)
+            if data.startswith(b"ERR "):
+                print(f"run-guest: bridge refused: {connection.recv(256)!r}", file=sys.stderr)
+                time.sleep(0.25)
+                continue
+        except TimeoutError:
+            pass
+        connection.settimeout(90)
+        connection.sendall(struct.pack("<I", len(command_bytes)) + command_bytes)
+        if no_wait:
+            return 0
+        data = b""
+        while len(data) < 4:
+            chunk = connection.recv(4 - len(data))
+            if not chunk:
+                raise RuntimeError(
+                    "connection closed before the exit code arrived; the command "
+                    "was already delivered, so this is fatal (no resend)"
+                )
+            data += chunk
+        if data.startswith(b"ERR "):
+            raise RuntimeError(data + connection.recv(256))
+        return struct.unpack("<i", data)[0]
+    raise RuntimeError("guest port 1234 never accepted the command")
+
+
 def check_guest(path: str, test_mmds: bool) -> None:
     command_bytes = guest_command(test_mmds)
     last: Exception | None = None
@@ -117,7 +164,13 @@ def parse_args() -> argparse.Namespace:
     vsock = subparsers.add_parser("vsock-config")
     vsock.add_argument("path")
 
-    subparsers.add_parser("network-config")
+    network = subparsers.add_parser("network-config")
+    network.add_argument("--mac", default="AA:FC:00:00:00:01")
+
+    run = subparsers.add_parser("run-guest")
+    run.add_argument("vsock")
+    run.add_argument("guest_command")
+    run.add_argument("--no-wait", action="store_true")
 
     boot = subparsers.add_parser("boot-config")
     boot.add_argument("kernel")
@@ -137,7 +190,9 @@ def main() -> int:
     if args.command == "vsock-config":
         print(json.dumps(vsock_config(args.path)))
     elif args.command == "network-config":
-        print(json.dumps(network_config()))
+        print(json.dumps(network_config(args.mac)))
+    elif args.command == "run-guest":
+        print(run_guest(args.vsock, args.guest_command, args.no_wait))
     elif args.command == "boot-config":
         print(json.dumps(boot_config(args.kernel, args.initrd)))
     elif args.command == "drive-config":
