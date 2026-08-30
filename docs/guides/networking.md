@@ -32,6 +32,18 @@ When working from the repository, `just network-check` wraps this workflow and
 adds an outbound HTTP request. Maintainers can use `just fc-compat-net-e2e` to
 validate the Firecracker API path.
 
+## Cross-VM isolation
+
+Whether two VMs on one host can reach each other is measured, not assumed.
+`just net-isolation-check` boots two NAT VMs and asserts that neither TCP
+nor ICMP crosses between them (with a gateway control proving the probe
+works); `just vmnet-isolation-check` does the same for two vmnet daemons
+and additionally asserts they occupy distinct `/24` subnets. Both measure
+`isolated` on macOS 26.5.2. VZ NAT's behavior is undocumented by Apple, so
+the NAT smoke exists to catch an OS update changing it. A multi-VM shared
+vmnet segment is not constructible: the network object must be created in
+the attaching process, and Hephaestus runs one process per VM.
+
 ## Shared vmnet networking
 
 On macOS 26 or later, the Firecracker daemon can replace VZ's opaque NAT
