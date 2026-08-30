@@ -4,6 +4,22 @@ All notable changes to hephaestus. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [0.4.0-alpha.3](https://github.com/hephaestus-vm/hephaestus/compare/v0.4.0-alpha.2...v0.4.0-alpha.3) (2026-08-30)
+
+
+### Features
+
+* **jailer:** add privilege drop and launchd supervision ([#36](https://github.com/hephaestus-vm/hephaestus/issues/36)) ([c868344](https://github.com/hephaestus-vm/hephaestus/commit/c8683441842632deccfb15d2146e0f352f02a008))
+* **jailer:** allocate dedicated per-VM uids ([#39](https://github.com/hephaestus-vm/hephaestus/issues/39)) ([a96b47c](https://github.com/hephaestus-vm/hephaestus/commit/a96b47c8ec893a72040fe74bab398e4d3a5cb3be))
+* **jailer:** complete per-VM path and lifecycle ownership ([#37](https://github.com/hephaestus-vm/hephaestus/issues/37)) ([cd023c8](https://github.com/hephaestus-vm/hephaestus/commit/cd023c83d45244f893ee3ea95f9de8ab8a50eccf))
+* **networking:** serve transparent MMDS over authorized vmnet ([#22](https://github.com/hephaestus-vm/hephaestus/issues/22)) ([5025492](https://github.com/hephaestus-vm/hephaestus/commit/502549285dfd07d2676b766b9b49612f003cd51d))
+
+
+### Bug Fixes
+
+* **release:** tolerate no-op automation runs ([#28](https://github.com/hephaestus-vm/hephaestus/issues/28)) ([d12420f](https://github.com/hephaestus-vm/hephaestus/commit/d12420fa4a4fcc6e164d2d267182713e7b340e10))
+* **release:** use the generated pull request output ([#24](https://github.com/hephaestus-vm/hephaestus/issues/24)) ([23ebc59](https://github.com/hephaestus-vm/hephaestus/commit/23ebc59fad45ff7a8d29fd499beef75068948c06))
+
 ## [0.4.0-alpha.2](https://github.com/hephaestus-vm/hephaestus/compare/v0.4.0-alpha.1...v0.4.0-alpha.2) (2026-07-13)
 
 
