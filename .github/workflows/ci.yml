@@ -16,6 +16,46 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # Decide whether the expensive macOS build/test jobs are relevant to this
+  # change. Docs-only PRs skip them; the cheap ubuntu jobs always run. Pushes
+  # to main always run everything — main is the release baseline and primes
+  # the rust-cache entries PR runs restore from. Job-level gating (rather
+  # than workflow `paths-ignore`) keeps every check reporting a status, so
+  # this stays correct if branch protection ever marks them required.
+  changes:
+    name: change detection
+    runs-on: ubuntu-latest
+    outputs:
+      # `true || …` short-circuits for push events, where the filter step is
+      # skipped and its output is empty.
+      code: ${{ github.event_name != 'pull_request' || steps.filter.outputs.code }}
+    steps:
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          # Everything that can change what the macOS jobs compile, lint,
+          # test, or exercise. Markdown and non-CI dotfiles are the point of
+          # the skip; when in doubt a path belongs on this list.
+          filters: |
+            code:
+              - 'src/**'
+              - 'swift/**'
+              - 'compat/**'
+              - 'guest/**'
+              - 'scripts/**'
+              - 'vendor/**'
+              - '.cargo/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'rustfmt.toml'
+              - 'deny.toml'
+              - 'justfile'
+              - 'version.txt'
+              - '*.entitlements'
+              - '.github/workflows/**'
+
   pr-title:
     name: conventional PR title
     if: github.event_name == 'pull_request'
@@ -66,6 +106,8 @@ jobs:
 
   lint:
     name: fmt + clippy
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -85,6 +127,8 @@ jobs:
 
   test:
     name: cargo test
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -97,6 +141,8 @@ jobs:
 
   swift-build:
     name: swift build
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -111,6 +157,8 @@ jobs:
 
   fc-compat-config:
     name: Firecracker API config-only compat
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -126,6 +174,8 @@ jobs:
 
   fc-compat-sandbox-config:
     name: Firecracker API restrictive sandbox compat
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
