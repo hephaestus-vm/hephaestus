@@ -6,8 +6,9 @@ Hephaestus runs **trusted guest code**. There is no supported multi-tenant
 isolation story yet. The `hephaestus-jailer` generates a per-VM deny-by-default
 sandbox profile, owns daemon launch and per-VM lifecycle (instance locking,
 stale-socket cleanup, `--teardown`), and supports privilege drop to an
-unprivileged user (`--uid`/`--gid`/`--user`) and launchd supervision
-(`--generate-launchd-plist`). `hephaestus-firecracker` retains a low-level
+unprivileged user (`--uid`/`--gid`/`--user`, or per-VM dedicated uids via
+`--uid-base`, refusing to run two live instances under one uid) and launchd
+supervision (`--generate-launchd-plist`). `hephaestus-firecracker` retains a low-level
 `--sandbox-profile <file>` hook. Signing/entitlement distribution and
 release-gated real-Mac coverage are not complete. Do not treat these hardening
 primitives as support for hostile or mutually-untrusted guests. The full

@@ -98,6 +98,7 @@ traverse), the root holds:
 | `.<id>.sandbox.profile` | root | no |
 | `.<id>.lock` | root | no (fd inherited, path not writable) |
 | `.<id>.launchd.stdout.log`, `.<id>.launchd.stderr.log` | root | via inherited fd only |
+| `.uid-allocations` (shared uid registry) | root | no |
 
 The invariant: **everything root re-reads or re-executes against lives
 outside the daemon-writable directory.** A1 owns the contents of `<id>/`
@@ -142,8 +143,9 @@ Snapshot files live in the per-VM work dir, so their integrity equals the
 daemon's integrity: A1 can feed itself a malicious snapshot, which changes
 nothing (it already controls the VM). What the layout prevents is A1
 poisoning *another* instance's restore path — other instances' work dirs
-are unreachable (different dropped uids or at minimum different `0700`
-directories), and the pool base is read-only.
+are unreachable (dedicated per-VM uids under `--uid-base`, or at minimum
+different `0700` directories; the jailer refuses two live instances on one
+uid unless explicitly allowed), and the pool base is read-only.
 
 ### The network segment
 
@@ -198,11 +200,13 @@ What Hephaestus claims **today**:
 The **target tier** — not yet claimed — is *contained semi-trusted
 tenants*: the posture of Apple's own `container` project (one VM per
 workload behind the VZ boundary), which Hephaestus already exceeds on
-host-side confinement. Claiming it requires: per-VM dedicated uid
-allocation as the enforced default (one shared drop uid lets sibling
-daemons signal and ptrace each other), isolated per-VM networking as the
-multi-tenant default with shared vmnet strictly opt-in, and a review of
-the generated profile's non-filesystem allow surface.
+host-side confinement. Per-VM dedicated uids now exist: `--uid-base`
+allocates each instance its own uid/gid (persisted in the root-owned
+`.uid-allocations` registry), and the jailer refuses to launch two live
+instances under one uid regardless of drop mode (`--allow-shared-uid`
+opts out). Claiming the tier still requires: isolated per-VM networking
+as the multi-tenant default with shared vmnet strictly opt-in, and a
+review of the generated profile's non-filesystem allow surface.
 
 ## Non-claims
 

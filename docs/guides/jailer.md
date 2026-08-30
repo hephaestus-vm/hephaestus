@@ -32,9 +32,10 @@ Before launching the daemon, the jailer:
 Each instance id owns three kinds of on-disk state under the work root: the
 per-VM work dir `<work-dir>/<id>/` (API socket, logs, metrics, snapshots),
 and the root-owned dot-siblings `.<id>.sandbox.profile` and `.<id>.lock`
-(plus `.<id>.launchd.*.log` under launchd). The dot-siblings deliberately
-live outside the daemon-writable work dir so a compromised dropped-uid
-daemon cannot replace them.
+(plus `.<id>.launchd.*.log` under launchd, and a line in the shared
+`.uid-allocations` registry when the instance drops privileges). The
+dot-siblings deliberately live outside the daemon-writable work dir so a
+compromised dropped-uid daemon cannot replace them.
 
 The instance lock is a `flock` held for the life of the supervised daemon.
 The lock file descriptor is inherited by the daemon, so the claim survives
@@ -50,8 +51,8 @@ opt-in operations manage that state:
   retire-and-recreate. It is never carried into generated launchd plists,
   so supervised restarts always preserve state.
 - `--teardown` (with `--id` and `--work-dir`) removes the instance's
-  on-disk state entirely — work dir, profile, launchd logs, and lock — and
-  exits without launching. It refuses while the instance is running. Under
+  on-disk state entirely — work dir, profile, launchd logs, uid-registry
+  entry, and lock — and exits without launching. It refuses while the instance is running. Under
   launchd, run `sudo launchctl bootout system/com.hephaestus.vm.<id>`
   first; a still-loaded `KeepAlive` job would simply re-create everything.
 
@@ -85,6 +86,35 @@ $ sudo hephaestus-jailer \
     --rootfs /absolute/path/to/rootfs.ext4 \
     --user nobody
 ```
+
+### Per-VM dedicated uids (`--uid-base`)
+
+When running more than one VM, prefer `--uid-base <n>` over a shared
+`--user nobody`: two daemons under one uid can signal, ptrace, and access
+each other's work dirs, so a shared uid collapses instance separation back
+onto the sandbox profile alone.
+
+```console
+$ sudo hephaestus-jailer \
+    --id example \
+    --kernel /absolute/path/to/vmlinux \
+    --rootfs /absolute/path/to/rootfs.ext4 \
+    --uid-base 61000
+```
+
+Each instance id is allocated the lowest free uid in `[base, base+1000)` —
+skipping uids taken by other instances (even retired-but-not-torn-down
+ones) and by real user accounts — with gid set equal to the uid. The
+allocation is recorded in the root-owned `<work-dir>/.uid-allocations`
+registry and reused on every relaunch, so an id keeps its uid (and the
+ownership of its chowned files) across restarts; `--teardown` releases the
+entry. Generated launchd plists pin the allocated `--uid`/`--gid` rather
+than carrying `--uid-base`, so supervised restarts never re-run allocation.
+
+Whatever the drop mode, the jailer refuses to launch while another *live*
+instance runs under the same uid, naming both instances in the error. Pass
+`--allow-shared-uid` for deliberate shared-uid deployments (it propagates
+into generated plists).
 
 ## launchd supervision
 
@@ -172,6 +202,13 @@ and teardown (root-free, VM-free):
 $ just jailer-lifecycle-check
 ```
 
+Validate per-VM uid allocation — distinct uids per id, the live-shared-uid
+refusal, and registry release (needs sudo; VM-free):
+
+```console
+$ just jailer-uid-check
+```
+
 Restrictive sandbox tests cover config-only, cold boot, vsock/MMDS, snapshots,
 and both pool flavors. See [Testing](../development/testing.md).
 
@@ -186,7 +223,8 @@ The current jailer does not provide:
 What it does provide:
 
 - **uid/gid isolation** — the daemon runs as an unprivileged user after
-  privilege drop (`--uid`, `--gid`, `--user`).
+  privilege drop (`--uid`, `--gid`, `--user`), with per-VM dedicated uids
+  via `--uid-base` and a refusal to launch two live instances on one uid.
 - **launchd supervision** — automatic restart on crash via generated plist
   (`--generate-launchd-plist`).
 - **macOS sandbox** — deny-by-default filesystem profile.
