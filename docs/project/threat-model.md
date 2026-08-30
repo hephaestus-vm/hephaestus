@@ -45,6 +45,38 @@ UNIX-domain, mode-protected, and expected to be reachable only by its owner.
 Denial of service (a guest burning host CPU/memory/disk) and cross-guest
 side channels are out of scope.
 
+## The Virtualization.framework boundary
+
+The guest/host boundary is hardware virtualization — the same *kind* of
+mechanism as KVM. What differs is the assurance behind it:
+
+**What Apple stands behind.** A guest-to-host escape from
+Virtualization.framework is a critical, bounty-eligible vulnerability class
+that Apple patches and assigns CVEs for. Apple stakes its own products on
+this boundary: [apple/container](https://github.com/apple/container) runs
+each Linux container in its own VZ VM precisely for "the isolation
+properties of a full VM," and Apple's Private Cloud Compute [Virtual
+Research Environment](https://security.apple.com/blog/pcc-security-research/)
+runs PCC node software — the platform behind Apple's strongest public
+security claims — in a virtual machine on Apple Silicon Macs.
+
+**What Apple does not provide.** No published threat model or multi-tenancy
+endorsement for VZ, no source, and no adversarial track record at hostile
+scale. The contrast with PCC is instructive: there, Apple publishes a
+security guide, an append-only transparency log with binary images for
+independent inspection, partial source, a research environment, and a
+dedicated bounty — proof that Apple *can* make a component auditable when it
+intends a security posture. VZ has none of that, and independent analysis of
+PCC ([arXiv 2605.24239](https://arxiv.org/abs/2605.24239)) found even that
+program stops short of full verifiability (no reproducible builds, no
+symbols).
+
+Hephaestus therefore treats VZ as a real but **unauditable** boundary:
+strong enough to anchor the trusted-workload model and the contained-tenant
+ceiling described below, never strong enough to support hostile
+multi-tenancy claims. Escapes through VZ are Apple's bugs; report them to
+Apple.
+
 ## Shared resources and their defenses
 
 ### The work root and its control files
@@ -146,10 +178,44 @@ would not hand to the least-trusted process in that guest.
 - **launchd logs grow without rotation** (documented, with a `newsyslog.d`
   recipe, in the [jailer guide](../guides/jailer.md)).
 
+## Claims
+
+What Hephaestus claims **today**:
+
+1. **A compromised daemon is contained to its own VM's assets.** Post-drop,
+   a fully hostile daemon cannot write the pool base, reach another
+   instance's work dir, replace any file root re-reads or re-executes
+   against, or redirect a privileged operation through a symlink. The
+   shared-resources sections above substantiate this path by path.
+2. **Co-resident local users get nothing.** Work-root modes and ownership
+   checks deny read, plant, and redirect attacks from other uids.
+3. **The lifecycle is operationally sound.** No double launches or socket
+   stealing, claims survive supervisor crashes, supervised restarts
+   preserve state, and retirement is complete.
+4. **The guest/host boundary is hardware virtualization**, with the
+   assurance caveats stated above.
+
+The **target tier** — not yet claimed — is *contained semi-trusted
+tenants*: the posture of Apple's own `container` project (one VM per
+workload behind the VZ boundary), which Hephaestus already exceeds on
+host-side confinement. Claiming it requires: per-VM dedicated uid
+allocation as the enforced default (one shared drop uid lets sibling
+daemons signal and ptrace each other), isolated per-VM networking as the
+multi-tenant default with shared vmnet strictly opt-in, and a review of
+the generated profile's non-filesystem allow surface.
+
 ## Non-claims
 
-Hephaestus does **not** claim: containment of hostile or mutually untrusted
-guests; protection against a root-level host attacker; resistance to
-denial of service by a guest; or isolation against cross-guest timing and
-side channels. Virtualization.framework remains the primary guest/host
-boundary in all cases.
+Hephaestus does **not** claim — at any tier, including the target tier:
+
+- containment of **hostile or mutually untrusted** guests. Firecracker's
+  version of that claim rests on an open, independently audited boundary
+  under years of adversarial pressure at cloud scale; none of that is
+  reproducible on a closed boundary.
+- protection against a root-level host attacker;
+- resistance to **denial of service** by a guest — macOS has no cgroups
+  equivalent, and rlimits cannot cap a daemon's memory or CPU;
+- isolation against cross-guest **timing and side channels**.
+
+Virtualization.framework remains the primary guest/host boundary in all
+cases.
