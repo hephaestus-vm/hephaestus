@@ -53,7 +53,7 @@ installer, then choose an explicit release version.
 $ curl --proto '=https' --tlsv1.2 -fLo install.sh \
     https://raw.githubusercontent.com/hephaestus-vm/hephaestus/main/install.sh
 $ less install.sh
-$ sh install.sh --version v0.4.0-alpha.1
+$ sh install.sh --version v0.4.0-alpha.3
 $ "$HOME/.local/bin/hephaestus" --version
 ```
 
