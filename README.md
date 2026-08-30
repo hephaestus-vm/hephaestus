@@ -12,8 +12,9 @@ Linux microVMs on macOS by pointing at a Hephaestus UNIX socket.
 
 > [!WARNING]
 > Hephaestus is alpha software for trusted workloads. Public interfaces may
-> change before v1.0, and untrusted or mutually untrusted guests are not yet
-> supported. Read the [security policy](SECURITY.md) before deployment.
+> change before v1.0, and untrusted or mutually untrusted guests are not
+> supported. Read the [security policy](SECURITY.md) and
+> [threat model](docs/project/threat-model.md) before deployment.
 
 ## Why Hephaestus?
 
@@ -28,7 +29,8 @@ an Apple Silicon Mac while replacing KVM with Virtualization.framework.
 | Control plane | HTTP over a UNIX socket | Firecracker-compatible HTTP over a UNIX socket |
 | VM per process | Yes | Yes |
 | Snapshot format | Firecracker-specific | Virtualization.framework-specific |
-| Untrusted multi-tenancy | Firecracker jailer | Not currently supported |
+| Workload isolation | Firecracker jailer | `hephaestus-jailer`: per-VM sandbox, dedicated uids, lifecycle ownership |
+| Hostile multi-tenancy | Supported | Not supported ([threat model](docs/project/threat-model.md)) |
 
 Compatibility applies to API wire shapes and supported behavior. Hephaestus is
 not a binary port, and snapshots cannot move between the two hypervisors. See
@@ -142,7 +144,8 @@ for the component and state-machine details.
 | MMDS | Agent/vsock shim on NAT; transparent link-local service on vmnet |
 | Cross-hypervisor snapshots | Unsupported by the underlying formats |
 | CPU templates, pmem, memory hotplug | Unsupported by Virtualization.framework |
-| Untrusted multi-tenancy | **Unsupported**; jailer remains experimental |
+| Workload isolation | Per-VM deny-by-default sandbox, dedicated uids (`--uid-base`), instance locking, and launchd supervision via `hephaestus-jailer` |
+| Hostile multi-tenancy | **Unsupported**; see the [threat model](docs/project/threat-model.md) for claims and non-claims |
 | API stability | Breaking changes may occur before v1.0 |
 
 The canonical support matrix is
