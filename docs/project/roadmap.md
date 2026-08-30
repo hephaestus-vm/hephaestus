@@ -27,12 +27,13 @@ Completed:
 - privilege drop to a dedicated uid/gid where deployment permits it;
 - launchd ownership and restart behavior (plist generation);
 - per-VM path and lifecycle ownership (instance locking, stale-socket
-  cleanup, `--clean-work-dir`, `--teardown`).
+  cleanup, `--clean-work-dir`, `--teardown`);
+- a reviewed [threat model for shared host
+  resources](threat-model.md).
 
 Remaining work includes:
 
 - release-gated restrictive real-Mac tests;
-- a reviewed threat model for shared host resources;
 - signed distribution and entitlement guidance.
 
 Completion requires more than a passing sandbox smoke. The security policy must

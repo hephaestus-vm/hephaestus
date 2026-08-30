@@ -10,7 +10,10 @@ unprivileged user (`--uid`/`--gid`/`--user`) and launchd supervision
 (`--generate-launchd-plist`). `hephaestus-firecracker` retains a low-level
 `--sandbox-profile <file>` hook. Signing/entitlement distribution and
 release-gated real-Mac coverage are not complete. Do not treat these hardening
-primitives as support for hostile or mutually-untrusted guests.
+primitives as support for hostile or mutually-untrusted guests. The full
+statement of what the jailer defends, against whom, and what it does not
+claim is the [shared host resources threat
+model](docs/project/threat-model.md).
 
 Beyond an optional caller-supplied macOS sandbox profile, hephaestus does not
 harden against a hostile guest escaping into the host kernel beyond what
