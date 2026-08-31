@@ -4,6 +4,13 @@ All notable changes to hephaestus. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## [0.4.0-alpha.4](https://github.com/hephaestus-vm/hephaestus/compare/v0.4.0-alpha.3...v0.4.0-alpha.4) (2026-08-31)
+
+
+### Features
+
+* **net:** pin per-VM vmnet subnets and gate the host packet interface ([#44](https://github.com/hephaestus-vm/hephaestus/issues/44)) ([acaea58](https://github.com/hephaestus-vm/hephaestus/commit/acaea58c07474ff933b8124e99ea435a4f950671))
+
 ## [0.4.0-alpha.3](https://github.com/hephaestus-vm/hephaestus/compare/v0.4.0-alpha.2...v0.4.0-alpha.3) (2026-08-30)
 
 
