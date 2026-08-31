@@ -80,8 +80,11 @@ status.
   backed by VZ's built-in NAT by default (`192.168.64.0/24`, gateway `.1`).
   NAT only needs the base `com.apple.security.virtualization` entitlement, so
   it works under ad-hoc signing. A profile-authorized daemon launched with
-  `--network-backend vmnet` instead uses a process-owned shared-mode
-  `VZVmnetNetworkDeviceAttachment`. `guest_mac` is honored in either mode (VZ
+  `--network-backend vmnet` instead uses a process-owned per-VM
+  `VZVmnetNetworkDeviceAttachment` whose subnet is pinned across restarts
+  (recorded in a `.vmnet-subnet` sidecar next to the serial log). Both modes
+  are measured cross-VM isolated; see `just net-isolation-check` and
+  `just vmnet-isolation-check`. `guest_mac` is honored in either mode (VZ
   assigns a random MAC when omitted).
 - Like Firecracker, hephaestus provides the *device*; the guest
   configures L3 (DHCP / `ip=` boot arg / cloud-init). VZ NAT runs a
@@ -93,7 +96,9 @@ status.
   `hephaestus-agent` shim in the default NAT mode because VZ NAT is a black box.
   A profile-authorized daemon started with `--network-backend vmnet
   --host-mmds` instead answers ARP and serves MMDS directly on the VM's virtual
-  Ethernet segment, so stock images do not need the shim.
+  Ethernet segment, so stock images do not need the shim. The host-side packet
+  interface behind that responder exists only under `--host-mmds`
+  (verified by `just fc-compat-vmnet-nommds-e2e`).
 - `PATCH` is an accept-noop (VZ attachments aren't hot-swappable).
 - Verified by `just fc-compat-net-e2e` (boots with a NIC, confirms a
   non-loopback netdev appears in the guest).

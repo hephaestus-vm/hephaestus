@@ -26,11 +26,17 @@ def network_config(mac: str = "AA:FC:00:00:00:01") -> JsonObject:
     }
 
 
-def boot_config(kernel: str, initrd: str) -> JsonObject:
+def boot_config(kernel: str, initrd: str, mmds_off: bool = False) -> JsonObject:
+    boot_args = "console=hvc0 rdinit=/init quiet loglevel=3"
+    if mmds_off:
+        # Disable the guest agent's link-local MMDS shim: it answers
+        # 169.254.169.254 too, and the no-mmds assertion must observe the
+        # host responder's absence, not the shim's presence.
+        boot_args += " hephaestus.mmds=off"
     return {
         "kernel_image_path": kernel,
         "initrd_path": initrd,
-        "boot_args": "console=hvc0 rdinit=/init quiet loglevel=3",
+        "boot_args": boot_args,
     }
 
 
@@ -43,7 +49,17 @@ def drive_config(rootfs: str) -> JsonObject:
     }
 
 
-def guest_command(test_mmds: bool) -> bytes:
+def guest_command(test_mmds: bool, expect_no_mmds: bool = False) -> bytes:
+    if expect_no_mmds:
+        # The NIC and DHCP must work, but the metadata fetch must FAIL:
+        # observable proof that no host packet interface answers on the
+        # segment (the shim is disabled via hephaestus.mmds=off).
+        return b'''set -e
+iface="$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -1)"
+test -n "$iface"
+ip link set "$iface" up
+udhcpc -i "$iface" -n -q
+! wget -qO- -T 5 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null'''
     if not test_mmds:
         return b'test -n "$(ls /sys/class/net 2>/dev/null | grep -v \'^lo$\')"'
     return b'''set -e
@@ -125,8 +141,8 @@ def run_guest(path: str, command: str, no_wait: bool) -> int:
     raise RuntimeError("guest port 1234 never accepted the command")
 
 
-def check_guest(path: str, test_mmds: bool) -> None:
-    command_bytes = guest_command(test_mmds)
+def check_guest(path: str, test_mmds: bool, expect_no_mmds: bool = False) -> None:
+    command_bytes = guest_command(test_mmds, expect_no_mmds)
     last: Exception | None = None
     for _ in range(80):
         try:
@@ -143,9 +159,15 @@ def check_guest(path: str, test_mmds: bool) -> None:
                 raise RuntimeError(data + command.recv(256))
             code = struct.unpack("<i", data)[0]
             if code != 0:
-                assertion = "MMDS fetch" if test_mmds else "network device check"
+                assertion = (
+                    "no-MMDS check (metadata unexpectedly reachable?)"
+                    if expect_no_mmds
+                    else "MMDS fetch" if test_mmds else "network device check"
+                )
                 raise RuntimeError(f"guest {assertion} failed (agent exit {code})")
-            if test_mmds:
+            if expect_no_mmds:
+                print("guest networking works and the metadata service is absent")
+            elif test_mmds:
                 print("guest fetched transparent MMDS over vmnet")
             else:
                 print("guest sees a non-loopback network device")
@@ -175,6 +197,7 @@ def parse_args() -> argparse.Namespace:
     boot = subparsers.add_parser("boot-config")
     boot.add_argument("kernel")
     boot.add_argument("initrd")
+    boot.add_argument("--mmds-off", action="store_true")
 
     drive = subparsers.add_parser("drive-config")
     drive.add_argument("rootfs")
@@ -182,6 +205,7 @@ def parse_args() -> argparse.Namespace:
     guest = subparsers.add_parser("check-guest")
     guest.add_argument("vsock")
     guest.add_argument("--mmds", action="store_true")
+    guest.add_argument("--expect-no-mmds", action="store_true")
     return parser.parse_args()
 
 
@@ -194,11 +218,11 @@ def main() -> int:
     elif args.command == "run-guest":
         print(run_guest(args.vsock, args.guest_command, args.no_wait))
     elif args.command == "boot-config":
-        print(json.dumps(boot_config(args.kernel, args.initrd)))
+        print(json.dumps(boot_config(args.kernel, args.initrd, args.mmds_off)))
     elif args.command == "drive-config":
         print(json.dumps(drive_config(args.rootfs)))
     elif args.command == "check-guest":
-        check_guest(args.vsock, args.mmds)
+        check_guest(args.vsock, args.mmds, args.expect_no_mmds)
     else:
         raise AssertionError(f"unknown command: {args.command}")
     return 0

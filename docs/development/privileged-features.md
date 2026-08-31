@@ -7,9 +7,11 @@ host authorization.
 ## vmnet networking
 
 Transparent link-local MMDS for a stock image requires a network path where the
-host can answer guest traffic directly. The experimental path uses a shared
+host can answer guest traffic directly. The experimental path uses a per-VM
 vmnet-backed VZ attachment and the restricted `com.apple.vm.networking`
-entitlement.
+entitlement. An unauthorized daemon fails `InstanceStart` with an error naming
+`just probe-vmnet` and the app bundle, rather than only the raw
+`VMNET_NOT_AUTHORIZED` status.
 
 Under System Integrity Protection, an ad-hoc signature cannot grant that
 entitlement. Development requires:

@@ -236,6 +236,7 @@ unsafe extern "C" {
         memory_mib: u64,
         read_only: bool,
         network_mode: u32,
+        start_packet_interface: bool,
         mac: *const c_char,
         extra_drive_count: usize,
         extra_drive_paths: *const *const c_char,
@@ -319,6 +320,7 @@ unsafe extern "C" {
         memory_mib: u64,
         read_only: bool,
         network_mode: u32,
+        start_packet_interface: bool,
         mac: *const c_char,
         extra_drive_count: usize,
         extra_drive_paths: *const *const c_char,
@@ -560,7 +562,8 @@ pub enum VzNetworkMode {
     None,
     /// Virtualization.framework's built-in NAT attachment.
     Nat,
-    /// A customizable shared-mode network backed by the vmnet framework.
+    /// This VM's own isolated vmnet network (macOS 26+, requires the
+    /// profile-authorized `com.apple.vm.networking` bundle).
     Vmnet,
 }
 
@@ -602,9 +605,14 @@ pub struct VzSpec {
     /// read-only, the guest must not be able to mutate it.
     pub read_only: bool,
     /// Network attachment for the guest NIC. `None` boots without a network
-    /// device, `Nat` uses VZ's built-in NAT, and `Vmnet` creates a shared-mode
-    /// vmnet network.
+    /// device, `Nat` uses VZ's built-in NAT, and `Vmnet` creates this VM's
+    /// own isolated vmnet network (subnet pinned across restarts).
     pub network_mode: VzNetworkMode,
+    /// Start the host-side vmnet packet interface used by the transparent
+    /// MMDS responder. Only meaningful with `VzNetworkMode::Vmnet`; defaults
+    /// to `false` so the extra host NIC on the VM's segment exists only on
+    /// request.
+    pub host_packet_interface: bool,
     /// Optional guest MAC address (from Firecracker's `guest_mac`). `None`
     /// lets VZ assign a random locally-administered address.
     pub mac: Option<String>,
@@ -645,6 +653,11 @@ impl VzSpec {
 
     pub fn network_mode(mut self, mode: VzNetworkMode) -> Self {
         self.network_mode = mode;
+        self
+    }
+
+    pub fn host_packet_interface(mut self, on: bool) -> Self {
+        self.host_packet_interface = on;
         self
     }
 
@@ -715,6 +728,7 @@ impl VzVm {
                 spec.memory_mib,
                 spec.read_only,
                 spec.network_mode.code(),
+                spec.host_packet_interface,
                 mac_ptr,
                 drives.count(),
                 drives.paths_ptr(),
@@ -1299,6 +1313,7 @@ pub fn vz_long_restore(
     memory_mib: u64,
     read_only: bool,
     network_mode: VzNetworkMode,
+    host_packet_interface: bool,
     mac: Option<&str>,
     extra_drives: &[(std::path::PathBuf, bool)],
     resume: bool,
@@ -1329,6 +1344,7 @@ pub fn vz_long_restore(
             memory_mib,
             read_only,
             network_mode.code(),
+            host_packet_interface,
             mac_ptr,
             drives.count(),
             drives.paths_ptr(),

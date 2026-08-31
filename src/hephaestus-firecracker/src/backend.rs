@@ -8,7 +8,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
@@ -395,6 +395,29 @@ impl VzBackend {
             VzNetworkMode::Nat
         };
         self
+    }
+
+    /// Assemble the long-running VM spec. Split from `boot_cold` so the
+    /// network-mode and packet-interface wiring is unit-testable without
+    /// constructing a VM: the host-side vmnet packet interface exists only
+    /// when the transparent MMDS responder (`--host-mmds`) will consume it.
+    fn long_run_spec(
+        &self,
+        kernel: &Path,
+        rootfs: &Path,
+        log: &Path,
+        boot_args: String,
+        cpu: u32,
+        memory: u64,
+    ) -> VzSpec {
+        VzSpec::new(kernel, rootfs, log, boot_args)
+            .cpus(cpu)
+            .memory_mib(memory)
+            .read_only(self.root_drive_read_only)
+            .network_mode(self.configured_network_mode())
+            .host_packet_interface(self.host_mmds)
+            .mac(self.configured_mac())
+            .extra_drives(self.extra_drive_specs())
     }
 
     fn configured_network_mode(&self) -> VzNetworkMode {
@@ -1095,13 +1118,7 @@ impl VmmBackend for VzBackend {
             }
         }
 
-        let mut spec = VzSpec::new(&kernel, &rootfs, &log, boot_args)
-            .cpus(cpu)
-            .memory_mib(memory)
-            .read_only(self.root_drive_read_only)
-            .network_mode(self.configured_network_mode())
-            .mac(self.configured_mac())
-            .extra_drives(self.extra_drive_specs());
+        let mut spec = self.long_run_spec(&kernel, &rootfs, &log, boot_args, cpu, memory);
         if let Some(initrd) = boot.initrd_path.as_ref() {
             spec = spec.initrd(std::path::Path::new(initrd));
         }
@@ -1226,6 +1243,7 @@ impl VmmBackend for VzBackend {
             memory,
             self.root_drive_read_only,
             network_mode,
+            self.host_mmds,
             mac.as_deref(),
             &extra_drives,
             params.resume_vm,
@@ -1840,6 +1858,58 @@ mod tests {
             })
             .unwrap();
         assert!(backend.root_drive_read_only);
+    }
+
+    #[test]
+    fn long_run_spec_gates_the_packet_interface_on_host_mmds() {
+        use hephaestus_fc_api::vmm_config::net::NetworkInterfaceConfig;
+
+        let nic = || NetworkInterfaceConfig {
+            iface_id: "eth0".into(),
+            host_dev_name: "tap0".into(),
+            guest_mac: None,
+            rx_rate_limiter: None,
+            tx_rate_limiter: None,
+        };
+        let spec_for = |vmnet: bool, host_mmds: bool| {
+            let mut backend = VzBackend::new("spec-test".into())
+                .with_vmnet_networking(vmnet)
+                .with_host_mmds(host_mmds);
+            backend.insert_network_device(nic()).unwrap();
+            backend.long_run_spec(
+                Path::new("/k"),
+                Path::new("/r"),
+                Path::new("/l"),
+                "console=hvc0".into(),
+                1,
+                256,
+            )
+        };
+
+        // The spec mirrors --host-mmds verbatim; the Swift side only starts
+        // a packet interface when a vmnet network exists, so the nat rows'
+        // `true` is inert there (and nat+host-mmds is refused at startup
+        // anyway). The matrix documents the pass-through, not a policy.
+        let matrix = [
+            (false, false, VzNetworkMode::Nat, false),
+            (false, true, VzNetworkMode::Nat, true),
+            (true, false, VzNetworkMode::Vmnet, false),
+            (true, true, VzNetworkMode::Vmnet, true),
+        ];
+        for (vmnet, host_mmds, want_mode, want_packet) in matrix {
+            let spec = spec_for(vmnet, host_mmds);
+            assert_eq!(spec.network_mode, want_mode, "vmnet={vmnet}");
+            assert_eq!(
+                spec.host_packet_interface, want_packet,
+                "vmnet={vmnet} host_mmds={host_mmds}"
+            );
+        }
+
+        // Default VzSpec never asks for the extra host NIC.
+        assert!(
+            !VzSpec::new(Path::new("/k"), Path::new("/r"), Path::new("/l"), "x")
+                .host_packet_interface
+        );
     }
 
     #[test]

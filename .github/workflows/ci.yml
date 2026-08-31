@@ -93,6 +93,7 @@ jobs:
             scripts/fc-compat-net-e2e.sh \
             scripts/fc-compat-vsock-e2e.sh \
             scripts/net-isolation-e2e.sh \
+            scripts/vmnet-subnet-pin-e2e.sh \
             scripts/generate-fc-sandbox-profile.sh
       - run: python3 -m compileall -q scripts
       - run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'

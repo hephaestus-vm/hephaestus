@@ -44,11 +44,11 @@ the NAT smoke exists to catch an OS update changing it. A multi-VM shared
 vmnet segment is not constructible: the network object must be created in
 the attaching process, and Hephaestus runs one process per VM.
 
-## Shared vmnet networking
+## Per-VM vmnet networking
 
 On macOS 26 or later, the Firecracker daemon can replace VZ's opaque NAT
-attachment with a `VZVmnetNetworkDeviceAttachment` backed by a process-owned
-`VMNET_SHARED_MODE` network:
+attachment with a `VZVmnetNetworkDeviceAttachment` backed by this VM's own
+process-owned network:
 
 ```console
 $ just sign-vmnet
@@ -58,11 +58,27 @@ $ build/HephaestusFirecracker.app/Contents/MacOS/hephaestus-firecracker \
     --api-sock /tmp/hephaestus-firecracker.socket
 ```
 
+Each daemon creates its own network object, so every VM gets its own `/24`
+subnet — that separation is the cross-VM isolation guarantee above. The
+daemon prints the subnet to stderr at boot
+(`vmnet network subnet=… mask=…`) and records it in a `.vmnet-subnet`
+sidecar next to the serial log, so relaunches and snapshot restores in the
+same work dir land the guest back on the subnet its DHCP lease came from.
+Delete the sidecar to reallocate; a corrupt or unsatisfiable pin fails
+closed with the same remedy. Snapshots moved to a *different* work dir get
+a fresh subnet and the guest must re-DHCP.
+
+The host-side vmnet packet interface — an extra host NIC on the VM's
+segment — exists only under `--host-mmds`, and it sets vmnet's isolation
+option so different daemons' packet interfaces cannot reach each other.
+
 The app bundle embeds the provisioning profile that authorizes
 `com.apple.vm.networking`; signing the standalone Mach-O is insufficient. Run
 `just probe-vmnet` first to validate both AMFI authorization and construction of
-the shared vmnet attachment. NAT remains the default and release builds do not
-claim the restricted entitlement.
+the vmnet attachment (an unauthorized daemon fails with an error naming that
+probe). NAT remains the default and release builds do not claim the restricted
+entitlement. Under the jailer, pass
+`--network-backend vmnet --firecracker-binary <app-bundle binary>`.
 
 ## Metadata service
 
