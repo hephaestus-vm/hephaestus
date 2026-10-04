@@ -1,11 +1,11 @@
 module github.com/hephaestus-vz/compat/firectl-harness
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/firecracker-microvm/firecracker-go-sdk v1.0.0
 	github.com/go-openapi/runtime v0.33.1
-	github.com/go-openapi/strfmt v0.27.0
+	github.com/go-openapi/strfmt v0.27.2
 )
 
 require (
