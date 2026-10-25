@@ -123,7 +123,7 @@ jobs:
       # different toolchain alias than whatever stable patch the action installs.
       # Install components against that exact alias so cargo fmt/clippy work.
       - run: rustup toolchain install 1.96 --component rustfmt --component clippy --profile minimal --no-self-update
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -138,7 +138,7 @@ jobs:
         with:
           xcode-version: latest-stable
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test --workspace
 
   swift-build:
@@ -152,7 +152,7 @@ jobs:
         with:
           xcode-version: latest-stable
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # build.rs in hephaestus-bridge runs `xcrun swift build` as part
       # of cargo build; a successful cargo build means swift built too.
       - run: cargo build --workspace
@@ -171,7 +171,7 @@ jobs:
         with:
           go-version-file: compat/firectl-harness/go.mod
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: scripts/fc-compat-config-only.sh
 
   fc-compat-sandbox-config:
@@ -188,5 +188,5 @@ jobs:
         with:
           go-version-file: compat/firectl-harness/go.mod
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: scripts/fc-compat-sandbox-config.sh
